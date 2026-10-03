@@ -465,6 +465,13 @@ def test_update_syntax_failure_restores_pre_update_head(update_tree, monkeypatch
                 else 'Pulled code has a syntax error') in output
         assert git(t.clone, 'rev-parse', 'HEAD') == t.base
         assert not (t.clone / 'hermes_cli' / 'config.py').exists()
+    if sync_phase == 'origin' and dirty:
+        # Refused before the autostash too: the local work never left the tree, index included.
+        assert not git(t.clone, 'stash', 'list')
+        assert local.read_bytes() == unstaged
+        assert git(t.clone, 'show', ':.gitignore') == staged.decode().strip()
+        assert (t.clone / 'notes.txt').read_bytes() == b'untracked local work\n'
+        return
     assert not git(t.clone, 'status', '--porcelain')
     assert bool(git(t.clone, 'stash', 'list')) is dirty
     if dirty:
