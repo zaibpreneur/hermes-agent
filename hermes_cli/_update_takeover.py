@@ -24,8 +24,15 @@ def prepare(request: dict) -> tuple[Path, dict[str, str]]:
     from pm.client import ensure_tools_for_sync, sync_venv, venv_is_current
     from pm.environments import activation_environment, install_state_dir, runtime_facts_path
     from hermes_cli._launchers import resolve_store_python
-    from hermes_cli.venv_sync import collect_superseded_generations, publish_launchers
+    from hermes_cli.venv_sync import (
+        arm_completion, collect_superseded_generations, publish_launchers, refuse_foreign_owned_venv)
 
+    # The historical updater already moved the tree: owe the tail and the fleet restart before the
+    # first slow step, exactly like a current updater's commit point, so a kill from here on leaves
+    # both for the next launch / `hermes update` instead of nothing.
+    refuse_foreign_owned_venv(root)
+    arm_completion(root)
+    _arm_fleet_obligation(root)
     correlation = request["update_id"]
     with receipt.worker_context(correlation):
         # A pre-PM installation has no required-tool facts. A current Python
@@ -51,6 +58,16 @@ def prepare(request: dict) -> tuple[Path, dict[str, str]]:
     if python is None:
         raise RuntimeError("updated installation has no managed interpreter")
     return python, activation_environment(root)
+
+
+def _arm_fleet_obligation(root: Path) -> None:
+    head = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True, encoding="utf-8",
+                          stdin=subprocess.DEVNULL, timeout=60)
+    sha = head.stdout.strip() if head.returncode == 0 else ""
+    if sha:  # an SHA-less record names no code the fleet could be proven current on
+        from hermes_cli.update_cmd_fleet import _write_fleet_restart_pending_marker
+
+        _write_fleet_restart_pending_marker(expected_sha=sha)
 
 
 def _record_failure(request: dict, result: Path, code: int, detail: str) -> None:

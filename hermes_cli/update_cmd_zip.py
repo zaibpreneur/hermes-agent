@@ -14,10 +14,18 @@ import sys
 from pathlib import Path
 from typing import Collection, Optional
 
+from hermes_cli._early_recovery import (
+    ZIP_SWAP_JOURNAL, restore_interrupted_zip_swap, write_zip_swap_journal, zip_swap_owner_lock)
+
 # Log-record parity with the origin module.
 logger = logging.getLogger("hermes_cli.update_cmd")
 
 _ZIP_STAGING_ARTIFACT_SUFFIXES = ".hermes-update-staging", ".hermes-update-old"
+# Hermes' own root breadcrumbs: the swap journal + its owner lock, and the update/refresh markers.
+# They are never user work, so the dirty-tree guard must not refuse (and wedge) on them.
+_ZIP_HERMES_ROOT_ARTIFACTS = frozenset({
+    ".hermes-update-zip-swap", ".hermes-update-zip-swap.lock", ".hermes-update-zip-swap.tmp",
+    ".update-incomplete", ".lazy-refresh-incomplete"})
 
 # Single source of truth for entries the ZIP swap preserves — used by the dirty-tree filter and the swap loop.
 _ZIP_PRESERVED_TOP_LEVEL = {"venv", ".venv", "node_modules", ".git", ".env"}
@@ -89,7 +97,7 @@ def _discard_staged(staged) -> None:
             logger.warning("could not remove staging path %s: %s", staging, exc)
 
 
-def _commit_staged_replacements(staged) -> None:
+def _commit_staged_replacements(staged, *, on_committed=None) -> None:
     """Phase 2: swap every staged entry into place, rolling back all on failure.
 
     Per-entry safety wasn't enough: a partway failure over ~90 entries left a mixed-version tree (every
@@ -121,6 +129,8 @@ def _commit_staged_replacements(staged) -> None:
                 # Keep restoring the rest; a silent failure here turns a recoverable rollback into a mixed tree.
                 logger.warning("rollback failed for %s: %s", dst, exc)
         raise
+    if on_committed is not None:
+        on_committed()  # every rename landed: an interrupted cleanup now finishes, never rolls back
     for _dst, backup in swapped:  # all swaps succeeded — drop the backups (best-effort, never fatal)
         if backup:
             _remove_path(backup, ignore_errors=True)
@@ -210,7 +220,8 @@ def _is_zip_preserved_entry_status_line(line: str, shipped: Optional[Collection[
 
 def _is_zip_staging_artifact_status_line(line: str) -> bool:
     """True when a porcelain status line is our own two-phase-swap artifact."""
-    return _status_top_level(line[3:] if len(line) >= 3 else line).endswith(_ZIP_STAGING_ARTIFACT_SUFFIXES)
+    top = _status_top_level(line[3:] if len(line) >= 3 else line)
+    return top.endswith(_ZIP_STAGING_ARTIFACT_SUFFIXES) or top in _ZIP_HERMES_ROOT_ARTIFACTS
 
 
 def _abort_zip_update_if_dirty_tree() -> None:
@@ -219,7 +230,9 @@ def _abort_zip_update_if_dirty_tree() -> None:
     See #87304.
     """
     from hermes_cli.update_cmd import _m
-    reason = _zip_overlay_block_reason(_m().PROJECT_ROOT)
+    # Our own staging/backup siblings and breadcrumbs are never user work: counting them refused
+    # every retry after an interrupted swap (the next run's staging clears them per entry).
+    reason = _zip_overlay_block_reason(_m().PROJECT_ROOT, ignore_staging_artifacts=True)
     if reason is None:
         return
     print(f"✗ ZIP fallback refused: {reason}.")
@@ -322,7 +335,57 @@ def _stage_entries(extracted: str, entries: list[str], project_root: str) -> lis
     return staged
 
 
-def _download_and_swap_zip(branch: str, zip_url: str) -> None:
+def _journaled_stage_and_swap(extracted: str, entries: list[str], root: Path, target_sha) -> list:
+    """Stage + swap under the ZIP swap journal and its owner lock (``_early_recovery``), so a kill at
+    any point is finished or rolled back by the next launch and no staging/backup sibling leaks."""
+    from hermes_cli import update_cmd_commit as _commit
+    from hermes_cli.update_cmd import _UPDATE_CRITICAL_FILES, _m
+
+    # A previous run killed mid-swap: settle it before staging over its leftovers.
+    restore_interrupted_zip_swap(root)
+    with zip_swap_owner_lock(root, wait=10.0) as owned:
+        if not owned:
+            raise RuntimeError("another `hermes update` is swapping this install right now")
+        journal_entries = [[item, os.path.lexists(os.path.join(root, item))] for item in entries]
+        write_zip_swap_journal(root, "staging", journal_entries)
+        try:
+            staged = _stage_entries(extracted, entries, str(root))
+        except BaseException:
+            (root / ZIP_SWAP_JOURNAL).unlink(missing_ok=True)  # _stage_entries dropped its copies
+            raise
+        try:
+            # TOCTOU re-check right before the swap: download + extract + staging can take minutes and
+            # work created meanwhile would be destroyed. Our own staging siblings are filtered out.
+            recheck_reason = _zip_overlay_block_reason(root, ignore_staging_artifacts=True, shipped=entries)
+            if recheck_reason is not None:
+                _discard_staged(staged)
+                (root / ZIP_SWAP_JOURNAL).unlink(missing_ok=True)
+                print(f"✗ ZIP fallback aborted before the swap: {recheck_reason}.")
+                print("  Files appeared in the checkout while the update was downloading; committing the swap would delete them.")
+                print(_STASH_HINT)
+                _m().sys.exit(1)
+            # Pre-commit gate: a target whose startup modules do not compile is refused untouched.
+            for rel in _UPDATE_CRITICAL_FILES:
+                path = os.path.join(extracted, *rel.split("/"))
+                if os.path.isfile(path):
+                    with open(path, "rb") as handle:
+                        compile(handle.read(), rel, "exec", dont_inherit=True)
+            # The commit point: tail + fleet restart owed before the first live rename.
+            _commit.arm_commit_obligations(root, target_sha or "")
+            write_zip_swap_journal(root, "swapping", journal_entries)
+            _commit_staged_replacements(
+                staged, on_committed=lambda: write_zip_swap_journal(root, "committed", journal_entries))
+        except Exception:
+            # Rollback restored swapped entries but staging copies for the rest remain; drop them or the
+            # retry's up-front free-space check (runs BEFORE per-entry leftover cleanup) fails on our litter.
+            # Safe post-rollback: _discard_staged skips paths that no longer exist.
+            _discard_staged(staged)
+            raise
+        (root / ZIP_SWAP_JOURNAL).unlink(missing_ok=True)
+    return staged
+
+
+def _download_and_swap_zip(branch: str, zip_url: str, target_sha: str | None = None) -> None:
     """Download the source ZIP for *branch* and two-phase swap it into the checkout.
     ``sys.exit(1)`` on any failure; the install ends fully updated or fully rolled back.
     Two-phase: stage every entry (dirs AND top-level files) beside its target, then swap all in with
@@ -343,27 +406,16 @@ def _download_and_swap_zip(branch: str, zip_url: str) -> None:
         entries = [i for i in os.listdir(extracted) if i not in _ZIP_PRESERVED_TOP_LEVEL]
         project_root = str(_m().PROJECT_ROOT)
         _require_staging_space(extracted, entries, project_root)
-        staged = _stage_entries(extracted, entries, project_root)
-        try:
-            # TOCTOU re-check right before the swap: download + extract + staging can take minutes and
-            # work created meanwhile would be destroyed. Our own staging siblings are filtered out.
-            recheck_reason = _zip_overlay_block_reason(
-                _m().PROJECT_ROOT, ignore_staging_artifacts=True, shipped=entries)
-            if recheck_reason is not None:
-                _discard_staged(staged)
-                print(f"✗ ZIP fallback aborted before the swap: {recheck_reason}.")
-                print("  Files appeared in the checkout while the update was downloading; committing the swap would delete them.")
-                print(_STASH_HINT)
-                _m().sys.exit(1)
-            _commit_staged_replacements(staged)
-        except Exception:
-            # Rollback restored swapped entries but staging copies for the rest remain; drop them or the
-            # retry's up-front free-space check (runs BEFORE per-entry leftover cleanup) fails on our litter.
-            # Safe post-rollback: _discard_staged skips paths that no longer exist.
-            _discard_staged(staged)
-            raise
+        staged = _journaled_stage_and_swap(extracted, entries, Path(project_root), target_sha)
         print(f"✓ Updated {len(staged)} items from ZIP")
     except Exception as e:
+        # The swap rolled itself back; a rollback that could not finish leaves the journal, which
+        # this settles now (or the next launch's _early_recovery does) instead of leaking siblings.
+        with suppress(Exception):
+            restore_interrupted_zip_swap(_m().PROJECT_ROOT)
+            if not (Path(_m().PROJECT_ROOT) / ZIP_SWAP_JOURNAL).exists():
+                from hermes_cli import update_cmd_commit as _commit
+                _commit.disarm_commit_obligations()  # the old tree is whole again: nothing is owed
         print(f"✗ ZIP update failed: {e}")
         # Two-phase replace commits all or rolls all back, so no mixed tree here — don't push a needless reinstall.
         print("  Your existing install was left in place.")
@@ -406,7 +458,7 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False,
     if (not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository)
             or any(part in (".", "..") for part in repository.split("/"))):
         raise ValueError("ZIP update requires a GitHub owner/repository")
-    _download_and_swap_zip(branch, f"https://github.com/{repository}/archive/{ref}.zip")
+    _download_and_swap_zip(branch, f"https://github.com/{repository}/archive/{ref}.zip", target_sha)
     completion_request["expected_sha"] = target_sha
     completion_request["apply_mode"] = "zip"
     _complete_source_update(completion_request)
