@@ -440,12 +440,17 @@ _ZIP_STAGING_SUFFIX, _ZIP_OLD_SUFFIX = ".hermes-update-staging", ".hermes-update
 
 @contextlib.contextmanager
 def zip_swap_owner_lock(root: Path, *, wait: float = 0.0):
-    """Yields True while this process owns the ZIP swap lock, False when a live owner holds it."""
+    """Yields True while this process owns the ZIP swap lock, False when a live owner holds it.
+
+    The lock file is removed again once no journal is left, so a settled install carries no
+    breadcrumb (the swap itself also runs under the update lock; this one only proves liveness)."""
+    lock_path = Path(root) / (ZIP_SWAP_JOURNAL + ".lock")
     try:
-        fd = os.open(Path(root) / (ZIP_SWAP_JOURNAL + ".lock"), os.O_RDWR | os.O_CREAT, 0o644)
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
     except OSError:
         yield True  # unwritable root: no swap can run there either
         return
+    owned = False
     try:
         deadline = time.monotonic() + wait
         while not _lock_fd(fd, True):
@@ -453,12 +458,16 @@ def zip_swap_owner_lock(root: Path, *, wait: float = 0.0):
                 yield False
                 return
             time.sleep(0.05)
+        owned = True
         try:
             yield True
         finally:
             _lock_fd(fd, False)
     finally:
         os.close(fd)
+        if owned and not (Path(root) / ZIP_SWAP_JOURNAL).exists():
+            with contextlib.suppress(OSError):
+                lock_path.unlink()
 
 
 def write_zip_swap_journal(root: Path, phase: str, entries: list) -> None:
