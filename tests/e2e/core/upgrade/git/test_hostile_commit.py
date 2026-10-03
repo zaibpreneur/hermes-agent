@@ -183,7 +183,10 @@ def test_syntax_error_target_is_refused_before_head_moves(world):
 
 _ZIP_DRIVER = r"""
 import os, signal, sys
+sys.path.insert(0, sys.argv[3])  # the install's checkout (the venv's own path points at its workspace)
 from hermes_cli import update_cmd_zip as z
+import hermes_cli.main as m
+assert str(m.PROJECT_ROOT) == sys.argv[3], m.PROJECT_ROOT
 renames, kill_after = [0], int(sys.argv[2])
 real = os.rename
 def rename(src, dst):
@@ -205,11 +208,15 @@ def test_kill_mid_zip_swap_is_settled_by_the_next_launch(world):
     I.git("archive", "--format=zip", "--prefix=hermes-agent-main/", "-o", str(archive), target, cwd=world["origin"])
     driver = world["root"] / "zip_driver.py"
     driver.write_text(_ZIP_DRIVER, encoding="utf-8")
-    killed = P.run_env(sb, [sb.python, str(driver), archive.as_uri(), "12"], sb.env, timeout=P.UPDATE_TIMEOUT)
-    assert killed.returncode in (-9, 137) or "Killed" in killed.stderr or _artifacts(sb), (
-        "harness: the ZIP swap was not killed mid-rename\n" + I.describe(killed))
+    killed = P.run_env(sb, [sb.python, str(driver), archive.as_uri(), "12", str(sb.checkout)], sb.env, timeout=P.UPDATE_TIMEOUT)
+    at_kill = {"artifacts": _artifacts(sb), "dirty": _tracked_dirty(sb),
+               "new_entry": (sb.checkout / "e2e_zip_release.py").exists()}
+    assert at_kill["artifacts"] and at_kill["dirty"], (
+        f"harness: the ZIP swap was not killed mid-rename ({at_kill['dirty']!r})\n" + I.describe(killed))
     launch = _launch(sb, "first launch after a kill mid ZIP swap")
     leftovers = _artifacts(sb)
-    assert not leftovers, f"staging/backup siblings leaked and wedge the next update: {leftovers}\n" + I.describe(launch)
+    assert not leftovers, (f"{len(leftovers)} staging/backup siblings leaked and wedge the next update: "
+                           f"{leftovers[:5]} (at kill: {len(at_kill['artifacts'])} siblings, "
+                           f"tracked changes {at_kill['dirty']!r})\n" + I.describe(launch))
     assert _head(sb) == pre and not _tracked_dirty(sb), (
         "the interrupted ZIP swap left a mixed tree:\n" + _tracked_dirty(sb) + "\n" + I.describe(launch))
