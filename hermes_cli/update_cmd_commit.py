@@ -108,8 +108,9 @@ def arm_tree_move(git_cmd, root: Path, *, pre: str | None, target: str, stash: s
                   rollback: str | None = None) -> Path:
     """Write the interrupted-pull marker for one git tree move (pre -> target).
 
-    ``rollback`` (``soft``/``detach``): a syntax rollback that moves HEAD back to ``pre`` before any
-    file; a kill before that step finds HEAD still on ``target`` and the restore redoes it first.
+    ``rollback`` (``branch``/``detach``): a syntax rollback that moves HEAD and the index back to
+    ``pre`` before any file; a kill before that step finds HEAD still on ``target`` and the restore
+    redoes it first.
     """
     marker = interrupted_pull_marker(root)
     marker.write_text(f"pid={os.getpid()}\npre={pre or ''}\ntarget={target}\nstash={stash or ''}\n"

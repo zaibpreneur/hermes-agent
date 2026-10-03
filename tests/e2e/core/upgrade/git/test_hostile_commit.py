@@ -166,7 +166,7 @@ def test_kill_during_branch_switch_is_restored(world):
     parked = _head(sb)
     _release(world, {"e2e_cp0_c.py": "C = 1\n"})
     # CP0: `git checkout main` dies after rewriting one file of main's tree.
-    _hostile_git(world, 'if [ "${@: -2:1}" = checkout ] && [ "${@: -1}" = main ]; then '
+    _hostile_git(world, 'if [ "${@: -1}" = main ] && case " $* " in *" checkout "*) true;; *) false;; esac; then '
                         '"$REAL" show main:e2e_cp0_a.py > e2e_cp0_a.py; kill -KILL $PPID; exit 137; fi')
     killed = _update(sb)
     _hostile_git(world, "")
@@ -279,8 +279,11 @@ def test_failed_upstream_sync_after_origin_pull_keeps_the_tail_owed(world):
     I.publish_commit(upstream, root, "upstream: touches the locked dir", {"zzz_e2e_fork/mod.py": "V = 2\n"})
     I.git("remote", "add", "upstream", str(upstream), cwd=sb.checkout)
     flag = sb.checkout / ".git" / "e2e-upstream-ff-failed"
-    # Kill the updater at its next branch check once the upstream merge has failed (and been settled).
-    _hostile_git(world, f'case " $* " in *" merge --ff-only upstream/main "*) "$REAL" "$@"; rc=$?; '
+    # origin reads as a fork (the sandbox shim otherwise reports the official URL). Kill the updater at
+    # its next branch check once the upstream merge has failed (and been settled).
+    _hostile_git(world, 'case " $* " in *" remote get-url origin "*) echo https://github.com/e2e-fork/hermes-agent.git; '
+                        'exit 0;; esac\n'
+                        f'case " $* " in *" merge --ff-only upstream/main "*) "$REAL" "$@"; rc=$?; '
                         f'[ $rc != 0 ] && touch "{flag}"; exit $rc;; esac\n'
                         f'if [ -e "{flag}" ]; then case " $* " in *" rev-parse --abbrev-ref HEAD "*) '
                         'kill -KILL $PPID; exit 137;; esac; fi')

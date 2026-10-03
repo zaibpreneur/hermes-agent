@@ -927,25 +927,25 @@ def _rollback_if_pulled_syntax_error(git_cmd, pre_pull_sha, *, rollback_branch=N
         root = _m().PROJECT_ROOT
         parked = rollback_branch not in (None, "HEAD")
         print(f"→ Rolling back to {rollback_branch if parked else pre_pull_sha[:10]}...")
-        # HEAD goes back FIRST, without writing a file, then the files follow. A kill anywhere in
+        # HEAD and the index go back FIRST, without writing a file, then the files follow. A kill in
         # between leaves HEAD on pre_pull_sha with the broken files reading as the move's own
         # writes, so the next launch's restore lands on pre_pull_sha, never on the broken commit;
         # ``rollback=`` lets it redo the HEAD step when the kill came before it.
-        mode = "soft" if rollback_branch is None else "detach"
-        head_step = (["reset", "--soft", pre_pull_sha] if mode == "soft"
-                     else ["update-ref", "--no-deref", "HEAD", pre_pull_sha])
+        mode = "branch" if rollback_branch is None else "detach"
         with _best_effort('Could not write the interrupted-pull marker: %s'):
             _commit.arm_tree_move(git_cmd, root, pre=pre_pull_sha, target=_capture_head_sha(git_cmd, root),
                                   stash=None, rollback=mode)
-        rollback_args = head_step
-        rollback_result = _git_run(git_cmd, head_step)
+        if mode == "detach":  # never move the update branch onto a parked/detached commit
+            rollback_args = ["update-ref", "--no-deref", "HEAD", pre_pull_sha]
+            rollback_result = _git_run(git_cmd, rollback_args)
+        if mode == "branch" or rollback_result.returncode == 0:
+            rollback_args = ["reset", "-q", pre_pull_sha]  # HEAD (and the index) only, no file
+            rollback_result = _git_run(git_cmd, rollback_args)
         if rollback_result.returncode == 0:
             rollback_args = ["reset", "--hard", pre_pull_sha]
             rollback_result = _git_run(git_cmd, rollback_args)
-            if rollback_result.returncode != 0 and _commit.settle_failed_tree_move(root):
-                rollback_result = subprocess.CompletedProcess(rollback_args, 0, "", "")
-        else:
-            interrupted_pull_marker(root).unlink(missing_ok=True)  # nothing moved: still the pulled tree
+        if rollback_result.returncode != 0 and _commit.settle_failed_tree_move(root):
+            rollback_result = subprocess.CompletedProcess(rollback_args, 0, "", "")  # restored in-process
         if rollback_result.returncode == 0 and parked:
             # Same commit, so only HEAD's name changes. The parked branch can be unavailable (e.g.
             # checked out in another worktree): its commit then stays checked out detached.
