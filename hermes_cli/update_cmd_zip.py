@@ -97,6 +97,18 @@ def _discard_staged(staged) -> None:
             logger.warning("could not remove staging path %s: %s", staging, exc)
 
 
+def _hardlink_backup(path: str, backup: str) -> bool:
+    """Hardlink ``path`` to ``backup`` (a stale backup is replaced); False where links are unsupported.
+    A link is all-or-nothing, so a killed swap never leaves a short backup the restore would put back."""
+    try:
+        if os.path.lexists(backup):
+            _remove_path(backup)
+        os.link(path, backup)
+    except OSError:
+        return False
+    return True
+
+
 def _commit_staged_replacements(staged, *, on_committed=None) -> None:
     """Phase 2: swap every staged entry into place, rolling back all on failure.
 
@@ -108,12 +120,21 @@ def _commit_staged_replacements(staged, *, on_committed=None) -> None:
 
     ``_atomic_replace_dir`` makes each *individual* directory swap safe, but the ZIP update replaces ~90
     top-level entries in a loop, and nothing made the loop atomic *as a whole*. See #63717, #76091, #76104.
+
+    A plain file is never absent, not even for one rename: its backup is a hardlink and ``os.replace``
+    lands the new bytes over it (a filesystem without hardlinks keeps the move-aside). The root modules every launcher imports first
+    (``hermes_constants``, ``hermes_bootstrap``) therefore always import, and ``hermes_bootstrap`` runs the
+    journal-driven restore even while a killed swap left a directory (``hermes_cli/`` included) moved aside.
     """
     swapped: list[tuple[str, str]] = []  # (dst, backup) in swap order; "" = absent
     try:
         for staging, dst in staged:
             backup = f"{dst}.hermes-update-old"
-            if os.path.exists(dst):
+            if os.path.isfile(dst) and not os.path.islink(dst) and _hardlink_backup(dst, backup):
+                swapped.append((dst, backup))
+                os.replace(staging, dst)
+                continue
+            if os.path.lexists(dst):
                 os.rename(dst, backup)
                 swapped.append((dst, backup))
             else:
@@ -122,8 +143,11 @@ def _commit_staged_replacements(staged, *, on_committed=None) -> None:
     except OSError:
         for dst, backup in reversed(swapped):  # undo every swap already made so the install stays self-consistent
             try:
+                if backup and os.path.isfile(backup) and not os.path.islink(backup):
+                    os.replace(backup, dst)
+                    continue
                 _remove_path(dst)
-                if backup and os.path.exists(backup):
+                if backup and os.path.lexists(backup):
                     os.rename(backup, dst)
             except OSError as exc:
                 # Keep restoring the rest; a silent failure here turns a recoverable rollback into a mixed tree.

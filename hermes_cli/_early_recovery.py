@@ -553,8 +553,11 @@ def restore_interrupted_zip_swap(project_root: Path | None = None) -> bool:
             try:
                 if phase == "swapping":
                     if existed and old.exists():
-                        _drop_path(dst)
-                        os.rename(old, dst)
+                        if old.is_file() and not old.is_symlink() and not dst.is_dir():
+                            os.replace(old, dst)  # a file entry never goes missing, not even here
+                        else:
+                            _drop_path(dst)
+                            os.rename(old, dst)
                         changed = True
                     elif not existed and dst.exists() and not staging.exists():
                         _drop_path(dst)

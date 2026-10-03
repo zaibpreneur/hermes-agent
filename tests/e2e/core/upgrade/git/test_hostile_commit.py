@@ -16,6 +16,8 @@ real git failure, and then judges the next real launch from the files the update
   launch must put the parked tree back.
 * ``kill_mid_zip_swap``: the ZIP swap is SIGKILLed between renames. The next launch must finish or
   roll back the swap, leaving no ``*.hermes-update-staging``/``-old`` sibling to wedge a retry.
+* ``kill_mid_zip_swap_with_hermes_cli_moved_aside``: the swap renamed ``hermes_cli/`` (the recovery
+  code itself) aside and died before its replacement landed. The next launch must still restore.
 * ``syntax_error_target``: a release whose startup module does not compile is refused BEFORE
   HEAD moves (no fast-forward in the reflog), not merely rolled back afterwards.
 """
@@ -187,28 +189,39 @@ sys.path.insert(0, sys.argv[3])  # the install's checkout (the venv's own path p
 from hermes_cli import update_cmd_zip as z
 import hermes_cli.main as m
 assert str(m.PROJECT_ROOT) == sys.argv[3], m.PROJECT_ROOT
-renames, kill_after = [0], int(sys.argv[2])
-real = os.rename
-def rename(src, dst):
-    real(src, dst)
-    if str(src).endswith(".hermes-update-staging"):  # one entry swapped in
-        renames[0] += 1
-        if renames[0] >= kill_after:
-            os.kill(os.getpid(), signal.SIGKILL)
-os.rename = rename
+swaps, kill_at = [0], sys.argv[2]
+def killing(real):
+    def move(src, dst):
+        real(src, dst)
+        if kill_at == "hermes_cli-moved-aside":  # the live package renamed away, its replacement not yet in
+            if os.path.basename(str(src)) == "hermes_cli" and str(dst).endswith(".hermes-update-old"):
+                os.kill(os.getpid(), signal.SIGKILL)
+        elif str(src).endswith(".hermes-update-staging"):  # one entry swapped in
+            swaps[0] += 1
+            if swaps[0] >= int(kill_at):
+                os.kill(os.getpid(), signal.SIGKILL)
+    return move
+os.rename, os.replace = killing(os.rename), killing(os.replace)
 z._download_and_swap_zip("main", sys.argv[1])
 """
+
+
+def _zip_killed_at(world, kill_at: str):
+    """A ZIP update of a fresh release, SIGKILLed at ``kill_at`` (N-th entry swapped in, or a named point)."""
+    sb = world["sb"]
+    target = _release(world, {"e2e_zip_release.py": f"Z = {world['n']}\n", "hermes_cli/e2e_zip_marker.py": "M = 1\n"})
+    archive = world["root"] / f"release-{world['n']}.zip"
+    I.git("archive", "--format=zip", "--prefix=hermes-agent-main/", "-o", str(archive), target, cwd=world["origin"])
+    driver = world["root"] / "zip_driver.py"
+    driver.write_text(_ZIP_DRIVER, encoding="utf-8")
+    return P.run_env(sb, [sb.python, str(driver), archive.as_uri(), kill_at, str(sb.checkout)], sb.env,
+                     timeout=P.UPDATE_TIMEOUT)
 
 
 def test_kill_mid_zip_swap_is_settled_by_the_next_launch(world):
     sb = world["sb"]
     pre = _head(sb)
-    target = _release(world, {"e2e_zip_release.py": "Z = 1\n", "hermes_cli/e2e_zip_marker.py": "M = 1\n"})
-    archive = world["root"] / "release.zip"
-    I.git("archive", "--format=zip", "--prefix=hermes-agent-main/", "-o", str(archive), target, cwd=world["origin"])
-    driver = world["root"] / "zip_driver.py"
-    driver.write_text(_ZIP_DRIVER, encoding="utf-8")
-    killed = P.run_env(sb, [sb.python, str(driver), archive.as_uri(), "12", str(sb.checkout)], sb.env, timeout=P.UPDATE_TIMEOUT)
+    killed = _zip_killed_at(world, "12")
     at_kill = {"artifacts": _artifacts(sb), "dirty": _tracked_dirty(sb),
                "new_entry": (sb.checkout / "e2e_zip_release.py").exists()}
     assert at_kill["artifacts"] and at_kill["dirty"], (
@@ -220,3 +233,20 @@ def test_kill_mid_zip_swap_is_settled_by_the_next_launch(world):
                            f"tracked changes {at_kill['dirty']!r})\n" + I.describe(launch))
     assert _head(sb) == pre and not _tracked_dirty(sb), (
         "the interrupted ZIP swap left a mixed tree:\n" + _tracked_dirty(sb) + "\n" + I.describe(launch))
+
+
+def test_kill_mid_zip_swap_with_hermes_cli_moved_aside_reaches_recovery(world):
+    """The one window where the recovery code itself is gone: the swap renamed ``hermes_cli/`` aside
+    and died before the replacement landed. The next launch must still reach the journal-driven
+    restore (from the moved-aside copy) and run, not die on ``No module named 'hermes_cli'``."""
+    sb = world["sb"]
+    pre = _head(sb)
+    killed = _zip_killed_at(world, "hermes_cli-moved-aside")
+    assert not (sb.checkout / "hermes_cli").exists() and (sb.checkout / "hermes_cli.hermes-update-old").is_dir(), (
+        "harness: the ZIP swap was not killed with hermes_cli/ moved aside\n" + I.describe(killed))
+    launch = _launch(sb, "first launch after a kill with hermes_cli moved aside")
+    assert launch.returncode == 0 and (sb.checkout / "hermes_cli" / "main.py").is_file(), (
+        "the launch after a kill with hermes_cli/ moved aside could not reach recovery\n" + I.describe(launch))
+    assert not _artifacts(sb) and _head(sb) == pre and not _tracked_dirty(sb), (
+        f"left {_artifacts(sb)[:5]} / tracked changes {_tracked_dirty(sb)!r}\n" + I.describe(launch))
+    P.ok(_update(sb), "the update after the restored swap failed")
