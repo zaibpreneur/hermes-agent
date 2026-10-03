@@ -365,12 +365,17 @@ def _journaled_stage_and_swap(extracted: str, entries: list[str], root: Path, ta
     from hermes_cli import update_cmd_commit as _commit
     from hermes_cli.update_cmd import _UPDATE_CRITICAL_FILES, _m
 
-    # A previous run killed mid-swap: settle it before staging over its leftovers.
+    # A previous run killed mid-swap: settle it before staging over its leftovers. A journal it could
+    # not settle is that swap's only record: never overwrite it with this run's.
     restore_interrupted_zip_swap(root)
+    if (root / ZIP_SWAP_JOURNAL).exists():
+        raise RuntimeError("an interrupted ZIP update could not be settled; see the warning above")
     with zip_swap_owner_lock(root, wait=10.0) as owned:
         if not owned:
             raise RuntimeError("another `hermes update` is swapping this install right now")
-        journal_entries = [[item, os.path.lexists(os.path.join(root, item))] for item in entries]
+        # A leftover backup counts: _stage_replacement puts it back as the entry before the swap.
+        journal_entries = [[item, any(os.path.lexists(os.path.join(root, item + suffix))
+                                      for suffix in ("", ".hermes-update-old"))] for item in entries]
         write_zip_swap_journal(root, "staging", journal_entries)
         try:
             staged = _stage_entries(extracted, entries, str(root))
@@ -388,8 +393,11 @@ def _journaled_stage_and_swap(extracted: str, entries: list[str], root: Path, ta
                 print("  Files appeared in the checkout while the update was downloading; committing the swap would delete them.")
                 print(_STASH_HINT)
                 _m().sys.exit(1)
-            # Pre-commit gate: a target whose startup modules do not compile is refused untouched.
-            for rel in _UPDATE_CRITICAL_FILES:
+            # Pre-commit gate: a target whose startup modules do not compile is refused untouched
+            # (unless it requires a Python this interpreter is not: its syntax is not ours to judge).
+            pyproject = Path(extracted, "pyproject.toml")
+            newer_python = pyproject.is_file() and _commit.requires_other_python(pyproject.read_bytes())
+            for rel in () if newer_python else _UPDATE_CRITICAL_FILES:
                 path = os.path.join(extracted, *rel.split("/"))
                 if os.path.isfile(path):
                     with open(path, "rb") as handle:

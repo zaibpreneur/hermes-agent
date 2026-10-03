@@ -419,7 +419,9 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path, *, assume_yes: 
         # very commit counted above.
         run_git(git_cmd, ["merge", "--ff-only", upstream], cwd=cwd, check=True, **_no_prompt_git_kwargs())
     except subprocess.CalledProcessError:
-        if _commit.settle_failed_tree_move(cwd) and _git_stdout(git_cmd, ["rev-parse", "HEAD"], cwd) == pre:
+        if _commit.settle_failed_tree_move(cwd):
+            # Back at ``pre``; that is still new code when the origin pull moved first, and
+            # disarm refuses then (it only hands obligations back at the run's start commit).
             _commit.disarm_commit_obligations()
         print("  ✗ Failed to pull from upstream. You may need to resolve conflicts manually.")
         return False

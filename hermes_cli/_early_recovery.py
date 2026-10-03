@@ -552,6 +552,9 @@ def restore_interrupted_zip_swap(project_root: Path | None = None) -> bool:
             staging, old = Path(f"{dst}{_ZIP_STAGING_SUFFIX}"), Path(f"{dst}{_ZIP_OLD_SUFFIX}")
             try:
                 if phase == "swapping":
+                    # Staging finished before this phase, so a backup now is the one the swap made
+                    # from the old entry: it existed, whatever an older journal recorded.
+                    existed = existed or old.exists()
                     if existed and old.exists():
                         if old.is_file() and not old.is_symlink() and not dst.is_dir():
                             os.replace(old, dst)  # a file entry never goes missing, not even here
@@ -644,6 +647,11 @@ def _restore_holding_claim(root: Path, marker: Path, *, after_failure: bool = Fa
                               capture_output=True, timeout=120, stdin=None if stdin is not None else subprocess.DEVNULL,
                               **({"text": True, "encoding": "utf-8", "errors": "replace"} if text else {}))
 
+    rollback = fields.get("rollback", "").strip()
+    if rollback in ("soft", "detach") and pre and target and git("rev-parse", "HEAD").stdout.strip() == target:
+        # A syntax rollback killed before it moved HEAD back: redo that step (it writes no file), so
+        # the restore below lands on ``pre`` (the code the update started from), not the broken tree.
+        git(*(["reset", "--soft", pre] if rollback == "soft" else ["update-ref", "--no-deref", "HEAD", pre]))
     if not pre or not target or git("rev-parse", "HEAD").stdout.strip() != pre:
         marker.unlink()  # git finished (HEAD moved) or the marker is unusable
         return False

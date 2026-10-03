@@ -25,8 +25,9 @@ from hermes_cli._early_recovery import interrupted_pull_marker, restore_interrup
 
 # What this run found before it armed anything: {path: bytes or None}. None = nothing armed yet.
 _armed_snapshot: Optional[dict[Path, Optional[bytes]]] = None
-# (git_cmd, (HEAD, branch)) when this run reached its checkout phase.
+# (git_cmd, (HEAD, branch)) when this run reached its checkout phase, and the checkout it names.
 _run_start: Optional[tuple[list, tuple[str, str]]] = None
+_obligation_root: Optional[Path] = None
 
 
 def _owns_live_checkout(root: Path) -> bool:
@@ -74,15 +75,27 @@ def arm_commit_obligations(root: Path, expected_sha: str) -> None:
 
 
 def disarm_commit_obligations() -> None:
-    """Restore both obligations to what this run found: the tree never left its pre-update commit."""
+    """Restore both obligations to what this run found: the tree never left its pre-update commit.
+
+    Refused (obligations stay armed) unless HEAD is the commit this run STARTED from: a failed later
+    move (the upstream fork ff after a committed origin pull) is put back to a commit that is
+    already new code, and that tree still owes its tail.
+    """
     global _armed_snapshot
+    if _run_start is not None:
+        git_cmd, (start_head, _branch) = _run_start
+        root = Path(_obligation_root) if _obligation_root is not None else None
+        if root is None or not start_head or head_and_branch(git_cmd, root)[0] != start_head:
+            return
     snapshot, _armed_snapshot = _armed_snapshot, None
     for path, data in (snapshot or {}).items():
         try:
             if data is None:
                 path.unlink(missing_ok=True)
             else:
-                path.write_bytes(data)
+                tmp = path.with_name(path.name + ".restore")
+                tmp.write_bytes(data)
+                os.replace(tmp, path)
         except OSError:
             pass  # an owed tail/restart left armed is a retry, never a lost obligation
 
@@ -91,11 +104,16 @@ def commit_obligations_armed() -> bool:
     return _armed_snapshot is not None
 
 
-def arm_tree_move(git_cmd, root: Path, *, pre: str | None, target: str, stash: str | None) -> Path:
-    """Write the interrupted-pull marker for one git tree move (pre -> target)."""
+def arm_tree_move(git_cmd, root: Path, *, pre: str | None, target: str, stash: str | None,
+                  rollback: str | None = None) -> Path:
+    """Write the interrupted-pull marker for one git tree move (pre -> target).
+
+    ``rollback`` (``soft``/``detach``): a syntax rollback that moves HEAD back to ``pre`` before any
+    file; a kill before that step finds HEAD still on ``target`` and the restore redoes it first.
+    """
     marker = interrupted_pull_marker(root)
-    marker.write_text(f"pid={os.getpid()}\npre={pre or ''}\ntarget={target}\nstash={stash or ''}\n",
-                      encoding="utf-8")
+    marker.write_text(f"pid={os.getpid()}\npre={pre or ''}\ntarget={target}\nstash={stash or ''}\n"
+                      + (f"rollback={rollback}\n" if rollback else ""), encoding="utf-8")
     return marker
 
 
@@ -109,12 +127,43 @@ def settle_failed_tree_move(root: Path) -> bool:
     return not interrupted_pull_marker(Path(root)).is_file()
 
 
+def requires_other_python(pyproject: bytes | str | None) -> bool:
+    """True when a target's ``requires-python`` excludes the running interpreter.
+
+    Its startup modules may then use a newer Python's syntax that this interpreter's ``compile()``
+    cannot judge (PM provisions the required Python with the new code). Unknown -> False: keep
+    checking, so a real syntax error is never waved through on a guess.
+    """
+    if not pyproject:
+        return False
+    import platform
+    import re
+    import tomllib
+
+    try:
+        text = pyproject.decode("utf-8") if isinstance(pyproject, bytes) else pyproject
+        spec = tomllib.loads(text)["project"]["requires-python"]
+        try:
+            from packaging.specifiers import SpecifierSet
+        except ImportError:  # the lower bound is the part a Python bump moves
+            floor = re.search(r">=\s*(\d+)\.(\d+)", spec)
+            return bool(floor) and sys.version_info[:2] < (int(floor[1]), int(floor[2]))
+        return not SpecifierSet(spec).contains(platform.python_version(), prereleases=True)
+    except (KeyError, TypeError, ValueError):  # TOMLDecodeError / InvalidSpecifier are ValueErrors
+        return False
+
+
 def target_syntax_error(git_cmd, root: Path, target_ref: str, relpaths) -> tuple[str, str] | None:
     """``(path, error)`` for the first startup-critical file that does not compile at ``target_ref``.
 
     Read from the object store, never written to the tree: this runs BEFORE HEAD moves, so a broken
     release is refused with the install untouched (the post-pull rollback stays as the backstop).
+    Skipped for a target that requires a Python this interpreter is not (``requires_other_python``).
     """
+    pyproject = subprocess.run([*git_cmd, "show", f"{target_ref}:pyproject.toml"], cwd=str(root),
+                               capture_output=True, stdin=subprocess.DEVNULL, timeout=120)
+    if pyproject.returncode == 0 and requires_other_python(pyproject.stdout):
+        return None
     for rel in relpaths:
         shown = subprocess.run([*git_cmd, "show", f"{target_ref}:{rel}"], cwd=str(root), capture_output=True,
                                stdin=subprocess.DEVNULL, timeout=120)
@@ -149,8 +198,9 @@ def checkout_untouched(git_cmd, root: Path, start: tuple[str, str] | None) -> bo
 
 
 def record_run_start(git_cmd, root: Path) -> None:
-    global _run_start
+    global _run_start, _obligation_root
     _run_start = (list(git_cmd), head_and_branch(git_cmd, root))
+    _obligation_root = Path(root)
 
 
 def run_checkout_untouched(root: Path) -> bool:
@@ -185,6 +235,7 @@ def preflight_refusal(git_cmd, root: Path, target_ref: str, critical_files) -> s
 
 
 def reset_for_tests() -> None:
-    global _armed_snapshot, _run_start
+    global _armed_snapshot, _run_start, _obligation_root
     _armed_snapshot = None
     _run_start = None
+    _obligation_root = None
