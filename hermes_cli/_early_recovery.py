@@ -244,6 +244,35 @@ def interrupted_pull_marker(root: Path) -> Path:
     return _git_dir(root) / INTERRUPTED_PULL_MARKER
 
 
+def _git_executable() -> str:
+    """The git ``hermes update`` runs (``_subprocess_compat.expose_pm_git``), without installing it.
+
+    PATH's git first. A Windows install whose only git is the one install.ps1 staged in PM's store
+    has none on PATH until the updater exposes it, so this falls back to that copy: PM's recorded
+    entry, or the lockfile's pinned entry the installer extracted without recording it. A bare
+    ``git`` there dies with WinError 2 and the torn tree this repair exists for stays torn.
+    """
+    import shutil
+
+    found = shutil.which("git")
+    if found:
+        return found
+    with contextlib.suppress(Exception):  # no PM, no store, no Windows git package: PATH's answer stands
+        import pm
+        from pm import paths
+        from pm.lock import Lockfile
+
+        recorded = pm.installed_package("git", allow_outdated=True)
+        if recorded is not None and recorded.binary is not None and recorded.binary.is_file():
+            return str(recorded.binary)
+        package, target = pm.get_package("git"), pm.current_target()
+        version = Lockfile(paths.lockfile_path()).version("git")
+        staged = package.binary(paths.store_root() / package.store_entry(version, target), target)
+        if staged is not None and staged.is_file():
+            return str(staged)
+    return "git"
+
+
 def _trees_git_could_write(git, pre: str, target: str) -> tuple[list[str], set[str]]:
     """The trees the killed git was moving the checkout to, and the paths whose new content is unknowable.
 
@@ -315,9 +344,12 @@ def _paths_git_wrote(git, root: Path, pre: str, target: str) -> tuple[list[str],
             written = True
         else:  # git's own file cut short starts one of the new blobs
             content = file.read_bytes()
-            written = any(subprocess.run(["git", "-C", str(root), "cat-file", "--filters", f"--path={path}", blob],
-                                         capture_output=True, check=True, timeout=120,
-                                         stdin=subprocess.DEVNULL).stdout.startswith(content) for blob in blobs)
+            written = False
+            for blob in blobs:
+                shown = git("cat-file", "--filters", f"--path={path}", blob, text=False)
+                if shown.returncode != 0:
+                    raise subprocess.SubprocessError(shown.stderr.decode(errors="replace").strip())
+                written = written or shown.stdout.startswith(content)
         if written:
             (added if old_blob is None else restore).append(path)
     new_dirs = {str(parent) for path, (_m, old_blob, _n) in entries.items() if old_blob is None
@@ -602,10 +634,12 @@ def _restore_holding_claim(root: Path, marker: Path, *, after_failure: bool = Fa
     pre, target = fields.get("pre", "").strip(), fields.get("target", "").strip()
     stash = fields.get("stash", "").strip()
 
-    def git(*args: str, stdin: str | None = None) -> subprocess.CompletedProcess:
-        return subprocess.run(["git", "--literal-pathspecs", "-C", str(root), *args], input=stdin,
-                              capture_output=True, text=True, encoding="utf-8", errors="replace",
-                              timeout=120, stdin=None if stdin is not None else subprocess.DEVNULL)
+    executable = _git_executable()
+
+    def git(*args: str, stdin: str | None = None, text: bool = True) -> subprocess.CompletedProcess:
+        return subprocess.run([executable, "--literal-pathspecs", "-C", str(root), *args], input=stdin,
+                              capture_output=True, timeout=120, stdin=None if stdin is not None else subprocess.DEVNULL,
+                              **({"text": True, "encoding": "utf-8", "errors": "replace"} if text else {}))
 
     if not pre or not target or git("rev-parse", "HEAD").stdout.strip() != pre:
         marker.unlink()  # git finished (HEAD moved) or the marker is unusable
