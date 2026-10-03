@@ -132,15 +132,12 @@ def test_branch_update_uses_real_refs_and_completion_request(update_tree, monkey
     def fault(command, *args, **kwargs):
         assert Path(command[0]).name.lower() in {'git', 'git.exe'} or command[0] == sys.executable, command
         assert Path(kwargs['cwd']).resolve() in {t.clone, t.origin}, command
-        if 'merge' in command and _upstream_sha() in command:  # the fork sync's local fast-forward
-            result = run(command, *args, **kwargs)
-            if case.startswith('fork-late'):
-                if case.endswith('wrong-branch'):
-                    run(['git', 'checkout', '-qb', 'wrong'], cwd=t.clone, check=True, capture_output=True)
-                if case.endswith('reverted'):
-                    run(['git', 'reset', '--hard', t.base], cwd=t.clone, check=True, capture_output=True)
-            return result
-        if 'merge' in command and '--ff-only' in command:
+        # The upstream sync's tree move (`pull upstream main` on older updaters, a local merge of
+        # the commit resolved from `refs/remotes/upstream/main` now, m2) vs the origin fast-forward.
+        upstream_move = ('pull' in command or 'merge' in command) and (
+            any(arg == 'upstream' or arg.startswith(('upstream/', 'refs/remotes/upstream/')) for arg in command)
+            or ('merge' in command and _upstream_sha() in command))
+        if 'merge' in command and '--ff-only' in command and not upstream_move:
             if case == 'no-move':
                 return subprocess.CompletedProcess(command, 0, stdout='', stderr='')
             result = run(command, *args, **kwargs)
@@ -150,6 +147,11 @@ def test_branch_update_uses_real_refs_and_completion_request(update_tree, monkey
                 run(['git', 'reset', '--hard', t.base], cwd=t.clone, check=True, capture_output=True)
             return result
         result = run(command, *args, **kwargs)
+        if upstream_move and case.startswith('fork-late'):
+            if case.endswith('wrong-branch'):
+                run(['git', 'checkout', '-qb', 'wrong'], cwd=t.clone, check=True, capture_output=True)
+            if case.endswith('reverted'):
+                run(['git', 'reset', '--hard', t.base], cwd=t.clone, check=True, capture_output=True)
         if 'push' in command and 'origin' in command:
             pushes.append(result.returncode)
         return result
@@ -457,7 +459,10 @@ def test_update_syntax_failure_restores_pre_update_head(update_tree, monkeypatch
         assert "checkout is on 'unexpected'" in output
         assert 'Rolling back' not in output
     else:
-        assert 'Pulled code has a syntax error' in output
+        # Origin's own target is refused before HEAD moves (the commit point's preflight); an
+        # upstream sync's target is still caught by the post-pull guard and rolled back.
+        assert ('The update target has a syntax error' if sync_phase == 'origin'
+                else 'Pulled code has a syntax error') in output
         assert git(t.clone, 'rev-parse', 'HEAD') == t.base
         assert not (t.clone / 'hermes_cli' / 'config.py').exists()
     assert not git(t.clone, 'status', '--porcelain')

@@ -118,6 +118,30 @@ def arm_tree_move(git_cmd, root: Path, *, pre: str | None, target: str, stash: s
     return marker
 
 
+def files_added_by(git_cmd, root: Path, pre: str, target: str | None) -> list[str]:
+    """Paths ``target`` adds over ``pre``. A rollback's mixed reset un-tracks them and ``reset --hard``
+    never touches untracked files, so ``drop_added_files`` removes them by name afterwards."""
+    if not target or target == pre:
+        return []
+    cp = subprocess.run([*git_cmd, "diff", "--name-only", "-z", "--no-renames", "--diff-filter=A", pre, target],
+                        cwd=str(root), capture_output=True, text=True, encoding="utf-8", errors="replace",
+                        stdin=subprocess.DEVNULL, timeout=120)
+    return [p for p in cp.stdout.split("\0") if p] if cp.returncode == 0 else []
+
+
+def drop_added_files(root: Path, added: list[str]) -> None:
+    """Every one is the move's own file: git refuses to move a checkout over an untracked file."""
+    root = Path(root)
+    for rel in added:
+        (root / rel).unlink(missing_ok=True)
+    for parent in sorted({p for rel in added for p in Path(rel).parents if str(p) != "."},
+                         key=lambda p: len(p.parts), reverse=True):
+        try:
+            (root / parent).rmdir()  # only when empty: anything else inside keeps it
+        except OSError:
+            pass
+
+
 def settle_failed_tree_move(root: Path) -> bool:
     """Git exited without finishing a tree move: put back what it wrote, keep the marker if we can't.
 

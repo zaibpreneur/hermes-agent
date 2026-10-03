@@ -643,7 +643,7 @@ def _restore_holding_claim(root: Path, marker: Path, *, after_failure: bool = Fa
     executable = _git_executable()
 
     def git(*args: str, stdin: str | None = None, text: bool = True) -> subprocess.CompletedProcess:
-        return subprocess.run([executable, "--literal-pathspecs", "-C", str(root), *args], input=stdin,
+        return subprocess.run([executable, "--literal-pathspecs", "-C", str(root), *args], input=stdin, cwd=str(root),
                               capture_output=True, timeout=120, stdin=None if stdin is not None else subprocess.DEVNULL,
                               **({"text": True, "encoding": "utf-8", "errors": "replace"} if text else {}))
 
@@ -668,7 +668,10 @@ def _restore_holding_claim(root: Path, marker: Path, *, after_failure: bool = Fa
                   file=sys.stderr)
         return False
     # A killed claim holder's own git child can still be writing; scanning under it reads half a tree.
-    if not _release_dead_index_lock(git_dir):
+    # After a git that EXITED (``after_failure``) no git of ours is left: a lock now is another git's
+    # (often the very reason ours failed), never ours to drop. The scan below only reads.
+    foreign_lock = after_failure and (git_dir / "index.lock").exists()
+    if not foreign_lock and not _release_dead_index_lock(git_dir):
         print("⚠ A running git holds the index after an interrupted `hermes update`; the next launch "
               "finishes the restore.", file=sys.stderr)
         return False
@@ -678,6 +681,10 @@ def _restore_holding_claim(root: Path, marker: Path, *, after_failure: bool = Fa
         print(f"⚠ Ignoring a stale interrupted-update marker: commit {target[:10]} is gone.", file=sys.stderr)
         return False
     restore, added, new_dirs = written
+    if (restore or added) and foreign_lock:
+        print("⚠ Another git holds the index, so the files the update already wrote cannot be put back "
+              "now; the next launch restores them.", file=sys.stderr)
+        return False
     if restore or added:
         print(("⚠ git stopped partway through writing the new code — " if after_failure else
                "⚠ A previous `hermes update` was killed while git was writing the new code — ")

@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 
 def prepare(request: dict) -> tuple[Path, dict[str, str]]:
@@ -64,10 +66,20 @@ def _arm_fleet_obligation(root: Path) -> None:
     head = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True, encoding="utf-8",
                           stdin=subprocess.DEVNULL, timeout=60)
     sha = head.stdout.strip() if head.returncode == 0 else ""
-    if sha:  # an SHA-less record names no code the fleet could be proven current on
-        from hermes_cli.update_cmd_fleet import _write_fleet_restart_pending_marker
+    if not sha:  # an SHA-less record names no code the fleet could be proven current on
+        return
+    # This runs in the HISTORICAL interpreter, before PM syncs the new dependencies: only stdlib-only
+    # modules here (``update_cmd_fleet``'s writer imports ``update_cmd`` -> config -> ruamel, which a
+    # release older than ruamel does not have).
+    from hermes_cli.update_host_obligation import write_host_obligation
 
-        _write_fleet_restart_pending_marker(expected_sha=sha)
+    if not write_host_obligation(expected_sha=sha):
+        # Same fallback as ``update_cmd_fleet._write_fleet_restart_pending_marker``: the per-home
+        # breadcrumb every reader still honours.
+        from hermes_constants import get_hermes_home
+
+        (get_hermes_home() / "fleet_restart_pending").write_text(
+            f"started={time.time()}\npid={os.getpid()}\nexpected_sha={sha}\n", encoding="utf-8")
 
 
 def _record_failure(request: dict, result: Path, code: int, detail: str) -> None:

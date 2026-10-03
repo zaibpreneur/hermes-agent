@@ -932,9 +932,11 @@ def _rollback_if_pulled_syntax_error(git_cmd, pre_pull_sha, *, rollback_branch=N
         # writes, so the next launch's restore lands on pre_pull_sha, never on the broken commit;
         # ``rollback=`` lets it redo the HEAD step when the kill came before it.
         mode = "branch" if rollback_branch is None else "detach"
+        target_sha = _capture_head_sha(git_cmd, root)
         with _best_effort('Could not write the interrupted-pull marker: %s'):
-            _commit.arm_tree_move(git_cmd, root, pre=pre_pull_sha, target=_capture_head_sha(git_cmd, root),
+            _commit.arm_tree_move(git_cmd, root, pre=pre_pull_sha, target=target_sha,
                                   stash=None, rollback=mode)
+        added = _commit.files_added_by(git_cmd, root, pre_pull_sha, target_sha)
         if mode == "detach":  # never move the update branch onto a parked/detached commit
             rollback_args = ["update-ref", "--no-deref", "HEAD", pre_pull_sha]
             rollback_result = _git_run(git_cmd, rollback_args)
@@ -944,6 +946,8 @@ def _rollback_if_pulled_syntax_error(git_cmd, pre_pull_sha, *, rollback_branch=N
         if rollback_result.returncode == 0:
             rollback_args = ["reset", "--hard", pre_pull_sha]
             rollback_result = _git_run(git_cmd, rollback_args)
+            if rollback_result.returncode == 0:
+                _commit.drop_added_files(root, added)
         if rollback_result.returncode != 0 and _commit.settle_failed_tree_move(root):
             rollback_result = subprocess.CompletedProcess(rollback_args, 0, "", "")  # restored in-process
         if rollback_result.returncode == 0 and parked:

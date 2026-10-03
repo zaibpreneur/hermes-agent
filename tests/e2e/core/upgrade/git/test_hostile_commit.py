@@ -234,7 +234,10 @@ def _zip_killed_at(world, kill_at: str, files: dict[str, str] | None = None):
 def test_kill_mid_zip_swap_is_settled_by_the_next_launch(world):
     sb = world["sb"]
     pre = _head(sb)
-    killed = _zip_killed_at(world, "12")
+    # Killed right after a TRACKED file's new bytes landed: the swap order follows the archive's
+    # directory listing, so a "kill at the N-th swap" can land on N unchanged entries only.
+    agents = I.git("show", "HEAD:AGENTS.md", cwd=world["origin"]) + "\n<!-- e2e zip swap -->\n"
+    killed = _zip_killed_at(world, "after:AGENTS.md", {"AGENTS.md": agents})
     at_kill = {"artifacts": _artifacts(sb), "dirty": _tracked_dirty(sb),
                "new_entry": (sb.checkout / "e2e_zip_release.py").exists()}
     assert at_kill["artifacts"] and at_kill["dirty"], (
