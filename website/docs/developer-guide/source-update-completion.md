@@ -116,10 +116,21 @@ runner to be importable. If either module is torn, launch stops with
 `Cannot safely repair` and retains the interrupted-update marker instead of
 writing without exclusion. An updater that already imported healthy code can
 still hold and write the checkout even when its on-disk modules are damaged.
-Wait for any running update to finish; persistent damage requires checkout repair
-before launching again. This safety refusal is not automatic recovery of the
-recovery modules themselves: the launcher still depends on checkout bootstrap
-code, which a killed tree move can also leave unavailable.
+Wait for any running update to finish.
+
+The repair code lives in the tree a killed move tears (`hermes_bootstrap.py`,
+`hermes_cli/__init__.py`, `_early_recovery.py`, `update_lock.py`,
+`update_custody.py`). Before git writes, every tree move publishes those
+recovery/lock/custody modules, as committed at the move's starting commit, to
+`<git dir>/hermes-update-recovery/<pre>/`, outside the working tree and keyed
+to the marker's `pre`. When the checkout's own import fails while the marker
+exists, the minted launcher (`.hermes/bin/hermes`) runs that published copy:
+stdlib plus the copy only, the same restore claim and checkout lock (a live
+writer still gets `Not repairing the checkout now`), then relaunches from the
+restored tree. Limits: other entry points (`python -m hermes_cli.main`, the
+`hermes-agent` hook) have no such fallback, a launcher minted before this
+fallback existed has none, and the first update performed by such an old
+launcher's code publishes no closure.
 
 ## Historical surface
 

@@ -18,10 +18,16 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from contextlib import suppress
 from pathlib import Path
 from typing import Optional
 
-from hermes_cli._early_recovery import interrupted_pull_marker, restore_interrupted_pull
+from hermes_cli._early_recovery import (
+    RECOVERY_CLOSURE,
+    interrupted_pull_marker,
+    recovery_closure_dir,
+    restore_interrupted_pull,
+)
 from hermes_cli.update_custody import run_git
 
 # What this run found before it armed anything: {path: bytes or None}. None = nothing armed yet.
@@ -114,10 +120,49 @@ def arm_tree_move(git_cmd, root: Path, *, pre: str | None, target: str, stash: s
     redoes it first.
     """
     marker = interrupted_pull_marker(root)
+    if pre:
+        with suppress(OSError, subprocess.SubprocessError):  # no closure: the in-tree repair still runs
+            publish_recovery_closure(git_cmd, root, pre)
     marker.write_text(f"pid={os.getpid()}\npre={pre or ''}\ntarget={target}\nstash={stash or ''}\n"
                       + (f"rollback={rollback}\n" if rollback else "")
                       + (f"git={git}\n" if (git := _absolute_git(git_cmd)) else ""), encoding="utf-8")
     return marker
+
+
+def publish_recovery_closure(git_cmd, root: Path, pre: str) -> Path:
+    """Copy the launch repair's modules, as committed at ``pre``, beside the marker (outside the tree).
+
+    The bytes come from the commit the repair restores, never from the working tree: a rollback move
+    starts from a broken tree, and a second move in one run starts from code this process never ran.
+    Published by an atomic directory rename, so a present closure is a whole one; an older run's
+    closure (another ``pre``) is dropped.
+    """
+    import shutil
+
+    dest = recovery_closure_dir(Path(root), pre)
+    if all((dest / rel).is_file() for rel in RECOVERY_CLOSURE):
+        return dest
+    blobs = {}
+    for rel in RECOVERY_CLOSURE:
+        shown = run_git(git_cmd, ["cat-file", "blob", f"{pre}:{rel}"], cwd=str(root), capture_output=True,
+                        stdin=subprocess.DEVNULL, timeout=120)
+        if shown.returncode != 0 or not isinstance(shown.stdout, bytes) or not shown.stdout:
+            raise OSError(f"{rel} is not in {pre[:10]}")
+        blobs[rel] = shown.stdout
+    staging = dest.with_name(f".{pre}.{os.getpid()}.staging")
+    shutil.rmtree(staging, ignore_errors=True)
+    try:
+        for rel, data in {**blobs, "hermes_cli/__init__.py": b""}.items():
+            (staging / rel).parent.mkdir(parents=True, exist_ok=True)
+            (staging / rel).write_bytes(data)
+        shutil.rmtree(dest, ignore_errors=True)
+        os.replace(staging, dest)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    for stale in dest.parent.iterdir():
+        if stale != dest:
+            shutil.rmtree(stale, ignore_errors=True)
+    return dest
 
 
 def _absolute_git(git_cmd) -> str:

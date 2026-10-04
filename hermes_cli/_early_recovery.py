@@ -245,6 +245,19 @@ def interrupted_pull_marker(root: Path) -> Path:
     return _git_dir(root) / INTERRUPTED_PULL_MARKER
 
 
+# The repair's own code is in the tree a killed move tears (``hermes_bootstrap``, this module, the
+# package initializer, the lock/custody modules). ``update_cmd_commit.arm_tree_move`` publishes this
+# closure, as committed at the marker's ``pre``, beside the marker before git writes; a minted
+# launcher whose checkout import fails runs the repair from there (``_launchers._launcher_script``).
+# The modules import only the stdlib and each other; the package initializer is published empty.
+RECOVERY_CLOSURE_DIR = "hermes-update-recovery"
+RECOVERY_CLOSURE = ("hermes_cli/_early_recovery.py", "hermes_cli/update_lock.py", "hermes_cli/update_custody.py")
+
+
+def recovery_closure_dir(root: Path, pre: str) -> Path:
+    return _git_dir(root) / RECOVERY_CLOSURE_DIR / pre
+
+
 def _git_executable(recorded_by_updater: str = "") -> str:
     """The git ``hermes update`` runs (``_subprocess_compat.expose_pm_git``), without installing it.
 
@@ -741,8 +754,11 @@ def restore_interrupted_pull(project_root: Path | None = None, *, after_failure:
     edits are never touched; the updater's autostash (if any) stays in ``git stash list``. Concurrent
     launches take turns (``_restore_claim``); a launch that waited out another's restore relaunches.
 
-    Limits, by design: a torn ``hermes_cli/__init__.py``, ``hermes_bootstrap.py``, ``agent/__init__.py``
-    or ``agent/jiter_preload.py`` (imported before the ``hermes-agent`` hook) fails before this runs. A file git also changes that the user deleted, emptied or cut to a prefix of git's version
+    A torn ``hermes_bootstrap.py``, ``hermes_cli/__init__.py`` or recovery/lock/custody module fails
+    before (or inside) the checkout's copy of this code: a minted launcher then runs the copy the
+    updater published beside the marker (``RECOVERY_CLOSURE``). Limits, by design: other entry points
+    (``python -m``, the ``hermes-agent`` hook's ``agent/__init__.py``) have no such fallback, and a
+    launcher minted before that fallback existed has none either. A file git also changes that the user deleted, emptied or cut to a prefix of git's version
     looks exactly like git's own half-written file and is restored too, as is a user edit to a
     conflicted path or, on git < 2.38, to a path both sides of a custom-branch merge changed.
     """

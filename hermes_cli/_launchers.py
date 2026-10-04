@@ -317,19 +317,55 @@ def _launcher_script(name: str, repo_root: Path, dependencies: Path | None) -> s
     # ``hermes_bootstrap`` right after the repair (``_PIN_DEFAULT_HOME``), and here again for a
     # bootstrap that predates that hook.
     root = str(repo_root.resolve())
+    from hermes_cli._early_recovery import INTERRUPTED_PULL_MARKER, RECOVERY_CLOSURE_DIR
+
+    # A killed move can tear the repair's own code (``hermes_bootstrap``, ``hermes_cli``): with the
+    # marker still there, run the copy the updater published beside it before git wrote (stdlib +
+    # that copy only; it still takes the checkout lock), then relaunch from the restored tree.
+    closure_repair = (
+        "def _hermes_closure_repair():\n"
+        "    from pathlib import Path\n"
+        f"    root = Path({root!r})\n"
+        "    git = root / '.git'\n"
+        "    try:\n"
+        "        if git.is_file():\n"
+        "            text = git.read_text(encoding='utf-8-sig').strip()\n"
+        "            git = root / text[7:].strip() if text.startswith('gitdir:') else git\n"
+        f"        fields = dict(line.partition('=')[::2] for line in (git / {INTERRUPTED_PULL_MARKER!r})"
+        ".read_text(encoding='utf-8-sig').splitlines())\n"
+        "    except OSError:\n"
+        "        return\n"
+        "    pre = fields.get('pre', '').strip()\n"
+        f"    closure = git / {RECOVERY_CLOSURE_DIR!r} / pre\n"
+        "    if not pre or not (closure / 'hermes_cli' / '_early_recovery.py').is_file():\n"
+        "        return\n"
+        "    for name in [n for n in sys.modules if n.split('.')[0] in ('hermes_cli', 'hermes_bootstrap', 'hermes_constants', 'pm')]:\n"
+        "        del sys.modules[name]\n"
+        "    tree = os.path.normcase(os.path.realpath(root))\n"
+        "    sys.path[:] = [str(closure)] + [p for p in sys.path if p and os.path.normcase(os.path.realpath(p)) != tree\n"
+        "                                    and not os.path.normcase(os.path.realpath(p)).startswith(tree + os.sep)]\n"
+        "    print('hermes: the checkout cannot start after an interrupted `hermes update`; '\n"
+        "          'repairing it with the recovery code saved before the update.', file=sys.stderr)\n"
+        "    sys.dont_write_bytecode = True\n"
+        "    from hermes_cli import _early_recovery\n"
+        "    if _early_recovery.restore_interrupted_pull(root):\n"
+        "        _early_recovery.relaunch_after_restore()\n"
+    )
     return (
         "import os, re, sys\n"
         "os.environ.pop('PYTHONHOME', None)\n"
         "os.environ.pop('PYTHONPATH', None)\n"
         f"sys.path.insert(0, {root!r})\n"
+        + closure_repair +
         "if sys.argv[1:2] == ['--print-runtime-command']:\n"
         "    sys.dont_write_bytecode = True\n"
         "    from pathlib import Path\n"
         "    try:\n"
         "        from hermes_cli import _early_recovery\n"
-        "    except ImportError:\n"
-        "        _early_recovery = None\n"
-        f"    if _early_recovery is not None and _early_recovery.restore_interrupted_pull(Path({root!r})):\n"
+        "    except Exception:\n"
+        "        _hermes_closure_repair()\n"
+        "        raise\n"
+        f"    if _early_recovery.restore_interrupted_pull(Path({root!r})):\n"
         "        _early_recovery.relaunch_after_restore()\n"
         "    from hermes_constants import get_default_hermes_root\n"
         "    os.environ['HERMES_HOME'] = os.environ.get('HERMES_HOME') or str(get_default_hermes_root())\n"
@@ -337,7 +373,11 @@ def _launcher_script(name: str, repo_root: Path, dependencies: Path | None) -> s
         f"    print_runtime_command(Path({root!r}), sys.argv[2:])\n"
         "    sys.exit(0)\n"
         f"sys.{PIN_DEFAULT_HOME_FLAG} = True\n"
-        "import hermes_bootstrap\n"
+        "try:\n"
+        "    import hermes_bootstrap\n"
+        "except Exception:\n"
+        "    _hermes_closure_repair()\n"
+        "    raise\n"
         "if not os.environ.get('HERMES_HOME'):\n"
         "    from hermes_constants import get_default_hermes_root\n"
         "    os.environ['HERMES_HOME'] = str(get_default_hermes_root())\n"
