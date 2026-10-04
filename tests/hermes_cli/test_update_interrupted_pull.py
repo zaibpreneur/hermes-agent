@@ -408,3 +408,85 @@ def test_a_rollback_marker_outlives_a_lock_that_may_still_be_live(tmp_path):
     assert er.restore_interrupted_pull(root) is True
     assert _git(root, "rev-parse", "HEAD") == pre and not marker.exists() and not lock.exists()
     assert _git(root, "status", "--porcelain", "--untracked-files=no") == ""
+
+
+# --- R2: the launch-time repair holds the checkout kernel lock -------------------------------
+
+_HOLD_CHECKOUT = """
+import sys, time
+from pathlib import Path
+from hermes_cli import update_lock
+assert update_lock._acquire_checkout(Path(sys.argv[1])) is None
+print("held", flush=True)
+time.sleep(120)
+"""
+
+
+def test_launch_repair_leaves_the_tree_to_a_live_update_holding_the_checkout(tmp_path, capsys):
+    """A live update tree (here: a process holding the checkout kernel lock, as a running
+    completion/build/git does after its updater died) owns the checkout: the launch-time repair
+    must not touch it, and must finish the job once the tree is gone."""
+    root, pre, target = _broken_release(tmp_path, 20)
+    marker = _rollback_marker(root, pre, target)
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join([str(Path(er.__file__).resolve().parents[1]),
+                                                       os.environ.get("PYTHONPATH", "")]))
+    holder = subprocess.Popen([sys.executable, "-c", _HOLD_CHECKOUT, str(root)], stdout=subprocess.PIPE,
+                              text=True, env=env)
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        assert er.restore_interrupted_pull(root) is False
+        assert "Not repairing the checkout now" in capsys.readouterr().err
+        assert marker.exists() and _git(root, "rev-parse", "HEAD") == target, "the repair raced a live update"
+    finally:
+        holder.kill()
+        holder.wait()
+    assert er.restore_interrupted_pull(root) is True
+    assert _git(root, "rev-parse", "HEAD") == pre and not marker.exists()
+
+
+def test_a_dead_index_lock_is_released_even_when_git_cannot_run(tmp_path, monkeypatch):
+    """The dead ``index.lock`` goes before any git runs: an unresolvable git must not strand it."""
+    root, pre, target = _broken_release(tmp_path, 5)
+    _rollback_marker(root, pre, target)
+    lock = root / ".git" / "index.lock"
+    lock.write_bytes(b"")
+    if sys.platform == "darwin" and not shutil.which("lsof"):
+        pytest.skip("no lsof: the dead lock cannot be proven dead here")
+    monkeypatch.setattr(er, "_git_executable", lambda: str(tmp_path / "no-such-git"))
+    assert er.restore_interrupted_pull(root) is False
+    assert not lock.exists(), "a missing git stranded a dead index.lock"
+
+
+@pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="Linux /proc holder scan")
+def test_a_reader_git_in_the_tree_is_not_an_index_lock_holder_and_a_holder_is_named(tmp_path, capsys):
+    """A reader git whose cwd is the checkout (a paged ``git log``, ``cat-file --batch``) never takes
+    ``index.lock``: it must not keep a dead lock forever. A process with the lock open is named (pid + name) in the message."""
+    root, pre, target = _broken_release(tmp_path, 5)
+    marker = _rollback_marker(root, pre, target)
+    lock = root / ".git" / "index.lock"
+    lock.write_bytes(b"")
+    # A long-lived reader git in the tree (what IDEs and gitstatusd keep): `git cat-file --batch`
+    # waiting on stdin, the same shape as a `git log` parked in its pager.
+    pager = subprocess.Popen(["git", "cat-file", "--batch"], cwd=root, stdin=subprocess.PIPE,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        assert er.restore_interrupted_pull(root) is True, "a reader git kept a dead index.lock"
+        assert _git(root, "rev-parse", "HEAD") == pre and not marker.exists() and not lock.exists()
+    finally:
+        pager.kill()
+        pager.wait()
+
+    (tmp_path / "named").mkdir()
+    root2, pre2, target2 = _broken_release(tmp_path / "named", 5)
+    _rollback_marker(root2, pre2, target2)
+    lock2 = root2 / ".git" / "index.lock"
+    holder = subprocess.Popen([sys.executable, "-c", "import sys, time; f = open(sys.argv[1], 'w'); "
+                               "print('held', flush=True); time.sleep(120)", str(lock2)],
+                              stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        assert er.restore_interrupted_pull(root2) is False
+        assert f"pid {holder.pid} (" in capsys.readouterr().err
+    finally:
+        holder.kill()
+        holder.wait()
