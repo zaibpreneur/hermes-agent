@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import os
+import re
 import subprocess
 import sys
 import time
@@ -256,7 +257,7 @@ def _git_executable(recorded_by_updater: str = "") -> str:
     """
     import shutil
 
-    if recorded_by_updater and os.path.isfile(recorded_by_updater):
+    if recorded_by_updater and os.path.isfile(recorded_by_updater) and _is_git(recorded_by_updater):
         return recorded_by_updater
     found = shutil.which("git")
     if found:
@@ -275,6 +276,23 @@ def _git_executable(recorded_by_updater: str = "") -> str:
         if staged is not None and staged.is_file():
             return str(staged)
     return "git"
+
+
+def _is_git(path: str) -> bool:
+    """``path`` still runs as git: ``--version`` exits 0 and says ``git version`` (m5). A recorded
+    git that decayed into anything else (gone executable, a stub that exits 0 silently) must not
+    answer the repair's questions: its empty ``rev-parse`` would read as "HEAD moved"."""
+    try:
+        probe = subprocess.run([path, "--version"], capture_output=True, text=True, encoding="utf-8",
+                               errors="replace", timeout=30, stdin=subprocess.DEVNULL,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    return probe.returncode == 0 and probe.stdout.startswith("git version")
+
+
+# A full object name (SHA-1 or SHA-256): what `git rev-parse --verify HEAD` must print (m5).
+_OID = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 
 
 def _trees_git_could_write(git, pre: str, target: str) -> tuple[list[str], set[str]]:
@@ -787,6 +805,10 @@ def _checkout_custody(root: Path):
         yield ""
         return
     holder = update_lock._acquire_checkout(Path(root))
+    if holder is not None and not update_lock.checkout_lock_held(Path(root)):
+        # Refused, then free by the probe: its holder just exited. Take it now rather than run the
+        # repair unguarded in that window (m10).
+        holder = update_lock._acquire_checkout(Path(root))
     if holder is not None:
         if not update_lock.checkout_lock_held(Path(root)):
             # Not a holder but no lock at all (a git dir without working locks, e.g. NFS without
@@ -840,12 +862,21 @@ def _restore_holding_claim(root: Path, marker: Path, *, after_failure: bool = Fa
 
     rollback = fields.get("rollback", "").strip()
     rollback = rollback if rollback in ("branch", "detach") else ""
-    head = git("rev-parse", "HEAD")
-    if head.returncode != 0:
-        print(f"⚠ Could not read HEAD to repair an interrupted `hermes update` ({head.stderr.strip()}); "
+    def read_head() -> str | None:
+        # Only a full object name is an answer: an empty or garbled one keeps the marker (m5).
+        head = git("rev-parse", "HEAD")
+        oid = head.stdout.strip() if head.returncode == 0 else ""
+        if _OID.fullmatch(oid):
+            return oid
+        detail = head.stderr.strip() or f"git printed {oid!r}, exit {head.returncode}"
+        print(f"⚠ Could not read HEAD to repair an interrupted `hermes update` ({detail}); "
               "the next launch retries.", file=sys.stderr)
+        return None
+
+    head = read_head()
+    if head is None:
         return False
-    if rollback and pre and target and head.stdout.strip() == target:
+    if rollback and pre and target and head == target:
         # A syntax rollback killed before it moved HEAD back: redo that step (HEAD and index, no file),
         # so the restore below lands on ``pre`` (the code the update started from), not the broken tree.
         # Every step is checked, and the killed step's ``index.lock`` goes first, only once its git is
@@ -855,8 +886,10 @@ def _restore_holding_claim(root: Path, marker: Path, *, after_failure: bool = Fa
             print(f"⚠ An interrupted `hermes update` rollback to {pre[:10]} cannot resume yet ({reason}); "
                   "the next launch retries.", file=sys.stderr)
             return False
-        head = git("rev-parse", "HEAD")
-    if not pre or not target or head.stdout.strip() != pre:
+        head = read_head()
+        if head is None:
+            return False
+    if not pre or not target or head != pre:
         marker.unlink()  # git finished (HEAD moved) or the marker is unusable
         return False
     if any((git_dir / name).exists() for name in _GIT_OPERATION_IN_PROGRESS):

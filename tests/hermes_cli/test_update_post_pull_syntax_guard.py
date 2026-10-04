@@ -138,7 +138,9 @@ def test_the_tree_move_marker_records_the_absolute_git_the_repair_reruns(tmp_pat
                                   target="b" * 40, stash=None)
     fields = dict(line.partition("=")[::2] for line in marker.read_text(encoding="utf-8").splitlines())
     assert fields["git"] == str(fake)
-    # ...and the repair prefers it to PATH (empty here) and to the pm lookup.
+    # ...and the repair prefers it to PATH (empty here) and to the pm lookup, once it answers as a
+    # git (m5: this fake is an empty file; the version probe is what decides).
     monkeypatch.setattr("shutil.which", lambda name: None)
+    monkeypatch.setattr(_early_recovery, "_is_git", lambda path: path == str(fake))
     assert _early_recovery._git_executable(fields["git"]) == str(fake)
     assert _early_recovery._git_executable(str(tmp_path / "gone")) != str(tmp_path / "gone")

@@ -490,3 +490,68 @@ def test_a_reader_git_in_the_tree_is_not_an_index_lock_holder_and_a_holder_is_na
     finally:
         holder.kill()
         holder.wait()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell stubs stand in for a decayed git")
+@pytest.mark.parametrize("stub", ["#!/bin/sh\nexit 0\n", "not a program\n"], ids=["silent-exit-0", "not-executable"])
+def test_a_recorded_git_that_is_no_longer_git_falls_back_and_still_repairs(tmp_path, stub):
+    """m5: the marker's recorded ``git=`` was trusted on ``os.path.isfile`` alone. A stub that exits 0
+    silently made ``rev-parse HEAD`` print nothing, which read as "HEAD moved": the marker was
+    deleted over the torn tree. A non-executable file bricked every launch. The recorded git must
+    answer ``--version`` as git, else the resolver's git repairs."""
+    root, pre, target = _broken_release(tmp_path, 5)
+    stub_path = tmp_path / "decayed-git"
+    stub_path.write_text(stub, encoding="utf-8", newline="")
+    if stub.startswith("#!"):
+        stub_path.chmod(0o755)
+    marker = er.interrupted_pull_marker(root)
+    marker.write_text(f"pid=0\npre={pre}\ntarget={target}\nstash=\nrollback=branch\ngit={stub_path}\n",
+                      encoding="utf-8", newline="")
+    assert er.restore_interrupted_pull(root) is True
+    assert _git(root, "rev-parse", "HEAD") == pre and not marker.exists()
+    assert er._git_executable(str(stub_path)) != str(stub_path)
+
+
+def test_an_empty_head_answer_keeps_the_marker(tmp_path, monkeypatch, capsys):
+    """m5: whatever git answers, only a full object name counts as HEAD; an empty one keeps the
+    marker for the next launch instead of reading as "the update finished"."""
+    root, pre, target = _broken_release(tmp_path, 5)
+    marker = _rollback_marker(root, pre, target)
+    stub = tmp_path / "silent-git"
+    stub.write_text("", encoding="utf-8")
+    monkeypatch.setattr(er, "_git_executable", lambda recorded="": str(stub))
+    real_run = subprocess.run
+
+    def silent(argv, *args, **kwargs):  # every git call "succeeds" with no output
+        if argv and argv[0] == str(stub):
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", silent)
+    assert er.restore_interrupted_pull(root) is False
+    assert marker.exists(), "an empty `rev-parse HEAD` deleted the marker over a torn tree"
+    assert "Could not read HEAD" in capsys.readouterr().err
+
+
+def test_a_refusal_whose_holder_exits_before_the_probe_retries_the_lock(tmp_path, monkeypatch):
+    """m10: the acquire was refused, then the follow-up probe found the lock free (its holder had
+    just exited) and the repair ran unguarded. It takes the lock in that case."""
+    from hermes_cli import update_lock
+
+    root, _pre, _target = _broken_release(tmp_path, 1)
+    real = update_lock._acquire_checkout
+    calls = []
+
+    def refused_once(install_root):
+        calls.append(install_root)
+        if len(calls) == 1:  # the refusal; by the probe its holder is gone
+            return update_lock.UpdateHolder(pid=2 ** 22 + 7, age_seconds=0.0)
+        return real(install_root)
+
+    monkeypatch.setattr(update_lock, "_acquire_checkout", refused_once)
+    with er._checkout_custody(root) as busy:
+        assert busy == ""
+        held = update_lock._HELD
+        assert held is not None and held["path"] == str(update_lock.checkout_lock_path(root)), \
+            "the repair ran without the checkout lock"
+    assert update_lock._HELD is None and len(calls) == 2
