@@ -409,7 +409,7 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path, *, assume_yes: 
     from hermes_cli import update_cmd_commit as _commit
     from hermes_cli._early_recovery import interrupted_pull_marker
     pre = _git_stdout(git_cmd, ["rev-parse", "HEAD"], cwd)
-    target = _git_stdout(git_cmd, ["rev-parse", "upstream/main^{commit}"], cwd) or ""
+    target = upstream  # the counted commit is the marker's target and the merge's (m2)
     _commit.arm_commit_obligations(cwd, target)
     with suppress(OSError):
         _commit.arm_tree_move(git_cmd, cwd, pre=pre, target=target, stash=None)
@@ -438,8 +438,9 @@ def _push_synced_fork(git_cmd: list[str], cwd: Path) -> None:
     (or an earlier one whose push failed) fast-forwarded main from upstream.
     """
     head = _git_stdout(git_cmd, ["rev-parse", "HEAD"], cwd)
-    upstream = _git_stdout(git_cmd, ["rev-parse", "-q", "--verify", "upstream/main^{commit}"], cwd)
-    origin = _git_stdout(git_cmd, ["rev-parse", "-q", "--verify", "origin/main^{commit}"], cwd)
+    # Full ref names: a local branch called upstream/main or origin/main must not answer (m2).
+    upstream = _git_stdout(git_cmd, ["rev-parse", "-q", "--verify", "refs/remotes/upstream/main^{commit}"], cwd)
+    origin = _git_stdout(git_cmd, ["rev-parse", "-q", "--verify", "refs/remotes/origin/main^{commit}"], cwd)
     if not head or head != upstream or head == origin:
         return
     if origin and not _git_ok(git_cmd, ["merge-base", "--is-ancestor", origin, head], cwd):
