@@ -22,6 +22,10 @@ if __name__ == "__main__":
 
 from pm.environments import owning_home_root, store_root
 
+# ``sys`` attribute a launcher sets before ``import hermes_bootstrap``: pin HERMES_HOME to the
+# install's default root once the launch-time repair ran (``hermes_bootstrap._pin_launcher_home``).
+PIN_DEFAULT_HOME_FLAG = "_hermes_pin_default_home"
+
 
 def _inline_string_literal(value: str) -> str:
     """Keep inline Python source intact through Windows PowerShell's native argv quoting."""
@@ -44,15 +48,24 @@ def runtime_command(repo_root: Path, args=(), *, module: str = "hermes_cli.main"
     python = python or resolve_store_python(root) or Path(sys.executable)
     entry = f"exec({_inline_string_literal(code)})" if code is not None else (
         f"runpy.run_module({_inline_string_literal(module)}, run_name='__main__', alter_sys=True)")
-    default_home = (_inline_string_literal(str(home)) if home is not None else
-                    "str(__import__('hermes_constants').get_default_hermes_root())")
+    # A literal home is pinned up front; the default one needs ``hermes_constants`` from the
+    # checkout, so it is pinned only after ``hermes_bootstrap``'s launch-time repair (see
+    # ``_launcher_script``), here again for a bootstrap that predates that hook.
+    if home is not None:
+        pin, settle = (f"os.environ['HERMES_HOME'] = os.environ.get('HERMES_HOME') or "
+                       f"{_inline_string_literal(str(home))}; "), ""
+    else:
+        pin = f"sys.{PIN_DEFAULT_HOME_FLAG} = True; "
+        settle = ("os.environ.get('HERMES_HOME') or os.environ.__setitem__('HERMES_HOME', "
+                  "str(__import__('hermes_constants').get_default_hermes_root())); ")
     bootstrap = (
         "import os, sys, runpy; "
         "os.environ.pop('PYTHONHOME', None); os.environ.pop('PYTHONPATH', None); "
         "os.environ.pop('VIRTUAL_ENV', None); "
         f"sys.path.insert(0, {_inline_string_literal(str(root))}); "
-        f"os.environ['HERMES_HOME'] = os.environ.get('HERMES_HOME') or {default_home}; "
-        "import hermes_bootstrap; "
+        + pin
+        + "import hermes_bootstrap; "
+        + settle
         + entry
     )
     return [str(python), "-I", "-c", bootstrap, *args]
@@ -296,20 +309,38 @@ def _launcher_script(name: str, repo_root: Path, dependencies: Path | None) -> s
     module, func = ENTRY_POINTS[name]
     # Profile boot repairs shared launchers: their default must stay at the
     # install's dependency root, not whichever profile triggered publication.
+    #
+    # The launch-time repair of a checkout a killed update left torn (``hermes_bootstrap`` ->
+    # ``_early_recovery.restore_interrupted_pull``) runs before ANY other checkout module is
+    # imported: a merge killed while writing ``hermes_constants.py`` must not stop every launch
+    # before the repair. The default-home pin (which needs ``hermes_constants``) happens inside
+    # ``hermes_bootstrap`` right after the repair (``_PIN_DEFAULT_HOME``), and here again for a
+    # bootstrap that predates that hook.
+    root = str(repo_root.resolve())
     return (
         "import os, re, sys\n"
         "os.environ.pop('PYTHONHOME', None)\n"
         "os.environ.pop('PYTHONPATH', None)\n"
-        f"sys.path.insert(0, {str(repo_root.resolve())!r})\n"
-        "if sys.argv[1:2] == ['--print-runtime-command']: sys.dont_write_bytecode = True\n"
-        "from hermes_constants import get_default_hermes_root\n"
-        "os.environ['HERMES_HOME'] = os.environ.get('HERMES_HOME') or str(get_default_hermes_root())\n"
+        f"sys.path.insert(0, {root!r})\n"
         "if sys.argv[1:2] == ['--print-runtime-command']:\n"
+        "    sys.dont_write_bytecode = True\n"
         "    from pathlib import Path\n"
+        "    try:\n"
+        "        from hermes_cli import _early_recovery\n"
+        "    except ImportError:\n"
+        "        _early_recovery = None\n"
+        f"    if _early_recovery is not None and _early_recovery.restore_interrupted_pull(Path({root!r})):\n"
+        "        _early_recovery.relaunch_after_restore()\n"
+        "    from hermes_constants import get_default_hermes_root\n"
+        "    os.environ['HERMES_HOME'] = os.environ.get('HERMES_HOME') or str(get_default_hermes_root())\n"
         "    from hermes_cli._launchers import print_runtime_command\n"
-        f"    print_runtime_command(Path({str(repo_root.resolve())!r}), sys.argv[2:])\n"
+        f"    print_runtime_command(Path({root!r}), sys.argv[2:])\n"
         "    sys.exit(0)\n"
+        f"sys.{PIN_DEFAULT_HOME_FLAG} = True\n"
         "import hermes_bootstrap\n"
+        "if not os.environ.get('HERMES_HOME'):\n"
+        "    from hermes_constants import get_default_hermes_root\n"
+        "    os.environ['HERMES_HOME'] = str(get_default_hermes_root())\n"
         "if sys.argv[1:2] == ['--run-module']:\n"
         "    import runpy\n"
         "    if len(sys.argv) < 3: sys.exit('hermes: --run-module needs a module')\n"

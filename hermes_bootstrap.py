@@ -533,6 +533,20 @@ def _settle_interrupted_update() -> None:
 
 _settle_interrupted_update()
 
+
+def _pin_launcher_home() -> None:
+    """A minted launcher (``hermes_cli._launchers``) pins ``HERMES_HOME`` to the install's default
+    root. That needs ``hermes_constants`` from the checkout, so the launcher asks for it here, after
+    the repair above: a merge killed while writing ``hermes_constants.py`` must not keep the repair
+    from ever running. The flag name is ``_launchers.PIN_DEFAULT_HOME_FLAG``."""
+    if getattr(sys, "_hermes_pin_default_home", False) and not os.environ.get("HERMES_HOME"):
+        from hermes_constants import get_default_hermes_root
+
+        os.environ["HERMES_HOME"] = str(get_default_hermes_root())
+
+
+_pin_launcher_home()
+
 _legacy_post_swap = _legacy_post_swap_invocation(sys.argv[1:])
 if _legacy_post_swap is not None:
     # This continuation exists precisely because the replacement tree may not
