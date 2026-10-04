@@ -795,15 +795,18 @@ def _checkout_custody(root: Path):
     or join this process's kill-on-close job (Windows) through ``update_custody.run_git``, so a
     launch killed mid-restore keeps the checkout locked until its git is gone.
 
-    A tree too torn to import the lock module still gets its repair (this is the code that untears
-    it); no updater can be running from such a tree.
+    A torn lock module cannot prove custody: an already-running updater retains its imported
+    copy and may still be writing this checkout. Refuse launch rather than race that writer.
     """
     try:
         from hermes_cli import update_lock
-    except Exception as exc:  # noqa: BLE001 - torn tree: repair without the lock rather than never
-        print(f"⚠ Repairing without the checkout lock ({type(exc).__name__}: {exc}).", file=sys.stderr)
-        yield ""
-        return
+    except Exception as exc:  # noqa: BLE001 - syntax/import damage must never authorize a write
+        raise RuntimeError(
+            "Cannot safely repair the interrupted update: checkout custody is unavailable "
+            f"({type(exc).__name__}: {exc}). The recovery marker was kept. "
+            "Wait for any running update to finish; if this persists, repair the checkout "
+            "before launching Hermes again."
+        ) from exc
     holder = update_lock._acquire_checkout(Path(root))
     if holder is not None and not update_lock.checkout_lock_held(Path(root)):
         # Refused, then free by the probe: its holder just exited. Take it now rather than run the
@@ -842,17 +845,19 @@ def _restore_holding_claim(root: Path, marker: Path, *, after_failure: bool = Fa
     executable = _git_executable(fields.get("git", "").strip())
     try:
         from hermes_cli.update_custody import run_git
-    except Exception:  # noqa: BLE001 - torn tree: plain spawns (see _checkout_custody)
-        run_git = None
+    except Exception as exc:  # noqa: BLE001 - never start an uncontained repair writer
+        raise RuntimeError(
+            "Cannot safely repair the interrupted update: child custody is unavailable "
+            f"({type(exc).__name__}: {exc}). The recovery marker was kept. "
+            "Repair the checkout before launching Hermes again."
+        ) from exc
 
     def git(*args: str, stdin: str | None = None, text: bool = True) -> subprocess.CompletedProcess:
         base = [executable, "--literal-pathspecs", "-C", str(root)]
         kwargs = dict(input=stdin, cwd=str(root), capture_output=True, timeout=120,
                       stdin=None if stdin is not None else subprocess.DEVNULL,
                       **({"text": True, "encoding": "utf-8", "errors": "replace"} if text else {}))
-        if run_git is not None:
-            return run_git(base, list(args), **kwargs)
-        return subprocess.run([*base, *args], **kwargs)
+        return run_git(base, list(args), **kwargs)
 
     # A killed git's index.lock goes first, before any git runs (an unresolvable or failing git
     # would otherwise strand it, and it refuses every later git command). Proven-dead only; after a

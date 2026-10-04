@@ -109,6 +109,18 @@ lifecycle obligation when the child cannot execute or is killed. A failed child
 never clears the pending fleet obligation. No automatic code rollback after
 maintenance has begun (SQLite snapshots remain file-loss recovery, not rollback).
 
+### Damaged recovery code
+
+Launch-time checkout repair requires both the checkout lock and the child-custody
+runner to be importable. If either module is torn, launch stops with
+`Cannot safely repair` and retains the interrupted-update marker instead of
+writing without exclusion. An updater that already imported healthy code can
+still hold and write the checkout even when its on-disk modules are damaged.
+Wait for any running update to finish; persistent damage requires checkout repair
+before launching again. This safety refusal is not automatic recovery of the
+recovery modules themselves: the launcher still depends on checkout bootstrap
+code, which a killed tree move can also leave unavailable.
+
 ## Historical surface
 
 All names frozen from the complete reachable shipped updater history stay
