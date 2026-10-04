@@ -946,8 +946,13 @@ def _rollback_if_pulled_syntax_error(git_cmd, pre_pull_sha, *, rollback_branch=N
         if rollback_result.returncode == 0:
             rollback_args = ["reset", "--hard", pre_pull_sha]
             rollback_result = _git_run(git_cmd, rollback_args)
-            if rollback_result.returncode == 0:
-                _commit.drop_added_files(root, added)
+            if rollback_result.returncode == 0 and not _commit.drop_added_files(root, added):
+                rollback_result = subprocess.CompletedProcess(
+                    rollback_args, 1, "", "could not remove the broken release's added files")
+        if rollback_result.returncode == 0 and not _commit.tree_whole_at(git_cmd, root, pre_pull_sha):
+            # git said yes; the tree must agree (HEAD on pre, no tracked change) before the marker goes.
+            rollback_result = subprocess.CompletedProcess(
+                rollback_args, 1, "", f"the checkout is not whole at {pre_pull_sha[:10]}")
         if rollback_result.returncode != 0 and _commit.settle_failed_tree_move(root):
             rollback_result = subprocess.CompletedProcess(rollback_args, 0, "", "")  # restored in-process
         if rollback_result.returncode == 0 and parked:
@@ -965,6 +970,8 @@ def _rollback_if_pulled_syntax_error(git_cmd, pre_pull_sha, *, rollback_branch=N
             print(f"    cd {root} && git {shlex.join(rollback_args)}")
             if rollback_result.stderr.strip():
                 print(f"    ({rollback_result.stderr.strip().splitlines()[0]})")
+            if interrupted_pull_marker(root).is_file():
+                print(f"  The next `hermes` launch also finishes the rollback to {pre_pull_sha[:10]} on its own.")
     else:
         print("  Could not capture pre-pull SHA — recover manually with:")
         print(f"    cd {_m().PROJECT_ROOT} && git reflog && git reset --hard <prev-sha>")

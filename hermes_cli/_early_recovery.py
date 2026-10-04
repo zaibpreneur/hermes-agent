@@ -422,34 +422,61 @@ def _restore_claim(git_dir: Path):
         os.close(fd)
 
 
-def _held_open(path: Path) -> bool:
-    """True when a running process has ``path`` open, the usual sign of a live git owning its lock.
+def _held_open(path: Path, root: Path | None = None) -> bool | None:
+    """Whether a running process may still own ``path`` (a git lock): True, False, or None (unknowable).
 
-    Best effort, not exact: Linux answers through /proc, but a live git that owns ``index.lock`` without
-    an open fd (``commit`` waiting in the editor, or between closing the lock and renaming it) reads as
-    dead; Windows refuses to unlink a file another process has open, so the caller's unlink is its probe;
-    macOS/BSD have no portable check at all. The claim only orders Hermes launches, so on those paths a
-    live git's lock can be removed; its command then fails and the marker stays for the next launch.
+    False is proof, not a guess: Linux reads every process's fds through /proc and also counts any live
+    ``git`` whose working directory is inside ``root`` (``commit`` waiting in the editor keeps
+    ``index.lock`` with its fd closed); macOS/BSD ask ``lsof``. Without either check the answer is None
+    and the caller never deletes the lock. Windows needs no answer here: it refuses to unlink a file
+    another process has open, so the caller's unlink is the probe.
     """
     proc = Path("/proc")
-    if not (proc / "self" / "fd").is_dir():
-        return False
-    target = os.path.realpath(path)
-    for fd_dir in proc.glob("[0-9]*/fd"):
-        try:
-            if any(os.readlink(entry.path) == target for entry in os.scandir(fd_dir)):
+    if (proc / "self" / "fd").is_dir():
+        target = os.path.realpath(path)
+        inside = os.path.realpath(root) + os.sep if root is not None else None
+        for pid_dir in proc.glob("[0-9]*"):
+            try:
+                if any(os.readlink(entry.path) == target for entry in os.scandir(pid_dir / "fd")):
+                    return True
+            except OSError:
+                pass
+            if inside is None:
+                continue
+            try:
+                comm = (pid_dir / "comm").read_text(encoding="utf-8", errors="replace").strip()
+                cwd = os.readlink(pid_dir / "cwd")
+            except OSError:
+                continue
+            if comm.startswith("git") and (cwd + os.sep).startswith(inside):
                 return True
-        except OSError:
-            continue
-    return False
+        return False
+    import shutil
+
+    lsof = shutil.which("lsof") or next((p for p in ("/usr/sbin/lsof", "/usr/bin/lsof") if os.path.isfile(p)), None)
+    if lsof is None:
+        return None
+    try:
+        found = subprocess.run([lsof, "-t", "--", str(path)], capture_output=True, text=True, timeout=20,
+                               stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if found.stdout.strip():
+        return True
+    return False if found.returncode in (0, 1) else None  # lsof exits 1 when nothing has the file open
 
 
-def _release_dead_index_lock(git_dir: Path) -> bool:
-    """Drop the killed git's ``index.lock`` (it refuses every git command); False while a live git holds it."""
+def _release_dead_index_lock(git_dir: Path, root: Path | None = None) -> bool:
+    """Drop a killed git's ``index.lock`` (it refuses every git command) once its owner is PROVEN gone.
+
+    False while a live git may hold it, or when this platform cannot prove it dead: the caller then
+    keeps the interrupted-pull marker, so the next launch tries again instead of a rollback being lost.
+    """
     lock = git_dir / "index.lock"
     deadline = time.monotonic() + 5
     while lock.exists():
-        if not _held_open(lock):
+        held = None if sys.platform == "win32" else _held_open(lock, root)
+        if held is False or sys.platform == "win32":
             try:
                 lock.unlink()
                 return True
@@ -457,6 +484,8 @@ def _release_dead_index_lock(git_dir: Path) -> bool:
                 return True
             except PermissionError:  # Windows: open in a live process
                 pass
+        elif held is None:
+            return False
         if time.monotonic() > deadline:
             return False
         time.sleep(0.1)
@@ -648,13 +677,24 @@ def _restore_holding_claim(root: Path, marker: Path, *, after_failure: bool = Fa
                               **({"text": True, "encoding": "utf-8", "errors": "replace"} if text else {}))
 
     rollback = fields.get("rollback", "").strip()
-    if rollback in ("branch", "detach") and pre and target and git("rev-parse", "HEAD").stdout.strip() == target:
+    rollback = rollback if rollback in ("branch", "detach") else ""
+    head = git("rev-parse", "HEAD")
+    if head.returncode != 0:
+        print(f"⚠ Could not read HEAD to repair an interrupted `hermes update` ({head.stderr.strip()}); "
+              "the next launch retries.", file=sys.stderr)
+        return False
+    if rollback and pre and target and head.stdout.strip() == target:
         # A syntax rollback killed before it moved HEAD back: redo that step (HEAD and index, no file),
         # so the restore below lands on ``pre`` (the code the update started from), not the broken tree.
-        if rollback == "detach":
-            git("update-ref", "--no-deref", "HEAD", pre)
-        git("reset", "-q", pre)
-    if not pre or not target or git("rev-parse", "HEAD").stdout.strip() != pre:
+        # Every step is checked, and the killed step's ``index.lock`` goes first, only once its git is
+        # proven gone: until HEAD is on ``pre`` this marker is the rollback's only record.
+        reason = _redo_rollback_head(git, git_dir, root, pre, rollback, after_failure=after_failure)
+        if reason is not None:
+            print(f"⚠ An interrupted `hermes update` rollback to {pre[:10]} cannot resume yet ({reason}); "
+                  "the next launch retries.", file=sys.stderr)
+            return False
+        head = git("rev-parse", "HEAD")
+    if not pre or not target or head.stdout.strip() != pre:
         marker.unlink()  # git finished (HEAD moved) or the marker is unusable
         return False
     if any((git_dir / name).exists() for name in _GIT_OPERATION_IN_PROGRESS):
@@ -671,12 +711,17 @@ def _restore_holding_claim(root: Path, marker: Path, *, after_failure: bool = Fa
     # After a git that EXITED (``after_failure``) no git of ours is left: a lock now is another git's
     # (often the very reason ours failed), never ours to drop. The scan below only reads.
     foreign_lock = after_failure and (git_dir / "index.lock").exists()
-    if not foreign_lock and not _release_dead_index_lock(git_dir):
+    if not foreign_lock and not _release_dead_index_lock(git_dir, root):
         print("⚠ A running git holds the index after an interrupted `hermes update`; the next launch "
               "finishes the restore.", file=sys.stderr)
         return False
     written = _paths_git_wrote(git, root, pre, target)
     if written is None:  # after a gc or re-clone: nothing left to compare against
+        if rollback and not _rollback_verified(git, git_dir, pre):
+            print(f"⚠ An interrupted `hermes update` rollback to {pre[:10]} is not verified and commit "
+                  f"{target[:10]} is gone. Inspect `git -C {root} status`; `git -C {root} reset --hard "
+                  f"{pre[:10]}` finishes it.", file=sys.stderr)
+            return False
         marker.unlink()
         print(f"⚠ Ignoring a stale interrupted-update marker: commit {target[:10]} is gone.", file=sys.stderr)
         return False
@@ -700,6 +745,13 @@ def _restore_holding_claim(root: Path, marker: Path, *, after_failure: bool = Fa
     for rel in sorted(new_dirs, key=lambda d: d.count("/"), reverse=True):
         with contextlib.suppress(OSError):
             (root / rel).rmdir()  # only when empty: an untracked file inside keeps it
+    if rollback and not _rollback_verified(git, git_dir, pre):
+        # A rollback owns the whole tree (the update parked local edits first): only HEAD on ``pre``
+        # with no tracked change left is a finished rollback. Anything less keeps its only record.
+        print(f"  ✗ The rollback to {pre[:10]} is not verified yet (tracked files still differ); the next "
+              f"launch retries. Inspect `git -C {root} status`; `git -C {root} reset --hard {pre[:10]}` "
+              "finishes it by hand.", file=sys.stderr)
+        return bool(restore or added)
     marker.unlink()
     if not restore and not added:
         return False  # the killed git never reached the tree: nothing to put back
@@ -707,6 +759,37 @@ def _restore_holding_claim(root: Path, marker: Path, *, after_failure: bool = Fa
     if stash:
         print(f"  Your local changes are still in the update's stash ({stash}).", file=sys.stderr)
     return True
+
+
+def _redo_rollback_head(git, git_dir: Path, root: Path, pre: str, mode: str, *, after_failure: bool) -> str | None:
+    """Move HEAD (and the index) back to ``pre`` for a killed syntax rollback; None, or why not yet.
+
+    The killed step's ``index.lock`` is reclaimed first, and only when its git is proven gone. After a
+    git that exited in this very process (``after_failure``) a lock is never ours to judge.
+    """
+    lock = git_dir / "index.lock"
+    if lock.exists() and (after_failure or not _release_dead_index_lock(git_dir, root)):
+        return "a git may still hold .git/index.lock"
+    if mode == "detach":
+        moved = git("update-ref", "--no-deref", "HEAD", pre)
+        if moved.returncode != 0:
+            return f"git update-ref failed: {(moved.stderr.strip().splitlines() or ['?'])[-1]}"
+    reset = git("reset", "-q", pre)
+    if reset.returncode != 0:
+        return f"git reset failed: {(reset.stderr.strip().splitlines() or ['?'])[-1]}"
+    head = git("rev-parse", "HEAD")
+    if head.returncode != 0 or head.stdout.strip() != pre:
+        return "HEAD did not move back"
+    return None
+
+
+def _rollback_verified(git, git_dir: Path, pre: str) -> bool:
+    """The whole-tree rollback landed: HEAD is ``pre``, no index lock, no tracked change."""
+    head = git("rev-parse", "HEAD")
+    if head.returncode != 0 or head.stdout.strip() != pre or (git_dir / "index.lock").exists():
+        return False
+    status = git("status", "--porcelain", "-z", "--untracked-files=no")
+    return status.returncode == 0 and not status.stdout.strip("\0")
 
 
 def _put_back_paths(git, root: Path, restore: list[str], added: list[str]) -> subprocess.CompletedProcess | None:

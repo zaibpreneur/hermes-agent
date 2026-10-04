@@ -129,17 +129,37 @@ def files_added_by(git_cmd, root: Path, pre: str, target: str | None) -> list[st
     return [p for p in cp.stdout.split("\0") if p] if cp.returncode == 0 else []
 
 
-def drop_added_files(root: Path, added: list[str]) -> None:
-    """Every one is the move's own file: git refuses to move a checkout over an untracked file."""
+def drop_added_files(root: Path, added: list[str]) -> bool:
+    """Every one is the move's own file: git refuses to move a checkout over an untracked file.
+
+    False when one of them is still there (the caller keeps the marker; the restore retries)."""
     root = Path(root)
+    gone = True
     for rel in added:
-        (root / rel).unlink(missing_ok=True)
+        try:
+            (root / rel).unlink(missing_ok=True)
+        except OSError:
+            gone = False
     for parent in sorted({p for rel in added for p in Path(rel).parents if str(p) != "."},
                          key=lambda p: len(p.parts), reverse=True):
         try:
             (root / parent).rmdir()  # only when empty: anything else inside keeps it
         except OSError:
             pass
+    return gone and not any(os.path.lexists(root / rel) for rel in added)
+
+
+def tree_whole_at(git_cmd, root: Path, sha: str) -> bool:
+    """HEAD is ``sha``, no ``index.lock`` is left and no tracked file differs from it."""
+    def run(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run([*git_cmd, *args], cwd=str(root), capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", stdin=subprocess.DEVNULL, timeout=120)
+
+    head = run("rev-parse", "-q", "--verify", "HEAD")
+    if head.returncode != 0 or head.stdout.strip() != sha or (interrupted_pull_marker(Path(root)).parent / "index.lock").exists():
+        return False
+    status = run("status", "--porcelain", "-z", "--untracked-files=no")
+    return status.returncode == 0 and not status.stdout.strip("\0")
 
 
 def settle_failed_tree_move(root: Path) -> bool:
