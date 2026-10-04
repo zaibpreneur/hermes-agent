@@ -283,14 +283,15 @@ def test_failed_upstream_sync_after_origin_pull_keeps_the_tail_owed(world):
     moved = _release(world, {"e2e_fork_origin.py": "B = 1\n"})
     upstream = root / "upstream.git"
     I.git("clone", "-q", "--bare", "--shared", str(world["origin"]), str(upstream), cwd=root)
-    I.publish_commit(upstream, root, "upstream: touches the locked dir", {"zzz_e2e_fork/mod.py": "V = 2\n"})
+    up = I.publish_commit(upstream, root, "upstream: touches the locked dir", {"zzz_e2e_fork/mod.py": "V = 2\n"})
     I.git("remote", "add", "upstream", str(upstream), cwd=sb.checkout)
     flag = sb.checkout / ".git" / "e2e-upstream-ff-failed"
     # origin reads as a fork (the sandbox shim otherwise reports the official URL). Kill the updater at
     # its next branch check once the upstream merge has failed (and been settled).
     _hostile_git(world, 'case " $* " in *" remote get-url origin "*) echo https://github.com/e2e-fork/hermes-agent.git; '
                         'exit 0;; esac\n'
-                        f'case " $* " in *" merge --ff-only "*"upstream/main "*) "$REAL" "$@"; rc=$?; '
+                        # The sync fast-forwards to the upstream commit it resolved (one SHA, m2).
+                        f'case " $* " in *" merge --ff-only "*"{up} "*) "$REAL" "$@"; rc=$?; '
                         f'[ $rc != 0 ] && touch "{flag}"; exit $rc;; esac\n'
                         f'if [ -e "{flag}" ]; then case " $* " in *" rev-parse --abbrev-ref HEAD "*) '
                         'kill -KILL $PPID; exit 137;; esac; fi')
