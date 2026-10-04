@@ -372,7 +372,8 @@ def _journaled_stage_and_swap(extracted: str, entries: list[str], root: Path, ta
         raise RuntimeError("an interrupted ZIP update could not be settled; see the warning above")
     with zip_swap_owner_lock(root, wait=10.0) as owned:
         if not owned:
-            raise RuntimeError("another `hermes update` is swapping this install right now")
+            raise RuntimeError("another `hermes update` is swapping this install right now"
+                               if owned.reason == "busy" else f"no ZIP swap lock, no swap ({owned.reason})")
         # A leftover backup counts: _stage_replacement puts it back as the entry before the swap.
         journal_entries = [[item, any(os.path.lexists(os.path.join(root, item + suffix))
                                       for suffix in ("", ".hermes-update-old"))] for item in entries]

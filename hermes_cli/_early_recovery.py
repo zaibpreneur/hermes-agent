@@ -499,36 +499,62 @@ ZIP_SWAP_JOURNAL = ".hermes-update-zip-swap"
 _ZIP_STAGING_SUFFIX, _ZIP_OLD_SUFFIX = ".hermes-update-staging", ".hermes-update-old"
 
 
+class ZipSwapLock:
+    """``zip_swap_owner_lock``'s verdict: truthy only while this process holds the kernel lock.
+
+    ``reason`` names a refusal: ``busy`` (a live owner holds it) or why no lock could be taken at all.
+    """
+
+    __slots__ = ("owned", "reason")
+
+    def __init__(self, owned: bool, reason: str = "") -> None:
+        self.owned, self.reason = owned, reason
+
+    def __bool__(self) -> bool:
+        return self.owned
+
+
 @contextlib.contextmanager
 def zip_swap_owner_lock(root: Path, *, wait: float = 0.0):
-    """Yields True while this process owns the ZIP swap lock, False when a live owner holds it.
+    """Yields a truthy ``ZipSwapLock`` while this process owns the ZIP swap lock, a falsy one otherwise.
 
-    The lock file is removed again once no journal is left, so a settled install carries no
-    breadcrumb (the swap itself also runs under the update lock; this one only proves liveness)."""
+    The lock file is a stable sidecar: never unlinked, so every process locks the same inode (an
+    unlink lets a waiter keep the old inode while a newcomer locks a fresh one). No lock, no admission:
+    a root where the file cannot be opened or locked refuses with the reason (fail closed)."""
     lock_path = Path(root) / (ZIP_SWAP_JOURNAL + ".lock")
     try:
         fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
-    except OSError:
-        yield True  # unwritable root: no swap can run there either
+    except OSError as exc:
+        yield ZipSwapLock(False, f"cannot open the ZIP swap lock {lock_path}: {exc.strerror or exc}")
         return
-    owned = False
     try:
         deadline = time.monotonic() + wait
-        while not _lock_fd(fd, True):
+        while True:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if exc.errno not in _CLAIM_HELD_ERRNOS:
+                    yield ZipSwapLock(False, f"cannot lock the ZIP swap lock {lock_path}: {exc.strerror or exc}")
+                    return
             if time.monotonic() >= deadline:
-                yield False
+                yield ZipSwapLock(False, "busy")
                 return
             time.sleep(0.05)
-        owned = True
         try:
-            yield True
+            yield ZipSwapLock(True)
         finally:
             _lock_fd(fd, False)
     finally:
         os.close(fd)
-        if owned and not (Path(root) / ZIP_SWAP_JOURNAL).exists():
-            with contextlib.suppress(OSError):
-                lock_path.unlink()
 
 
 def write_zip_swap_journal(root: Path, phase: str, entries: list) -> None:
@@ -563,6 +589,8 @@ def restore_interrupted_zip_swap(project_root: Path | None = None) -> bool:
     if not journal.is_file() or _pytest_owns_live_checkout(root):
         return False
     with zip_swap_owner_lock(root) as owned:
+        if not owned and owned.reason != "busy":
+            print(f"⚠ An interrupted ZIP update cannot be settled: {owned.reason}.", file=sys.stderr)
         if not owned or not journal.is_file():
             return False
         import json
