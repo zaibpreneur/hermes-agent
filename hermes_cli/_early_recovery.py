@@ -449,6 +449,9 @@ def _held_open(path: Path, root: Path | None = None) -> bool | None:
             except OSError:
                 continue
             if comm.startswith("git") and (cwd + os.sep).startswith(inside):
+                with contextlib.suppress(OSError):  # the fsmonitor daemon lives in the tree but never locks the index
+                    if b"fsmonitor--daemon" in (pid_dir / "cmdline").read_bytes():
+                        continue
                 return True
         return False
     import shutil
