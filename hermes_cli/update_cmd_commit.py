@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Optional
 
 from hermes_cli._early_recovery import interrupted_pull_marker, restore_interrupted_pull
+from hermes_cli.update_custody import run_git
 
 # What this run found before it armed anything: {path: bytes or None}. None = nothing armed yet.
 _armed_snapshot: Optional[dict[Path, Optional[bytes]]] = None
@@ -123,7 +124,7 @@ def files_added_by(git_cmd, root: Path, pre: str, target: str | None) -> list[st
     never touches untracked files, so ``drop_added_files`` removes them by name afterwards."""
     if not target or target == pre:
         return []
-    cp = subprocess.run([*git_cmd, "diff", "--name-only", "-z", "--no-renames", "--diff-filter=A", pre, target],
+    cp = run_git(git_cmd, ["diff", "--name-only", "-z", "--no-renames", "--diff-filter=A", pre, target],
                         cwd=str(root), capture_output=True, text=True, encoding="utf-8", errors="replace",
                         stdin=subprocess.DEVNULL, timeout=120)
     return [p for p in cp.stdout.split("\0") if p] if cp.returncode == 0 else []
@@ -152,7 +153,7 @@ def drop_added_files(root: Path, added: list[str]) -> bool:
 def tree_whole_at(git_cmd, root: Path, sha: str) -> bool:
     """HEAD is ``sha``, no ``index.lock`` is left and no tracked file differs from it."""
     def run(*args: str) -> subprocess.CompletedProcess:
-        return subprocess.run([*git_cmd, *args], cwd=str(root), capture_output=True, text=True, encoding="utf-8",
+        return run_git(git_cmd, [*args], cwd=str(root), capture_output=True, text=True, encoding="utf-8",
                               errors="replace", stdin=subprocess.DEVNULL, timeout=120)
 
     head = run("rev-parse", "-q", "--verify", "HEAD")
@@ -205,12 +206,12 @@ def target_syntax_error(git_cmd, root: Path, target_ref: str, relpaths) -> tuple
     release is refused with the install untouched (the post-pull rollback stays as the backstop).
     Skipped for a target that requires a Python this interpreter is not (``requires_other_python``).
     """
-    pyproject = subprocess.run([*git_cmd, "show", f"{target_ref}:pyproject.toml"], cwd=str(root),
+    pyproject = run_git(git_cmd, ["show", f"{target_ref}:pyproject.toml"], cwd=str(root),
                                capture_output=True, stdin=subprocess.DEVNULL, timeout=120)
     if pyproject.returncode == 0 and requires_other_python(pyproject.stdout):
         return None
     for rel in relpaths:
-        shown = subprocess.run([*git_cmd, "show", f"{target_ref}:{rel}"], cwd=str(root), capture_output=True,
+        shown = run_git(git_cmd, ["show", f"{target_ref}:{rel}"], cwd=str(root), capture_output=True,
                                stdin=subprocess.DEVNULL, timeout=120)
         if shown.returncode != 0:
             continue  # absent at the target (or unreadable): the post-pull guard has the last word
@@ -223,7 +224,7 @@ def target_syntax_error(git_cmd, root: Path, target_ref: str, relpaths) -> tuple
 
 def head_and_branch(git_cmd, root: Path) -> tuple[str, str]:
     def out(*args: str) -> str:
-        cp = subprocess.run([*git_cmd, *args], cwd=str(root), capture_output=True, text=True, encoding="utf-8", errors="replace",
+        cp = run_git(git_cmd, [*args], cwd=str(root), capture_output=True, text=True, encoding="utf-8", errors="replace",
                             stdin=subprocess.DEVNULL, timeout=60)
         return cp.stdout.strip() if cp.returncode == 0 else ""
 
