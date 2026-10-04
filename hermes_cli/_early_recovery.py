@@ -444,7 +444,7 @@ def _held_open(path: Path, root: Path | None = None) -> bool | None:
             if inside is None:
                 continue
             try:
-                comm = (pid_dir / "comm").read_text(encoding="utf-8", errors="replace").strip()
+                comm = (pid_dir / "comm").read_bytes().decode("ascii", "replace").strip()  # /proc: Linux only
                 cwd = os.readlink(pid_dir / "cwd")
             except OSError:
                 continue
@@ -460,7 +460,8 @@ def _held_open(path: Path, root: Path | None = None) -> bool | None:
     if lsof is None:
         return None
     try:
-        found = subprocess.run([lsof, "-t", "--", str(path)], capture_output=True, text=True, timeout=20,
+        found = subprocess.run([lsof, "-t", "--", str(path)], capture_output=True, text=True, encoding="utf-8",
+                               errors="replace", timeout=20,
                                stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
         return None
