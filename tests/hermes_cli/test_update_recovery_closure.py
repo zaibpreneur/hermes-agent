@@ -2,7 +2,7 @@
 
 The repair (``hermes_bootstrap`` -> ``_early_recovery`` under the checkout lock) lives in the tree git
 rewrites. ``arm_tree_move`` publishes that closure beside the marker before git writes; the minted
-launcher runs it when the checkout's copy cannot even import. Real git, really killed mid-write (a
+launcher runs it (or the same files read from git's objects) when the checkout's copy cannot import. Real git, really killed mid-write (a
 smudge-filter barrier), the production marker writer in a child that exits, the production launcher;
 the application entry is an inert receipt.
 """
@@ -102,16 +102,20 @@ def _killed_mid_write(tmp_path: Path, rel: str):
 
 
 @pytest.mark.platforms("posix")
-@pytest.mark.parametrize(("rel", "torn"), [
-    ("hermes_bootstrap.py", False),
-    ("hermes_cli/_early_recovery.py", True),
-    ("hermes_cli/__init__.py", True),
-    ("hermes_cli/update_lock.py", True),
+@pytest.mark.parametrize(("rel", "torn", "published"), [
+    ("hermes_bootstrap.py", False, True),
+    ("hermes_cli/_early_recovery.py", True, True),
+    ("hermes_cli/__init__.py", True, True),
+    ("hermes_cli/update_lock.py", True, True),
+    # An updater that predates publication: the launcher reads the same files from git's objects.
+    ("hermes_bootstrap.py", True, False),
 ])
-def test_a_launch_repairs_a_move_killed_while_writing_the_repairs_own_code(tmp_path, rel, torn):
+def test_a_launch_repairs_a_move_killed_while_writing_the_repairs_own_code(tmp_path, rel, torn, published):
     root, env, original, launcher = _killed_mid_write(tmp_path, rel)
     if torn:  # git's write cut short: a prefix of the new blob
         (root / rel).write_bytes(original[:12])
+    if not published:
+        shutil.rmtree(root / ".git/hermes-update-recovery")
     launch = subprocess.run([str(launcher)], cwd=tmp_path, env=env, capture_output=True, text=True, encoding="utf-8",
                             errors="replace", timeout=60)
     assert launch.returncode == 0 and "APP_REACHED" in launch.stdout, launch.stderr

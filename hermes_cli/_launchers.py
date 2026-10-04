@@ -305,6 +305,63 @@ def mint_launcher(
     return _write_atomic(out_dir / f"{name}.cmd", lambda p: p.write_text(body, encoding="utf-8"))
 
 
+# A killed move can tear the repair's own code (``hermes_bootstrap``, ``hermes_cli``). With the
+# marker still there, a launcher whose checkout import failed runs the copy of the repair that the
+# updater published beside the marker (``update_cmd_commit.publish_recovery_closure``), or, when
+# none was published (an updater predating it), the same files read from git's objects at the
+# marker's ``pre``: stdlib plus that copy only, under the same claim and checkout lock (a live
+# writer still refuses), then a relaunch from the restored tree.
+_CLOSURE_REPAIR = """\
+def _hermes_closure_repair():
+    import subprocess
+    from pathlib import Path
+    root = Path(__ROOT__)
+    git = root / '.git'
+    try:
+        if git.is_file():
+            text = git.read_text(encoding='utf-8-sig').strip()
+            git = root / text[7:].strip() if text.startswith('gitdir:') else git
+        fields = dict(line.partition('=')[::2] for line in (git / __MARKER__).read_text(encoding='utf-8-sig').splitlines())
+    except OSError:
+        return
+    pre = fields.get('pre', '').strip()
+    closure = git / __CLOSURE_DIR__ / pre
+    if pre and not all((closure / rel).is_file() for rel in __CLOSURE__):
+        exe = fields.get('git', '').strip()
+        staging = closure.with_name('.%s.%d.launch' % (pre, os.getpid()))
+        try:
+            for rel in (*__CLOSURE__, 'hermes_cli/__init__.py'):
+                blob = b''
+                if rel in __CLOSURE__:
+                    blob = subprocess.run([exe if exe and os.path.isfile(exe) else 'git', '-C', str(root), 'cat-file',
+                                           'blob', pre + ':' + rel], capture_output=True, timeout=60,
+                                          stdin=subprocess.DEVNULL, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+                    if blob.returncode != 0:
+                        return
+                    blob = blob.stdout
+                (staging / rel).parent.mkdir(parents=True, exist_ok=True)
+                (staging / rel).write_bytes(blob)
+            os.replace(staging, closure)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        finally:
+            __import__('shutil').rmtree(staging, ignore_errors=True)
+    if not pre or not all((closure / rel).is_file() for rel in __CLOSURE__):
+        return
+    for name in [n for n in sys.modules if n.split('.')[0] in ('hermes_cli', 'hermes_bootstrap', 'hermes_constants', 'pm')]:
+        del sys.modules[name]
+    tree = os.path.normcase(os.path.realpath(root))
+    sys.path[:] = [str(closure)] + [p for p in sys.path if p and os.path.normcase(os.path.realpath(p)) != tree
+                                    and not os.path.normcase(os.path.realpath(p)).startswith(tree + os.sep)]
+    print('hermes: the checkout cannot start after an interrupted `hermes update`; '
+          'repairing it with the recovery code saved before the update.', file=sys.stderr)
+    sys.dont_write_bytecode = True
+    from hermes_cli import _early_recovery
+    if _early_recovery.restore_interrupted_pull(root):
+        _early_recovery.relaunch_after_restore()
+"""
+
+
 def _launcher_script(name: str, repo_root: Path, dependencies: Path | None) -> str:
     module, func = ENTRY_POINTS[name]
     # Profile boot repairs shared launchers: their default must stay at the
@@ -317,40 +374,12 @@ def _launcher_script(name: str, repo_root: Path, dependencies: Path | None) -> s
     # ``hermes_bootstrap`` right after the repair (``_PIN_DEFAULT_HOME``), and here again for a
     # bootstrap that predates that hook.
     root = str(repo_root.resolve())
-    from hermes_cli._early_recovery import INTERRUPTED_PULL_MARKER, RECOVERY_CLOSURE_DIR
+    from hermes_cli._early_recovery import INTERRUPTED_PULL_MARKER, RECOVERY_CLOSURE, RECOVERY_CLOSURE_DIR
 
-    # A killed move can tear the repair's own code (``hermes_bootstrap``, ``hermes_cli``): with the
-    # marker still there, run the copy the updater published beside it before git wrote (stdlib +
-    # that copy only; it still takes the checkout lock), then relaunch from the restored tree.
-    closure_repair = (
-        "def _hermes_closure_repair():\n"
-        "    from pathlib import Path\n"
-        f"    root = Path({root!r})\n"
-        "    git = root / '.git'\n"
-        "    try:\n"
-        "        if git.is_file():\n"
-        "            text = git.read_text(encoding='utf-8-sig').strip()\n"
-        "            git = root / text[7:].strip() if text.startswith('gitdir:') else git\n"
-        f"        fields = dict(line.partition('=')[::2] for line in (git / {INTERRUPTED_PULL_MARKER!r})"
-        ".read_text(encoding='utf-8-sig').splitlines())\n"
-        "    except OSError:\n"
-        "        return\n"
-        "    pre = fields.get('pre', '').strip()\n"
-        f"    closure = git / {RECOVERY_CLOSURE_DIR!r} / pre\n"
-        "    if not pre or not (closure / 'hermes_cli' / '_early_recovery.py').is_file():\n"
-        "        return\n"
-        "    for name in [n for n in sys.modules if n.split('.')[0] in ('hermes_cli', 'hermes_bootstrap', 'hermes_constants', 'pm')]:\n"
-        "        del sys.modules[name]\n"
-        "    tree = os.path.normcase(os.path.realpath(root))\n"
-        "    sys.path[:] = [str(closure)] + [p for p in sys.path if p and os.path.normcase(os.path.realpath(p)) != tree\n"
-        "                                    and not os.path.normcase(os.path.realpath(p)).startswith(tree + os.sep)]\n"
-        "    print('hermes: the checkout cannot start after an interrupted `hermes update`; '\n"
-        "          'repairing it with the recovery code saved before the update.', file=sys.stderr)\n"
-        "    sys.dont_write_bytecode = True\n"
-        "    from hermes_cli import _early_recovery\n"
-        "    if _early_recovery.restore_interrupted_pull(root):\n"
-        "        _early_recovery.relaunch_after_restore()\n"
-    )
+    closure_repair = (_CLOSURE_REPAIR.replace("__MARKER__", repr(INTERRUPTED_PULL_MARKER))
+                      .replace("__CLOSURE_DIR__", repr(RECOVERY_CLOSURE_DIR))
+                      .replace("__CLOSURE__", repr(RECOVERY_CLOSURE))
+                      .replace("__ROOT__", repr(root)))  # last: a path is never re-substituted
     return (
         "import os, re, sys\n"
         "os.environ.pop('PYTHONHOME', None)\n"

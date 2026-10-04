@@ -248,7 +248,8 @@ def interrupted_pull_marker(root: Path) -> Path:
 # The repair's own code is in the tree a killed move tears (``hermes_bootstrap``, this module, the
 # package initializer, the lock/custody modules). ``update_cmd_commit.arm_tree_move`` publishes this
 # closure, as committed at the marker's ``pre``, beside the marker before git writes; a minted
-# launcher whose checkout import fails runs the repair from there (``_launchers._launcher_script``).
+# launcher whose checkout import fails runs the repair from there, reading the same files from git's
+# objects first when no updater published them (``_launchers._CLOSURE_REPAIR``).
 # The modules import only the stdlib and each other; the package initializer is published empty.
 RECOVERY_CLOSURE_DIR = "hermes-update-recovery"
 RECOVERY_CLOSURE = ("hermes_cli/_early_recovery.py", "hermes_cli/update_lock.py", "hermes_cli/update_custody.py")
