@@ -359,6 +359,7 @@ def _hermes_closure_repair():
     from hermes_cli import _early_recovery
     if _early_recovery.restore_interrupted_pull(root):
         _early_recovery.relaunch_after_restore()
+    return True
 """
 
 
@@ -391,10 +392,11 @@ def _launcher_script(name: str, repo_root: Path, dependencies: Path | None) -> s
         "    from pathlib import Path\n"
         "    try:\n"
         "        from hermes_cli import _early_recovery\n"
-        "    except Exception:\n"
-        "        _hermes_closure_repair()\n"
-        "        raise\n"
-        f"    if _early_recovery.restore_interrupted_pull(Path({root!r})):\n"
+        "    except Exception as exc:\n"
+        "        if _hermes_closure_repair() or not isinstance(exc, ImportError):\n"
+        "            raise\n"
+        "        _early_recovery = None  # a tree without the repair: the imports below report real damage\n"
+        f"    if _early_recovery is not None and _early_recovery.restore_interrupted_pull(Path({root!r})):\n"
         "        _early_recovery.relaunch_after_restore()\n"
         "    from hermes_constants import get_default_hermes_root\n"
         "    os.environ['HERMES_HOME'] = os.environ.get('HERMES_HOME') or str(get_default_hermes_root())\n"
