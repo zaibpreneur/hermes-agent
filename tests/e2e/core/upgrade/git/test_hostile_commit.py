@@ -290,7 +290,7 @@ def test_failed_upstream_sync_after_origin_pull_keeps_the_tail_owed(world):
     # its next branch check once the upstream merge has failed (and been settled).
     _hostile_git(world, 'case " $* " in *" remote get-url origin "*) echo https://github.com/e2e-fork/hermes-agent.git; '
                         'exit 0;; esac\n'
-                        f'case " $* " in *" merge --ff-only upstream/main "*) "$REAL" "$@"; rc=$?; '
+                        f'case " $* " in *" merge --ff-only "*"upstream/main "*) "$REAL" "$@"; rc=$?; '
                         f'[ $rc != 0 ] && touch "{flag}"; exit $rc;; esac\n'
                         f'if [ -e "{flag}" ]; then case " $* " in *" rev-parse --abbrev-ref HEAD "*) '
                         'kill -KILL $PPID; exit 137;; esac; fi')
