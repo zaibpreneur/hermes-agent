@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from hermes_cli import update_cmd
+from hermes_cli import update_cmd, update_cmd_zip
 from hermes_constants import venv_bin_dir, venv_python_path
 
 # ---------------------------------------------------------------------------
@@ -357,3 +357,148 @@ def test_root_files_never_go_missing_mid_swap(tmp_path, monkeypatch):
     assert {n: (live / n).read_text(encoding="utf-8-sig") for n in ("hermes_constants.py", "hermes_bootstrap.py")} == {
         "hermes_constants.py": "new", "hermes_bootstrap.py": "new"}
     assert not [p for p in os.listdir(live) if "hermes-update" in p]
+
+
+# ---------------------------------------------------------------------------
+# ZIP swap owner lock and staging journal (_early_recovery / _journaled_stage_and_swap)
+# ---------------------------------------------------------------------------
+
+_LOCK_ROLE = r'''
+import json, os, sys, time
+from pathlib import Path
+from hermes_cli import _early_recovery as er
+role, work = sys.argv[1], Path(sys.argv[2])
+live, lock_path = work / "live", work / "live" / ".hermes-update-zip-swap.lock"
+def wait_for(name):
+    end = time.time() + 30
+    while not (work / name).exists():
+        if time.time() > end:
+            raise SystemExit(f"{role}: no {name}")
+        time.sleep(0.01)
+def mark(name, owned):
+    (work / name).write_text(json.dumps({"owned": bool(owned), "inode": os.stat(lock_path).st_ino
+                                         if lock_path.exists() else None}))
+if role == "a":  # owner whose release is caught right after its unlock: B already holds the inode
+    real = er._lock_fd
+    def lock_fd(fd, lock):
+        done = real(fd, lock)
+        if not lock:
+            wait_for("b")
+        return done
+    er._lock_fd = lock_fd
+    with er.zip_swap_owner_lock(live) as owned:
+        mark("a", owned)
+        wait_for("b-waiting"); time.sleep(0.3)
+    (work / "a-done").touch()
+elif role == "b":  # waiter that wins the lock as A lets go
+    wait_for("a"); (work / "b-waiting").touch()
+    with er.zip_swap_owner_lock(live, wait=20) as owned:
+        mark("b", owned)
+        wait_for("c")
+else:  # newcomer after A's release completed
+    wait_for("a-done")
+    with er.zip_swap_owner_lock(live) as owned:
+        mark("c", owned)
+'''
+
+
+def test_zip_swap_lock_is_one_inode_across_a_release(tmp_path):
+    """Three real processes: A releases while B waits; B wins. C must then be refused: a release that
+    unlinks the lock path lets C lock a fresh inode next to B's (two "exclusive" owners)."""
+    import json
+    import subprocess
+    import sys
+
+    (tmp_path / "live").mkdir()
+    repo = os.path.realpath(Path(update_cmd.__file__).parent.parent)
+    procs = [subprocess.Popen([sys.executable, "-c", _LOCK_ROLE, role, str(tmp_path)], cwd=repo,
+                              env={**os.environ, "PYTHONPATH": repo}) for role in "abc"]
+    assert [p.wait(timeout=90) for p in procs] == [0, 0, 0]
+    a, b, c = (json.loads((tmp_path / r).read_text()) for r in "abc")
+    assert a["owned"] and b["owned"]
+    assert not c["owned"], f"two processes held the ZIP swap lock at once (inodes {b['inode']} and {c['inode']})"
+    assert a["inode"] == b["inode"] == c["inode"]
+
+
+@pytest.mark.skipif(os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+                    reason="POSIX permission bits; root ignores them")
+def test_zip_swap_lock_refuses_admission_without_a_lock(tmp_path):
+    """A root where the lock file cannot be created grants nothing: no lock, no swap, and a named reason."""
+    from hermes_cli._early_recovery import zip_swap_owner_lock
+
+    live = tmp_path / "live"
+    live.mkdir()
+    live.chmod(0o555)
+    try:
+        with zip_swap_owner_lock(live) as owned:
+            assert not owned, "admitted to the ZIP swap without holding any lock"
+            assert owned.reason.startswith("cannot open the ZIP swap lock")
+        with pytest.raises(RuntimeError, match="no ZIP swap lock"):
+            update_cmd_zip._journaled_stage_and_swap(str(tmp_path), [], live, None)
+    finally:
+        live.chmod(0o755)
+
+
+def _unreadable_release(tmp_path: Path, *, read_only_dir: bool) -> tuple[Path, Path, list[Path]]:
+    live, extracted = tmp_path / "live", tmp_path / "extracted"
+    live.mkdir()
+    extracted.mkdir()
+    (live / "keep.txt").write_text("live data")
+    (extracted / "first.txt").write_text("new first")
+    (extracted / "second").mkdir()
+    (extracted / "second" / "good.txt").write_text("new copied data")
+    locked = []
+    if read_only_dir:  # copytree copies its mode: the partial stage gets a directory nobody can empty
+        ro = extracted / "second" / "aaa_ro"
+        ro.mkdir()
+        (ro / "x.txt").write_text("x")
+        locked.append(ro)
+    blocked = extracted / "second" / "zzz_no_read.txt"
+    blocked.write_text("unreadable")
+    locked.append(blocked)
+    for path in locked:
+        path.chmod(0o555 if path.is_dir() else 0)
+    return live, extracted, locked
+
+
+_POSIX_MODES = pytest.mark.skipif(os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+                                  reason="POSIX permission bits; root ignores them")
+
+
+@_POSIX_MODES
+def test_unreadable_source_file_leaves_no_partial_stage(tmp_path):
+    """The copy of ``second`` dies on an unreadable file after copying the rest: that partial staging
+    tree is the failing entry's and must be dropped like the finished ones (nothing live changes)."""
+    from hermes_cli._early_recovery import ZIP_SWAP_JOURNAL, restore_interrupted_zip_swap
+
+    live, extracted, locked = _unreadable_release(tmp_path, read_only_dir=False)
+    try:
+        with pytest.raises(OSError):
+            update_cmd_zip._journaled_stage_and_swap(str(extracted), ["first.txt", "second"], live, None)
+    finally:
+        for path in locked:
+            path.chmod(0o755)
+    assert not list(live.glob("*.hermes-update-staging")), "a partial stage leaked past the failed copy"
+    assert not (live / ZIP_SWAP_JOURNAL).exists()
+    assert restore_interrupted_zip_swap(live) is False
+    assert sorted(p.name for p in live.iterdir()) == [".hermes-update-zip-swap.lock", "keep.txt"]
+
+
+@_POSIX_MODES
+def test_a_stage_cleanup_that_cannot_finish_keeps_the_journal_for_recovery(tmp_path):
+    """When the updater cannot remove its partial stage, the journal is that stage's only record: it
+    stays, and the next launch's recovery removes the stage, then the journal."""
+    from hermes_cli._early_recovery import ZIP_SWAP_JOURNAL, restore_interrupted_zip_swap
+
+    live, extracted, locked = _unreadable_release(tmp_path, read_only_dir=True)
+    try:
+        with pytest.raises(OSError):
+            update_cmd_zip._journaled_stage_and_swap(str(extracted), ["first.txt", "second"], live, None)
+    finally:
+        for path in locked:
+            path.chmod(0o755)
+    assert (live / "second.hermes-update-staging").exists(), "harness: the cleanup was expected to fail"
+    assert (live / ZIP_SWAP_JOURNAL).exists(), "the journal went while its staging path was still on disk"
+    assert restore_interrupted_zip_swap(live) is False  # nothing live moved: no relaunch
+    assert not list(live.glob("*.hermes-update-staging")) and not (live / ZIP_SWAP_JOURNAL).exists()
+    assert (live / "keep.txt").read_text() == "live data"

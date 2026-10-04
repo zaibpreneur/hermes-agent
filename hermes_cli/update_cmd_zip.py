@@ -343,12 +343,14 @@ def _graft_nested_artifacts(item: str, live: str, staging: str) -> None:
 
 def _stage_entries(extracted: str, entries: list[str], project_root: str) -> list[tuple[str, str]]:
     """Phase 1 for every entry; on failure nothing is live yet, so drop partial staging copies so a retry
-    starts from the same free space."""
+    starts from the same free space. Each entry is recorded BEFORE its copy starts: a copy that fails
+    partway (an unreadable source file) leaves a partial staging tree that must be dropped too."""
     staged: list[tuple[str, str]] = []
     try:
         for item in entries:
             dst = os.path.join(project_root, item)
-            staged.append((_stage_replacement(os.path.join(extracted, item), dst), dst))
+            staged.append((f"{dst}.hermes-update-staging", dst))
+            _stage_replacement(os.path.join(extracted, item), dst)
             # The source ZIP carries only source; the built outputs (#70337/#87331 release/, then
             # dist/, apps/desktop/node_modules and web_dist — #90495) exist only in the LIVE tree. Graft
             # them into the staged copy BEFORE the swap so the commit preserves them atomically.
@@ -357,6 +359,21 @@ def _stage_entries(extracted: str, entries: list[str], project_root: str) -> lis
         _discard_staged(staged)
         raise
     return staged
+
+
+def _staging_left(root: Path, entries: list[str]) -> list[str]:
+    """The declared staging paths still on disk (a cleanup that could not finish)."""
+    return [item for item in entries if os.path.lexists(os.path.join(root, item + ".hermes-update-staging"))]
+
+
+def _drop_journal_if_clean(root: Path, entries: list[str]) -> None:
+    """The journal is the only record of the staging paths: it goes only once every one of them is gone."""
+    left = _staging_left(root, entries)
+    if left:
+        print(f"  ⚠ Could not remove the staged copies of {', '.join(left)}; the next `hermes` launch "
+              "removes them.")
+        return
+    (root / ZIP_SWAP_JOURNAL).unlink(missing_ok=True)
 
 
 def _journaled_stage_and_swap(extracted: str, entries: list[str], root: Path, target_sha) -> list:
@@ -381,7 +398,7 @@ def _journaled_stage_and_swap(extracted: str, entries: list[str], root: Path, ta
         try:
             staged = _stage_entries(extracted, entries, str(root))
         except BaseException:
-            (root / ZIP_SWAP_JOURNAL).unlink(missing_ok=True)  # _stage_entries dropped its copies
+            _drop_journal_if_clean(root, entries)  # _stage_entries dropped its copies, if it could
             raise
         try:
             # TOCTOU re-check right before the swap: download + extract + staging can take minutes and
@@ -389,7 +406,7 @@ def _journaled_stage_and_swap(extracted: str, entries: list[str], root: Path, ta
             recheck_reason = _zip_overlay_block_reason(root, ignore_staging_artifacts=True, shipped=entries)
             if recheck_reason is not None:
                 _discard_staged(staged)
-                (root / ZIP_SWAP_JOURNAL).unlink(missing_ok=True)
+                _drop_journal_if_clean(root, entries)
                 print(f"✗ ZIP fallback aborted before the swap: {recheck_reason}.")
                 print("  Files appeared in the checkout while the update was downloading; committing the swap would delete them.")
                 print(_STASH_HINT)

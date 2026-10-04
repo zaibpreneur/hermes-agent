@@ -569,8 +569,21 @@ def write_zip_swap_journal(root: Path, phase: str, entries: list) -> None:
 def _drop_path(path: Path) -> None:
     if path.is_dir() and not path.is_symlink():
         import shutil
+        import stat
 
-        shutil.rmtree(path)
+        try:
+            shutil.rmtree(path)
+        except OSError:
+            # A staged copy keeps its source's modes: a read-only directory refuses to give up its
+            # entries. These trees are the update's own copies, so make them writable and retry.
+            rwx = stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR
+            os.chmod(path, os.stat(path).st_mode | rwx)
+            for dirpath, dirnames, files in os.walk(path):
+                for name in (*dirnames, *files):
+                    child = os.path.join(dirpath, name)
+                    if not os.path.islink(child):  # about to be deleted: only the owner bits matter
+                        os.chmod(child, os.stat(child).st_mode | (rwx if name in dirnames else stat.S_IWUSR))
+            shutil.rmtree(path)
     elif path.exists() or path.is_symlink():
         path.unlink()
 
