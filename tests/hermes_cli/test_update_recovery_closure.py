@@ -124,17 +124,32 @@ def test_a_launch_repairs_a_move_killed_while_writing_the_repairs_own_code(tmp_p
 
 
 @pytest.mark.platforms("posix")
-def test_the_published_repair_leaves_the_tree_to_a_live_writer_holding_the_checkout(tmp_path):
+@pytest.mark.parametrize("published", [True, False])
+def test_the_published_repair_leaves_the_tree_to_a_live_writer_holding_the_checkout(tmp_path, published):
     root, env, original, launcher = _killed_mid_write(tmp_path, "hermes_bootstrap.py")
+    if not published:
+        # The closure comes from git's objects, and no git was recorded: the launcher's git is an
+        # absolute PATH entry's, never a ``git`` in the current directory an empty entry names (m4).
+        shutil.rmtree(root / ".git/hermes-update-recovery")
+        marker = root / ".git/hermes-update-pull"
+        lines = marker.read_text(encoding="utf-8-sig").splitlines()
+        marker.write_text("".join(line + "\n" for line in lines if not line.startswith("git=")), encoding="utf-8")
+        (tmp_path / "git").write_text(f"#!/bin/sh\ntouch {shlex.quote(str(tmp_path / 'CWD_GIT_RAN'))}\nexit 1\n",
+                                      encoding="utf-8")
+        (tmp_path / "git").chmod(0o755)
     holder = subprocess.Popen([sys.executable, "-I", "-c", _HOLDER, str(SOURCE), str(root)], env=env,
                               stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True, encoding="utf-8")
     try:
         assert holder.stdout is not None and holder.stdout.readline().strip() == "HELD"
-        launch = subprocess.run([str(launcher)], cwd=tmp_path, env=env, capture_output=True, text=True, encoding="utf-8",
-                            errors="replace", timeout=60)
+        launch = subprocess.run([str(launcher)], cwd=tmp_path, env={**env, "PATH": os.pathsep + env["PATH"]},
+                                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
         assert launch.returncode != 0 and "Not repairing the checkout now" in launch.stderr, launch.stderr
+        # One reason, not a "repairing it" banner followed by the import's traceback (m3).
+        assert "Traceback" not in launch.stderr and "repairing it" not in launch.stderr, launch.stderr
         assert not (root / "hermes_bootstrap.py").exists(), "repaired under a live writer"
         assert (root / ".git/hermes-update-pull").exists()
+        assert not (tmp_path / "CWD_GIT_RAN").exists()
+        assert (root / ".git/hermes-update-recovery").is_dir(), "closure not rebuilt from git's objects"
     finally:
         holder.kill()
         holder.wait()
@@ -142,3 +157,22 @@ def test_the_published_repair_leaves_the_tree_to_a_live_writer_holding_the_check
                             errors="replace", timeout=60)
     assert launch.returncode == 0 and "APP_REACHED" in launch.stdout, launch.stderr
     assert (root / "hermes_bootstrap.py").read_bytes() == original
+
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("damage", ["truncated", "foreign"])
+def test_a_damaged_published_closure_is_rebuilt_from_git_objects_not_trusted(tmp_path, damage):
+    """A power loss can leave the published closure with bytes git never had: they never run, and the
+    launch rebuilds the closure from ``pre``'s objects before repairing (M1)."""
+    root, env, original, launcher = _killed_mid_write(tmp_path, "hermes_bootstrap.py")
+    (closure,) = (root / ".git/hermes-update-recovery").iterdir()
+    module = closure / "hermes_cli/_early_recovery.py"
+    module.write_bytes(b"" if damage == "truncated" else
+                       module.read_bytes() + b"\nprint('NOT_PRE_CODE_RAN', file=__import__('sys').stderr)\n")
+    launch = subprocess.run([str(launcher)], cwd=tmp_path, env=env, capture_output=True, text=True, encoding="utf-8",
+                            errors="replace", timeout=60)
+    assert launch.returncode == 0 and "APP_REACHED" in launch.stdout, launch.stderr
+    assert "NOT_PRE_CODE_RAN" not in launch.stderr, launch.stderr
+    assert (root / "hermes_bootstrap.py").read_bytes() == original
+    assert not (root / ".git/hermes-update-pull").exists()

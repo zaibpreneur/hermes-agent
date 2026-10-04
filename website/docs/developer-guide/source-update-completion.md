@@ -123,12 +123,16 @@ The repair code lives in the tree a killed move tears (`hermes_bootstrap.py`,
 `update_custody.py`). Before git writes, every tree move publishes those
 recovery/lock/custody modules, as committed at the move's starting commit, to
 `<git dir>/hermes-update-recovery/<pre>/`, outside the working tree and keyed
-to the marker's `pre`. When the checkout's own import fails while the marker
-exists, the minted launcher (`.hermes/bin/hermes`) runs that published copy
-(when an older updater published none, it first reads the same files from
-git's objects at `pre` into that directory): stdlib plus the copy only, the
-same restore claim and checkout lock (a live writer still gets `Not repairing
-the checkout now`), then relaunches from the restored tree. Limits: other entry
+to the marker's `pre` (a full commit id, nothing else), with a `MANIFEST` of
+each file's blob id; files and directory are fsynced before the rename. When
+the checkout's own import fails while the marker exists, the minted launcher
+(`.hermes/bin/hermes`) runs that published copy only if every file hashes to
+its manifest id. A missing, torn or foreign copy (or none, from an older
+updater) is rebuilt first from git's objects at `pre` (`--no-replace-objects`,
+the recorded git or an absolute `PATH` entry, never the current directory) and
+verified the same way. Then: stdlib plus the copy only, the same restore claim
+and checkout lock (a live writer gets `Not repairing the checkout now` and exit
+1, no traceback), then a relaunch from the restored tree. Limits: other entry
 points (`python -m hermes_cli.main`, the `hermes-agent` hook) have no such
 fallback; a launcher minted before this fallback existed has none, so a kill
 during the first update onto this code (run under the old launcher) is not

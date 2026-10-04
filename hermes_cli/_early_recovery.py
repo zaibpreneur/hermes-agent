@@ -255,8 +255,40 @@ RECOVERY_CLOSURE_DIR = "hermes-update-recovery"
 RECOVERY_CLOSURE = ("hermes_cli/_early_recovery.py", "hermes_cli/update_lock.py", "hermes_cli/update_custody.py")
 
 
+# ``<blob id> <path>`` per published file (``RECOVERY_CLOSURE`` + the empty package initializer):
+# a closure is used only when every file hashes to its id (a power loss can leave the renamed dir
+# with files git's objects never had), else it is rebuilt from git's objects.
+RECOVERY_CLOSURE_MANIFEST = "MANIFEST"
+RECOVERY_CLOSURE_INIT = "hermes_cli/__init__.py"
+
+
 def recovery_closure_dir(root: Path, pre: str) -> Path:
+    if not is_object_id(pre):  # never a revision (``HEAD``) or a path (``../x``) under the git dir
+        raise ValueError(f"not a commit id: {pre!r}")
     return _git_dir(root) / RECOVERY_CLOSURE_DIR / pre
+
+
+def is_object_id(value: str) -> bool:
+    return bool(re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", value or ""))
+
+
+def blob_id(data: bytes, like: str) -> str:
+    """Git's object id of a blob holding ``data``, in ``like``'s object format (SHA-1 or SHA-256)."""
+    import hashlib
+
+    return hashlib.new("sha1" if len(like) == 40 else "sha256", b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def recovery_closure_verified(closure: Path, pre: str) -> bool:
+    """Every closure file present with exactly the bytes its manifest names, and nothing missing."""
+    try:
+        listed = dict(line.split(" ", 1)[::-1] for line in
+                      (closure / RECOVERY_CLOSURE_MANIFEST).read_text(encoding="utf-8-sig").splitlines())
+        return (set(listed) == {*RECOVERY_CLOSURE, RECOVERY_CLOSURE_INIT}
+                and listed[RECOVERY_CLOSURE_INIT] == blob_id(b"", pre)
+                and all(blob_id((closure / rel).read_bytes(), pre) == oid for rel, oid in listed.items()))
+    except (OSError, ValueError):
+        return False
 
 
 def _git_executable(recorded_by_updater: str = "") -> str:

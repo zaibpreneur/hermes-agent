@@ -307,13 +307,15 @@ def mint_launcher(
 
 # A killed move can tear the repair's own code (``hermes_bootstrap``, ``hermes_cli``). With the
 # marker still there, a launcher whose checkout import failed runs the copy of the repair that the
-# updater published beside the marker (``update_cmd_commit.publish_recovery_closure``), or, when
-# none was published (an updater predating it), the same files read from git's objects at the
-# marker's ``pre``: stdlib plus that copy only, under the same claim and checkout lock (a live
-# writer still refuses), then a relaunch from the restored tree.
+# updater published beside the marker (``update_cmd_commit.publish_recovery_closure``) once every
+# file hashes to the blob id its manifest names; a missing, torn or foreign closure (or none, from
+# an updater predating it) is rebuilt from git's objects at the marker's ``pre`` with the recorded
+# git or an absolute PATH entry (never one from the current directory) and verified the same way.
+# Stdlib plus that copy only, under the same claim and checkout lock (a live writer still refuses,
+# which exits 1 with the repair's own reason), then a relaunch from the restored tree.
 _CLOSURE_REPAIR = """\
 def _hermes_closure_repair():
-    import subprocess
+    import contextlib, hashlib, io, shutil, subprocess
     from pathlib import Path
     root = Path(__ROOT__)
     git = root / '.git'
@@ -325,41 +327,82 @@ def _hermes_closure_repair():
     except OSError:
         return
     pre = fields.get('pre', '').strip()
+    if not re.fullmatch('[0-9a-f]{40}|[0-9a-f]{64}', pre):
+        return
     closure = git / __CLOSURE_DIR__ / pre
-    if pre and not all((closure / rel).is_file() for rel in __CLOSURE__):
+    files = (*__CLOSURE__, __INIT__)
+
+    def blob_id(data):
+        return hashlib.new('sha1' if len(pre) == 40 else 'sha256', b'blob %d\\0' % len(data) + data).hexdigest()
+
+    def verified():
+        try:
+            listed = dict(line.split(' ', 1)[::-1] for line in (closure / __MANIFEST__).read_text(encoding='utf-8-sig').splitlines())
+            return (set(listed) == set(files) and listed[__INIT__] == blob_id(b'')
+                    and all(blob_id((closure / rel).read_bytes()) == oid for rel, oid in listed.items()))
+        except (OSError, ValueError):
+            return False
+
+    if not verified():
         exe = fields.get('git', '').strip()
+        if not (os.path.isabs(exe) and os.path.isfile(exe)):
+            names = ('git.exe',) if os.name == 'nt' else ('git',)
+            exe = next((os.path.join(d, n) for d in os.environ.get('PATH', '').split(os.pathsep) if os.path.isabs(d)
+                        for n in names if os.path.isfile(os.path.join(d, n))), '')
+        if not exe:
+            return
+
+        def git_out(*args):
+            done = subprocess.run([exe, '--no-replace-objects', '-C', str(root), *args], capture_output=True, timeout=60,
+                                  stdin=subprocess.DEVNULL, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+            if done.returncode != 0:
+                raise OSError(done.stderr)
+            return done.stdout
+
         staging = closure.with_name('.%s.%d.launch' % (pre, os.getpid()))
         try:
-            for rel in (*__CLOSURE__, 'hermes_cli/__init__.py'):
-                blob = b''
-                if rel in __CLOSURE__:
-                    blob = subprocess.run([exe if exe and os.path.isfile(exe) else 'git', '-C', str(root), 'cat-file',
-                                           'blob', pre + ':' + rel], capture_output=True, timeout=60,
-                                          stdin=subprocess.DEVNULL, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-                    if blob.returncode != 0:
-                        return
-                    blob = blob.stdout
+            ids = {}
+            for entry in git_out('ls-tree', '-z', '--full-tree', pre, '--', *__CLOSURE__).split(b'\\0'):
+                meta, _, rel = entry.decode('utf-8', 'replace').partition('\\t')
+                if meta.split()[1:2] == ['blob']:
+                    ids[rel] = meta.split()[2]
+            blobs = {__INIT__: b''}
+            for rel in __CLOSURE__:
+                blobs[rel] = git_out('cat-file', 'blob', ids[rel])
+            blobs[__MANIFEST__] = ''.join('%s %s\\n' % (blob_id(data), rel) for rel, data in blobs.items()).encode('utf-8')
+            for rel, data in blobs.items():
                 (staging / rel).parent.mkdir(parents=True, exist_ok=True)
-                (staging / rel).write_bytes(blob)
+                (staging / rel).write_bytes(data)
+            shutil.rmtree(closure, ignore_errors=True)
             os.replace(staging, closure)
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, KeyError, subprocess.SubprocessError):
             pass
         finally:
-            __import__('shutil').rmtree(staging, ignore_errors=True)
-    if not pre or not all((closure / rel).is_file() for rel in __CLOSURE__):
-        return
+            shutil.rmtree(staging, ignore_errors=True)
+        if not verified():
+            return
     for name in [n for n in sys.modules if n.split('.')[0] in ('hermes_cli', 'hermes_bootstrap', 'hermes_constants', 'pm')]:
         del sys.modules[name]
     tree = os.path.normcase(os.path.realpath(root))
     sys.path[:] = [str(closure)] + [p for p in sys.path if p and os.path.normcase(os.path.realpath(p)) != tree
                                     and not os.path.normcase(os.path.realpath(p)).startswith(tree + os.sep)]
-    print('hermes: the checkout cannot start after an interrupted `hermes update`; '
-          'repairing it with the recovery code saved before the update.', file=sys.stderr)
     sys.dont_write_bytecode = True
-    from hermes_cli import _early_recovery
-    if _early_recovery.restore_interrupted_pull(root):
+    said = io.StringIO()
+    restored = False
+    try:
+        with contextlib.redirect_stderr(said):
+            from hermes_cli import _early_recovery
+            restored = _early_recovery.restore_interrupted_pull(root)
+    except Exception as exc:
+        said.write('hermes: the checkout cannot start after an interrupted `hermes update`, and it was not '
+                   'repaired: %s\\n' % (exc,))
+    if restored:
+        sys.stderr.write('hermes: the checkout could not start after an interrupted `hermes update`; '
+                         'repaired it with the recovery code saved before the update.\\n' + said.getvalue())
         _early_recovery.relaunch_after_restore()
-    return True
+    sys.stderr.write(said.getvalue() or 'hermes: the checkout cannot start after an interrupted `hermes update`; '
+                     'launch again once the update that owns it finishes.\\n')
+    raise SystemExit(1)
 """
 
 
@@ -375,10 +418,18 @@ def _launcher_script(name: str, repo_root: Path, dependencies: Path | None) -> s
     # ``hermes_bootstrap`` right after the repair (``_PIN_DEFAULT_HOME``), and here again for a
     # bootstrap that predates that hook.
     root = str(repo_root.resolve())
-    from hermes_cli._early_recovery import INTERRUPTED_PULL_MARKER, RECOVERY_CLOSURE, RECOVERY_CLOSURE_DIR
+    from hermes_cli._early_recovery import (
+        INTERRUPTED_PULL_MARKER,
+        RECOVERY_CLOSURE,
+        RECOVERY_CLOSURE_DIR,
+        RECOVERY_CLOSURE_INIT,
+        RECOVERY_CLOSURE_MANIFEST,
+    )
 
     closure_repair = (_CLOSURE_REPAIR.replace("__MARKER__", repr(INTERRUPTED_PULL_MARKER))
                       .replace("__CLOSURE_DIR__", repr(RECOVERY_CLOSURE_DIR))
+                      .replace("__MANIFEST__", repr(RECOVERY_CLOSURE_MANIFEST))
+                      .replace("__INIT__", repr(RECOVERY_CLOSURE_INIT))
                       .replace("__CLOSURE__", repr(RECOVERY_CLOSURE))
                       .replace("__ROOT__", repr(root)))  # last: a path is never re-substituted
     return (

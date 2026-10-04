@@ -24,8 +24,13 @@ from typing import Optional
 
 from hermes_cli._early_recovery import (
     RECOVERY_CLOSURE,
+    RECOVERY_CLOSURE_INIT,
+    RECOVERY_CLOSURE_MANIFEST,
+    blob_id,
     interrupted_pull_marker,
+    is_object_id,
     recovery_closure_dir,
+    recovery_closure_verified,
     restore_interrupted_pull,
 )
 from hermes_cli.update_custody import run_git
@@ -134,35 +139,66 @@ def publish_recovery_closure(git_cmd, root: Path, pre: str) -> Path:
 
     The bytes come from the commit the repair restores, never from the working tree: a rollback move
     starts from a broken tree, and a second move in one run starts from code this process never ran.
-    Published by an atomic directory rename, so a present closure is a whole one; an older run's
-    closure (another ``pre``) is dropped.
+    A manifest names each file's blob id; the launcher runs the closure only when every file hashes
+    to it (``recovery_closure_verified``) and rebuilds it from git's objects otherwise. Files and
+    directory are fsynced before the atomic rename, so a power loss during the move that follows
+    finds the whole closure or none. An older run's closure (another ``pre``) is dropped.
     """
     import shutil
 
+    if not is_object_id(pre):
+        raise OSError(f"not a commit id: {pre!r}")
     dest = recovery_closure_dir(Path(root), pre)
-    if all((dest / rel).is_file() for rel in RECOVERY_CLOSURE):
+    if recovery_closure_verified(dest, pre):
         return dest
-    blobs = {}
+    git_cmd = [*([git_cmd] if isinstance(git_cmd, str) else git_cmd), "--no-replace-objects"]
+    listed = run_git(git_cmd, ["ls-tree", "-z", "--full-tree", pre, "--", *RECOVERY_CLOSURE], cwd=str(root),
+                     capture_output=True, stdin=subprocess.DEVNULL, timeout=120)
+    ids = {}
+    for entry in (listed.stdout or b"").split(b"\0") if listed.returncode == 0 else ():
+        meta, _, rel = entry.decode("utf-8", "replace").partition("\t")
+        if meta.split()[1:2] == ["blob"]:
+            ids[rel] = meta.split()[2]
+    blobs = {RECOVERY_CLOSURE_INIT: b""}
     for rel in RECOVERY_CLOSURE:
-        shown = run_git(git_cmd, ["cat-file", "blob", f"{pre}:{rel}"], cwd=str(root), capture_output=True,
-                        stdin=subprocess.DEVNULL, timeout=120)
-        if shown.returncode != 0 or not isinstance(shown.stdout, bytes) or not shown.stdout:
+        shown = run_git(git_cmd, ["cat-file", "blob", ids.get(rel, "")], cwd=str(root), capture_output=True,
+                        stdin=subprocess.DEVNULL, timeout=120) if rel in ids else None
+        if shown is None or shown.returncode != 0 or blob_id(shown.stdout or b"", pre) != ids[rel]:
             raise OSError(f"{rel} is not in {pre[:10]}")
         blobs[rel] = shown.stdout
+    manifest = "".join(f"{blob_id(data, pre)} {rel}\n" for rel, data in blobs.items()).encode("utf-8")
     staging = dest.with_name(f".{pre}.{os.getpid()}.staging")
     shutil.rmtree(staging, ignore_errors=True)
     try:
-        for rel, data in {**blobs, "hermes_cli/__init__.py": b""}.items():
+        for rel, data in {**blobs, RECOVERY_CLOSURE_MANIFEST: manifest}.items():
             (staging / rel).parent.mkdir(parents=True, exist_ok=True)
-            (staging / rel).write_bytes(data)
+            with open(staging / rel, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+        for directory in (staging / "hermes_cli", staging):
+            _fsync_dir(directory)
         shutil.rmtree(dest, ignore_errors=True)
         os.replace(staging, dest)
+        _fsync_dir(dest.parent)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
     for stale in dest.parent.iterdir():
         if stale != dest:
             shutil.rmtree(stale, ignore_errors=True)
     return dest
+
+
+def _fsync_dir(directory: Path) -> None:
+    """POSIX: make a directory's entries durable. Windows opens no directory handle; NTFS journals
+    the rename itself."""
+    if os.name == "nt":
+        return
+    fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def _absolute_git(git_cmd) -> str:
