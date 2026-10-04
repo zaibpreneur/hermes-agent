@@ -29,6 +29,10 @@ real git failure, and then judges the next real launch from the files the update
   (only ``origin/main``); git's checkout guess would create it and rewrite the tree unmarked.
 * ``kill_during_syntax_rollback``: a broken release past the preflight is rolled back and the
   updater dies mid-rollback; the next launch must land on the pre-update commit, not the broken one.
+* ``git_killed_inside_rollback_reset``: the rollback's own ``git reset -q <pre>`` is SIGKILLed the
+  moment its ``index.lock`` exists (HEAD still on the broken release, the lock left behind). The
+  updater must keep the interrupted-pull marker (never report the rollback complete), and the next
+  launch must reclaim the dead lock, redo the rollback and land on the pre-update commit whole.
 """
 
 from __future__ import annotations
@@ -376,3 +380,63 @@ def test_kill_during_syntax_rollback_lands_on_the_pre_update_commit(world):
     assert _head(sb) == pre and not _tracked_dirty(sb) and not (sb.checkout / "e2e_rollback_extra.py").exists(), (
         f"the launch after a kill mid-rollback did not land on {pre[:10]} (HEAD {_head(sb)[:10]}, broken "
         f"{broken[:10]}; tracked changes {_tracked_dirty(sb)!r})\n" + P.diagnostics(sb, killed, launch))
+
+
+# Run by the git shim inside the sandbox: start the real git under an inotify watch on its git dir and
+# SIGKILL it the moment ``index.lock`` is created (git then holds the lock and has not moved HEAD).
+_GIT_KILLER = r"""
+import ctypes, os, signal, struct, subprocess, sys
+real, args = sys.argv[1], sys.argv[2:]
+git_dir = subprocess.run([real, "rev-parse", "--absolute-git-dir"], capture_output=True, text=True).stdout.strip()
+libc = ctypes.CDLL(None, use_errno=True)
+fd = libc.inotify_init1(0)
+libc.inotify_add_watch(fd, git_dir.encode(), 0x100)  # IN_CREATE
+git = subprocess.Popen([real, *args])
+while git.poll() is None:
+    buf, i = os.read(fd, 4096), 0
+    while i < len(buf):
+        length = struct.unpack_from("iIII", buf, i)[3]
+        name, i = buf[i + 16:i + 16 + length].rstrip(b"\0"), i + 16 + length
+        if name == b"index.lock":
+            os.kill(git.pid, signal.SIGKILL)
+            git.wait()
+            sys.exit(137)
+sys.exit(git.returncode)
+"""
+
+
+def test_git_killed_inside_the_rollback_reset_is_finished_by_the_next_launch(world):
+    sb = world["sb"]
+    pre = _head(sb)
+    # A critical module the launcher imports only after the launch-time repair ran (the launcher's own
+    # first import, hermes_constants, is a documented limit: a broken copy dies before any repair).
+    tools = I.git("show", "main:model_tools.py", cwd=world["origin"])
+    broken = _release(world, {"model_tools.py": tools + "\ndef broken(:\n",
+                              "e2e_rollback_reset_extra.py": "X = 1\n"})
+    killer = world["root"] / "git_killer.py"
+    killer.write_text(_GIT_KILLER, encoding="utf-8")
+    once = sb.root / "rollback-reset-killed"  # the sandbox can write only under its own root
+    # The preflight reads the old file (so the broken release passes it); the rollback's first step,
+    # `reset -q <pre>` (HEAD and index, no file), runs once under the killer.
+    _hostile_git(world, 'case " $* " in *" show "*":model_tools.py "*) "$REAL" show HEAD:model_tools.py; '
+                        f'exit $?;; *" reset -q {pre} "*) if [ ! -e "{once}" ]; then : > "{once}"; '
+                        f'exec "{sb.python}" "{killer}" "$REAL" "$@"; fi;; esac')
+    killed = _update(sb)
+    _hostile_git(world, "")
+    output = (killed.stdout or "") + (killed.stderr or "")
+    lock = sb.checkout / ".git" / "index.lock"
+    assert "syntax error" in output and once.exists(), "harness: the rollback reset never ran\n" + I.describe(killed)
+    assert lock.exists() and _head(sb) == broken, (
+        "harness: the kill did not land while git held index.lock\n" + I.describe(killed))
+    assert killed.returncode != 0 and "Rollback complete" not in output, (
+        "the updater reported a rollback that never happened\n" + I.describe(killed))
+    assert (sb.checkout / ".git" / "hermes-update-pull").is_file(), (
+        "the killed rollback erased its own recovery record while HEAD is still the broken release\n"
+        + I.describe(killed))
+
+    launch = _launch(sb, "first launch after git was killed inside the rollback")
+    assert _head(sb) == pre and not _tracked_dirty(sb) and not lock.exists(), (
+        f"the launch did not finish the rollback to {pre[:10]} (HEAD {_head(sb)[:10]}, broken {broken[:10]}, "
+        f"lock {lock.exists()}, tracked changes {_tracked_dirty(sb)!r})\n" + P.diagnostics(sb, killed, launch))
+    assert not (sb.checkout / "e2e_rollback_reset_extra.py").exists()
+    assert not (sb.checkout / ".git" / "hermes-update-pull").exists()
