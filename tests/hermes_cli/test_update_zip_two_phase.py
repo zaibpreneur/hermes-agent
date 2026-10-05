@@ -304,6 +304,48 @@ def test_staging_restores_a_dangling_symlink_backup_instead_of_deleting_it(tmp_p
     assert not os.path.lexists(backup)
 
 
+@pytest.mark.parametrize("kind", ["file", "dir"])
+def test_a_symlink_planted_at_the_staging_path_after_the_sweep_is_never_written_through(tmp_path, monkeypatch, kind):
+    """_stage_replacement swept the fixed staging name, checked it was gone, then copy2'd to that same
+    path: a symlink planted in between carried the extracted bytes outside the install (review Z2).
+    The stage now fails closed on the planted entry; the external file keeps its bytes."""
+    live, new, outside = tmp_path / "live", tmp_path / "new", tmp_path / "outside"
+    for d in (live, new, outside):
+        d.mkdir()
+    victim = outside / ("sentinel.txt" if kind == "file" else "sentinel")
+    if kind == "file":
+        victim.write_text("SENTINEL")
+        (new / "alpha").write_text("NEW")
+    else:
+        victim.mkdir()
+        (new / "alpha").mkdir()
+        (new / "alpha" / "x.py").write_text("NEW")
+    (live / "alpha").write_text("OLD") if kind == "file" else (live / "alpha").mkdir()
+    staging = live / "alpha.hermes-update-staging"
+    real_isdir = os.path.isdir
+
+    def plant_then_isdir(path):  # the barrier: after the sweep and its lexists check, before the copy
+        if str(path) == str(new / "alpha") and not os.path.lexists(staging):
+            try:
+                staging.symlink_to(victim)
+            except OSError:
+                pytest.skip("symlinks need privileges here")
+        return real_isdir(path)
+
+    monkeypatch.setattr(update_cmd_zip.os.path, "isdir", plant_then_isdir)
+    with pytest.raises(OSError):
+        update_cmd._stage_replacement(str(new / "alpha"), str(live / "alpha"))
+    monkeypatch.undo()
+    if kind == "file":
+        assert victim.read_text() == "SENTINEL"
+    else:
+        assert list(victim.iterdir()) == []
+    staging.unlink()  # the planted link (only the link) goes; a healthy stage then proceeds
+    update_cmd._commit_staged_replacements([(update_cmd._stage_replacement(str(new / "alpha"), str(live / "alpha")),
+                                             str(live / "alpha"))])
+    assert (live / "alpha" if kind == "file" else live / "alpha" / "x.py").read_text() == "NEW"
+
+
 def test_commit_failure_plus_discard_leaves_no_staging_litter(tmp_path, monkeypatch):
     """Phase-2 failure must not orphan staging copies for unswapped entries.
 

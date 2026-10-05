@@ -90,8 +90,36 @@ def _stage_replacement(src: str, dst: str) -> str:
         _drop_path(Path(leftover))
         if os.path.lexists(leftover):
             raise OSError(f"could not remove the leftover {leftover}")
-    (shutil.copytree if os.path.isdir(src) else shutil.copy2)(src, staging)
+    # Never through the reusable pathname: copy2 opens it following a symlink planted after the sweep
+    # (review Z2). copytree's own os.mkdir is exclusive and never follows; a file is created the same way.
+    if os.path.isdir(src):
+        shutil.copytree(src, staging)
+    else:
+        _copy_file_exclusive(src, staging)
     return staging
+
+
+def _copy_file_exclusive(src: str, dst: str, *, sync: bool = False) -> None:
+    """``copy2`` that only ever creates ``dst``: O_CREAT|O_EXCL (+O_NOFOLLOW) fails on any entry there
+    (symlink, hardlink, file) instead of writing through it, and the bytes and mode go through the held
+    fd. Times are copied only where that can be done without following ``dst``."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    st = os.stat(src)
+    fd = os.open(dst, flags, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as out, open(src, "rb") as source:
+            shutil.copyfileobj(source, out, 1 << 20)
+            out.flush()
+            if os.chmod in os.supports_fd:
+                os.chmod(out.fileno(), st.st_mode & 0o7777)
+            if os.utime in os.supports_fd:
+                os.utime(out.fileno(), ns=(st.st_atime_ns, st.st_mtime_ns))
+            if sync:
+                os.fsync(out.fileno())
+    except BaseException:
+        with suppress(OSError):  # our own half-written create: never leave it for the swap to install
+            os.remove(dst)
+        raise
 
 
 def _discard_staged(staged) -> None:
@@ -123,9 +151,7 @@ def _file_backup(path: str, backup: str) -> None:
         return
     tmp = f"{backup}.tmp"
     try:
-        shutil.copy2(path, tmp)
-        with open(tmp, "rb+") as handle:
-            os.fsync(handle.fileno())
+        _copy_file_exclusive(path, tmp, sync=True)  # never through a planted <backup>.tmp link (Z2)
         os.replace(tmp, backup)
     except OSError:
         with suppress(OSError):

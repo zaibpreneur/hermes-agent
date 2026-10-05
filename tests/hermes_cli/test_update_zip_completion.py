@@ -358,8 +358,9 @@ def test_zip_recovers_crashed_backup_before_failed_copy_and_retry(zip_update, mo
     target.rename(backup)
     leftover = root / (entry + ".hermes-update-staging")
     leftover.write_text("interrupted copy", encoding="utf-8")
-    function = "copytree" if entry == "tools" else "copy2"
-    original = getattr(shutil, function)
+    # The file copy is update_cmd_zip's exclusive create (review Z2), no longer shutil.copy2.
+    owner, function = (shutil, "copytree") if entry == "tools" else (update_cmd_zip, "_copy_file_exclusive")
+    original = getattr(owner, function)
 
     def fail(src, dst, *args, **kwargs):
         if str(dst) == str(leftover):
@@ -367,7 +368,7 @@ def test_zip_recovers_crashed_backup_before_failed_copy_and_retry(zip_update, mo
         return original(src, dst, *args, **kwargs)
 
     with monkeypatch.context() as fault:
-        fault.setattr(shutil, function, fail)
+        fault.setattr(owner, function, fail)
         with pytest.raises(SystemExit) as error:
             update_cmd_zip._download_and_swap_zip("main", "local fixture")
         assert error.value.code == 1
