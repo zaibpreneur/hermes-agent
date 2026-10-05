@@ -139,6 +139,31 @@ during the first update onto this code (run under the old launcher) is not
 covered; a `pre` whose tree lacks the checkout lock or custody runner is not
 used.
 
+### Behaviour changes on the git path
+
+Intended differences from the pre-transactional updater, for release notes:
+
+- The Windows ZIP fallback runs only from an untouched checkout. Once git has
+  stashed, switched or half-moved the tree, the ZIP overlay (which replaces
+  every top-level entry) would bury that state, so the run fails with the git
+  error instead.
+- The commit point arms the completion tail, the fleet restart and the marker
+  before git writes. If any of them cannot be made durable, the update stops with
+  the checkout unchanged: moving without them is the "tail never runs" state.
+- Startup files (the launcher and `hermes_bootstrap` import closure) are
+  compiled at the target commit before the move, by an interpreter the target's
+  `requires-python` admits (`uv python find`, then `python3.N`). With none
+  installed the refusal names the Python to install. The preflight is one
+  `git cat-file --batch`.
+- Every move names the resolved commit id, not a ref, and its marker is dropped
+  only once HEAD is that commit. A branch that moves during the switch is
+  reported as a failed switch. The restart is owed for the HEAD the switch
+  actually landed on.
+- The fork's upstream fast-forward is judged the same way before it moves. A
+  broken upstream commit rolls the whole update back.
+- A recovery marker whose target commit is gone (gc, re-clone) is retired only
+  over a clean tracked tree at `pre`. Until then each launch warns.
+
 ## Historical surface
 
 All names frozen from the complete reachable shipped updater history stay
