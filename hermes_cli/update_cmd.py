@@ -941,7 +941,7 @@ def _rollback_if_pulled_syntax_error(git_cmd, pre_pull_sha, *, rollback_branch=N
         target_sha = _capture_head_sha(git_cmd, root)
         try:
             _commit.arm_tree_move(git_cmd, root, pre=pre_pull_sha, target=target_sha, stash=None, rollback=mode)
-        except OSError as exc:
+        except (OSError, subprocess.SubprocessError) as exc:  # its symbolic-ref can time out
             # Refusing would leave the broken tree in place: roll back unmarked, and only a tree
             # verified whole at pre_pull_sha below may report success (else the manual recipe).
             print(f"  ⚠ Could not write the interrupted-pull marker ({exc}); rolling back without it.")
