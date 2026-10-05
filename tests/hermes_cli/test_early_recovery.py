@@ -206,9 +206,9 @@ def test_zip_journal_writer_never_writes_through_a_preexisting_temp(tmp_path, li
         except OSError:
             pytest.skip("symlinks need privileges here")
     er.write_zip_swap_journal(root, "staging", [["a.py", True]])
-    assert secret.read_text(encoding="utf-8") == "API_KEY=keep\n"
+    assert secret.read_text(encoding="utf-8-sig") == "API_KEY=keep\n"
     journal = root / er.ZIP_SWAP_JOURNAL
-    assert not journal.is_symlink() and '"phase": "staging"' in journal.read_text(encoding="utf-8")
+    assert not journal.is_symlink() and '"phase": "staging"' in journal.read_text(encoding="utf-8-sig")
 
 
 @pytest.mark.parametrize("body", ["", "{not json", '{"phase": "swap", "entries": [["a.py", true]]}',
@@ -235,11 +235,12 @@ def test_an_unparsed_zip_journal_keeps_itself_and_every_backup(tmp_path, monkeyp
         monkeypatch.setattr(Path, "read_text", flaky)
     assert er.restore_interrupted_zip_swap(root) is False
     assert journal.is_file()
-    assert {p.name: p.read_text(encoding="utf-8") for p in root.iterdir() if p != journal and p.suffix != ".lock"} == {
+    assert {p.name: p.read_text(encoding="utf-8-sig") for p in root.iterdir() if p != journal and p.suffix != ".lock"} == {
         "a.py": "NEW_A", "a.py.hermes-update-old": "OLD_A", "b.py": "OLD_B", "b.py.hermes-update-staging": "NEW_B"}
 
 
-@pytest.mark.skipif(sys.platform == "win32" or os.geteuid() == 0, reason="POSIX modes; root ignores them")
+@pytest.mark.skipif(sys.platform == "win32" or getattr(os, "geteuid", lambda: 0)() == 0,
+                    reason="POSIX modes; root ignores them")
 def test_dropping_a_staged_tree_never_changes_a_hardlinked_live_files_mode(tmp_path):
     live = tmp_path / "release"
     live.mkdir()

@@ -419,7 +419,7 @@ def test_a_rollback_settles_beside_an_unrelated_tracked_edit_and_keeps_it(tmp_pa
     (root / "bulk" / "f1.txt").write_text("my edit\n", encoding="utf-8", newline="")
     assert er.restore_interrupted_pull(root) is True
     assert "reset --hard" not in capsys.readouterr().err
-    assert not marker.exists() and (root / "module.py").read_text(encoding="utf-8") == "good = True\n"
+    assert not marker.exists() and (root / "module.py").read_text(encoding="utf-8-sig") == "good = True\n"
     assert _git(root, "status", "--porcelain", "--untracked-files=no") == "M bulk/f1.txt"
 
 
@@ -443,7 +443,7 @@ def test_an_index_lock_judged_foreign_after_our_git_exited_is_never_reclaimed_la
     os.utime(lock, ns=(1_000_000_000, 1_000_000_000))
     assert er.restore_interrupted_pull(root) is True
     assert not lock.exists() and not marker.exists()
-    assert (root / "module.py").read_text(encoding="utf-8") == "good = True\n"
+    assert (root / "module.py").read_text(encoding="utf-8-sig") == "good = True\n"
 
 
 def test_a_launch_that_cannot_get_the_repair_claim_never_continues_from_the_torn_tree(tmp_path, monkeypatch):
