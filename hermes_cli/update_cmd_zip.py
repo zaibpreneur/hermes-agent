@@ -462,7 +462,10 @@ def _journaled_stage_and_swap(extracted: str, entries: list[str], root: Path, ta
         write_zip_swap_journal(root, "swapping", journal_entries)
         _commit_staged_replacements(
             staged, on_committed=lambda: write_zip_swap_journal(root, "committed", journal_entries))
-        (root / ZIP_SWAP_JOURNAL).unlink(missing_ok=True)
+        # Committed: the new tree is whole. A journal that cannot go now (AV/indexer holding it) says
+        # "committed", which the next launch's recovery settles by keeping the new tree.
+        with suppress(OSError):
+            (root / ZIP_SWAP_JOURNAL).unlink(missing_ok=True)
     return staged
 
 

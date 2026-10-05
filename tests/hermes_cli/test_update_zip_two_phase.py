@@ -573,3 +573,27 @@ def test_a_failed_swap_keeps_a_file_the_user_made_at_a_never_installed_entry(tmp
     assert user_file.is_file() and user_file.read_text(encoding="utf-8-sig") == "USER NOTE"
     assert (live / "a" / "v.txt").read_text(encoding="utf-8-sig") == "old"
     assert not [p.name for p in live.iterdir() if "hermes-update-staging" in p.name or p.name.endswith("-old")]
+
+def test_a_journal_that_cannot_be_dropped_after_the_commit_never_fails_the_update(tmp_path, monkeypatch):
+    """The swap committed: an AV scan holding the journal must not turn it into a reported failure
+    that disarms the new tree's completion obligations (F19)."""
+    from hermes_cli import update_cmd_commit
+
+    live, extracted = tmp_path / "live", tmp_path / "extracted"
+    _live_tree(live, {"payload": "old"})
+    _live_tree(extracted, {"payload": "new"})
+    real = Path.unlink
+
+    def held(self, *args, **kwargs):
+        if self.name == update_cmd_zip.ZIP_SWAP_JOURNAL:
+            raise PermissionError(13, "being used by another process", str(self))
+        return real(self, *args, **kwargs)
+
+    update_cmd_commit.reset_for_tests()
+    monkeypatch.setattr(Path, "unlink", held)
+    try:
+        update_cmd_zip._journaled_stage_and_swap(str(extracted), ["payload"], live, "b" * 40)
+        assert update_cmd_commit.commit_obligations_armed()
+    finally:
+        update_cmd_commit.reset_for_tests()
+    assert (live / "payload" / "version.txt").read_text() == "new"
