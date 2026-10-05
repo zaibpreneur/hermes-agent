@@ -190,11 +190,22 @@ def _project(tmp_path: Path, *, pyproject: bool = True) -> Path:
     return root
 
 
-
-
-
-
-
-
-
-
+@pytest.mark.parametrize("link", ["hardlink", "symlink"])
+def test_zip_journal_writer_never_writes_through_a_preexisting_temp(tmp_path, link):
+    """A temp left at the journal's fixed temp name as a link must not carry the journal into its target."""
+    root = tmp_path / "install"
+    root.mkdir()
+    secret = root / ".env"
+    secret.write_text("API_KEY=keep\n", encoding="utf-8")
+    tmp = root / (er.ZIP_SWAP_JOURNAL + ".tmp")
+    if link == "hardlink":
+        os.link(secret, tmp)
+    else:
+        try:
+            tmp.symlink_to(secret)
+        except OSError:
+            pytest.skip("symlinks need privileges here")
+    er.write_zip_swap_journal(root, "staging", [["a.py", True]])
+    assert secret.read_text(encoding="utf-8") == "API_KEY=keep\n"
+    journal = root / er.ZIP_SWAP_JOURNAL
+    assert not journal.is_symlink() and '"phase": "staging"' in journal.read_text(encoding="utf-8")

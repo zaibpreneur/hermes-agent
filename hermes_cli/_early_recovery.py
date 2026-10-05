@@ -681,8 +681,19 @@ def write_zip_swap_journal(root: Path, phase: str, entries: list) -> None:
 
     journal = Path(root) / ZIP_SWAP_JOURNAL
     tmp = journal.with_name(journal.name + ".tmp")
-    tmp.write_text(json.dumps({"pid": os.getpid(), "phase": phase, "entries": entries}), encoding="utf-8")
-    os.replace(tmp, journal)
+    # A fresh inode every time: writing into a pre-existing temp would follow its symlink or hardlink
+    # onto another file (.env). fsync before the rename: an empty journal over a mixed tree is no record.
+    tmp.unlink(missing_ok=True)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"pid": os.getpid(), "phase": phase, "entries": entries}))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, journal)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _drop_path(path: Path) -> None:
