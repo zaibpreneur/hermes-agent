@@ -237,3 +237,18 @@ def test_an_unparsed_zip_journal_keeps_itself_and_every_backup(tmp_path, monkeyp
     assert journal.is_file()
     assert {p.name: p.read_text(encoding="utf-8") for p in root.iterdir() if p != journal and p.suffix != ".lock"} == {
         "a.py": "NEW_A", "a.py.hermes-update-old": "OLD_A", "b.py": "OLD_B", "b.py.hermes-update-staging": "NEW_B"}
+
+
+@pytest.mark.skipif(sys.platform == "win32" or os.geteuid() == 0, reason="POSIX modes; root ignores them")
+def test_dropping_a_staged_tree_never_changes_a_hardlinked_live_files_mode(tmp_path):
+    live = tmp_path / "release"
+    live.mkdir()
+    (live / "Hermes.exe").write_bytes(b"app")
+    staging = tmp_path / "apps.hermes-update-staging" / "release"
+    staging.mkdir(parents=True)
+    os.link(live / "Hermes.exe", staging / "Hermes.exe")
+    (live / "Hermes.exe").chmod(0o555)
+    staging.chmod(0o555)  # a read-only dir refuses rmtree: the retry path runs
+    er._drop_path(staging.parent)
+    assert not staging.parent.exists()
+    assert (live / "Hermes.exe").stat().st_mode & 0o777 == 0o555

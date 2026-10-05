@@ -705,14 +705,22 @@ def _drop_path(path: Path) -> None:
             shutil.rmtree(path)
         except OSError:
             # A staged copy keeps its source's modes: a read-only directory refuses to give up its
-            # entries. These trees are the update's own copies, so make them writable and retry.
+            # entries. These trees are the update's own copies, so make their directories writable and
+            # retry. Files keep their modes: a grafted artifact is a hardlink to the LIVE file, and POSIX
+            # deletion needs only the parent's write bit. Windows refuses to delete a read-only file, so
+            # there only a file no other link shares has its read-only bit cleared.
             rwx = stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR
             os.chmod(path, os.stat(path).st_mode | rwx)
             for dirpath, dirnames, files in os.walk(path):
-                for name in (*dirnames, *files):
+                for name in dirnames:
                     child = os.path.join(dirpath, name)
-                    if not os.path.islink(child):  # about to be deleted: only the owner bits matter
-                        os.chmod(child, os.stat(child).st_mode | (rwx if name in dirnames else stat.S_IWUSR))
+                    if not os.path.islink(child):
+                        os.chmod(child, os.stat(child).st_mode | rwx)
+                for name in files if sys.platform == "win32" else ():
+                    child = os.path.join(dirpath, name)
+                    st = os.lstat(child)
+                    if st.st_nlink == 1 and not stat.S_ISLNK(st.st_mode):
+                        os.chmod(child, st.st_mode | stat.S_IWUSR)
             shutil.rmtree(path)
     elif path.exists() or path.is_symlink():
         path.unlink()
