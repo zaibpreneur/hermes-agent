@@ -37,6 +37,8 @@ from hermes_cli.update_custody import run_git
 
 # What this run found before it armed anything: {path: bytes or None}. None = nothing armed yet.
 _armed_snapshot: Optional[dict[Path, Optional[bytes]]] = None
+# What this run's latest arm left at each path: disarm hands back only records still exactly these.
+_armed_bytes: dict[Path, Optional[bytes]] = {}
 # (git_cmd, (HEAD, branch)) when this run reached its checkout phase, and the checkout it names.
 _run_start: Optional[tuple[list, tuple[str, str]]] = None
 _obligation_root: Optional[Path] = None
@@ -53,19 +55,24 @@ def _obligation_paths(root: Path) -> list[Path]:
     from hermes_cli.update_host_obligation import host_obligation_path
     from hermes_cli.venv_sync import completion_pending_path
 
-    paths = [completion_pending_path(root), _fleet_restart_pending_marker_path()]
-    host = host_obligation_path()
-    if host is not None:
-        paths.append(host)
-    return paths
+    return [completion_pending_path(root), _fleet_restart_pending_marker_path(), host_obligation_path()]
+
+
+def _read_or_none(path: Path) -> Optional[bytes]:
+    """The record's bytes, None when absent. Any other read error raises: custody is never guessed."""
+    try:
+        return path.read_bytes()
+    except FileNotFoundError:
+        return None
 
 
 def arm_commit_obligations(root: Path, expected_sha: str) -> None:
     """Owe the completion tail and the fleet restart for ``expected_sha`` BEFORE the tree moves.
 
     Idempotent within a run (the first call snapshots what to restore on a no-op failure). An
-    unwritable install state raises: nothing has moved yet, and moving without the obligation is
-    exactly the tail-never-runs state this exists to prevent.
+    unwritable install state, an unreadable record or a fleet restart neither store accepted
+    raises: nothing has moved yet, and moving without the obligation is exactly the
+    tail-never-runs state this exists to prevent.
     """
     global _armed_snapshot
     from hermes_cli.update_cmd_fleet import _write_fleet_restart_pending_marker
@@ -75,15 +82,14 @@ def arm_commit_obligations(root: Path, expected_sha: str) -> None:
     if _owns_live_checkout(root):
         return
     if _armed_snapshot is None:
-        snapshot: dict[Path, Optional[bytes]] = {}
-        for path in _obligation_paths(root):
-            try:
-                snapshot[path] = path.read_bytes()
-            except OSError:
-                snapshot[path] = None
-        _armed_snapshot = snapshot
-    arm_completion(root)
-    _write_fleet_restart_pending_marker(expected_sha=expected_sha or "")
+        _armed_snapshot = {path: _read_or_none(path) for path in _obligation_paths(root)}
+    try:
+        arm_completion(root)
+        owed = _write_fleet_restart_pending_marker(expected_sha=expected_sha or "")
+    finally:  # even a half-done arm: disarm must still recognise what this run wrote
+        _armed_bytes.update({path: _read_or_none(path) for path in _armed_snapshot})
+    if not owed:
+        raise OSError("could not record the pending gateway-restart obligation")
 
 
 def disarm_commit_obligations() -> None:
@@ -100,8 +106,12 @@ def disarm_commit_obligations() -> None:
         if root is None or not start_head or head_and_branch(git_cmd, root)[0] != start_head:
             return
     snapshot, _armed_snapshot = _armed_snapshot, None
+    armed = dict(_armed_bytes)
+    _armed_bytes.clear()
     for path, data in (snapshot or {}).items():
         try:
+            if path not in armed or _read_or_none(path) != armed[path]:
+                continue  # rewritten since this run armed it (another install's update): theirs now
             if data is None:
                 path.unlink(missing_ok=True)
             else:
@@ -378,5 +388,6 @@ def preflight_refusal(git_cmd, root: Path, target_ref: str, critical_files) -> s
 def reset_for_tests() -> None:
     global _armed_snapshot, _run_start, _obligation_root
     _armed_snapshot = None
+    _armed_bytes.clear()
     _run_start = None
     _obligation_root = None

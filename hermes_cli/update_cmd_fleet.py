@@ -82,8 +82,8 @@ def _write_legacy_fleet_restart_pending_marker(
         return False
 
 
-def _write_fleet_restart_pending_marker(*, expected_sha: str = "", runtimes: list[dict] | None = None) -> None:
-    """Arm the HOST pull→restart obligation. Never raises.
+def _write_fleet_restart_pending_marker(*, expected_sha: str = "", runtimes: list[dict] | None = None) -> bool:
+    """Arm the HOST pull→restart obligation. Never raises; False when neither store took it.
 
     An unwritable host state dir (``HERMES_GATEWAY_LOCK_DIR`` on a read-only mount, a container
     UID that does not own ``$HOME``) must never disarm the obligation: an update interrupted
@@ -95,20 +95,20 @@ def _write_fleet_restart_pending_marker(*, expected_sha: str = "", runtimes: lis
         # An explicit empty inventory owes no restart (e.g. Desktop-hosted `serve` with no
         # gateway services). Arming the marker here leaves a breadcrumb nothing can discharge:
         # a no-gateway host would then fail every later ``hermes update`` (#115311).
-        return
+        return True
     from hermes_cli.update_cmd import _m
     from hermes_cli.update_host_obligation import host_obligation_path, write_host_obligation
     if _m()._pytest_owns_live_checkout(_fleet_restart_pending_marker_path().parent):
         logger.debug("Skipping fleet-restart-pending obligation under pytest (live checkout)")
-        return
+        return True
     if write_host_obligation(
             expected_sha=expected_sha, runtimes=runtimes, profile=_current_profile_name()):
-        return
+        return True
     if _write_legacy_fleet_restart_pending_marker(expected_sha=expected_sha, runtimes=runtimes):
         logger.warning(
             "Host update-restart obligation (%s) is unwritable; armed the per-home marker %s instead.",
             host_obligation_path(), _fleet_restart_pending_marker_path())
-        return
+        return True
     logger.error(
         "Could not arm the update-restart obligation in %s or %s; an interrupted update will not warn.",
         host_obligation_path(), _fleet_restart_pending_marker_path())
@@ -117,6 +117,7 @@ def _write_fleet_restart_pending_marker(*, expected_sha: str = "", runtimes: lis
         "restart gateways with `hermes gateway restart` if this update is interrupted.",
         file=sys.stderr,
     )
+    return False
 
 
 def _current_profile_name() -> str:
