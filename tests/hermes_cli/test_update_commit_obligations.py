@@ -88,3 +88,20 @@ def test_an_unreadable_record_refuses_the_arm_and_survives(root, monkeypatch):
 
     assert host.read_text(encoding="utf-8") == "OLD"
 
+
+@pytest.mark.platforms("posix")  # unprivileged symlinks
+def test_disarm_never_writes_through_a_planted_restore_alias(root, tmp_path):
+    """A same-user link at a temp name must not redirect the restore (N05)."""
+    host = host_obligation_path()
+    host.parent.mkdir(parents=True, exist_ok=True)
+    host.write_text("ORIGINAL", encoding="utf-8")
+    sentinel = tmp_path / "sentinel"
+    sentinel.write_text("PRECIOUS", encoding="utf-8")
+    commit.arm_commit_obligations(root, "a" * 40)
+    for alias in (host.with_name(host.name + ".restore"), host.with_name(f".{host.name}.{os.getpid()}.restore")):
+        alias.symlink_to(sentinel)
+
+    commit.disarm_commit_obligations()
+
+    assert sentinel.read_text(encoding="utf-8") == "PRECIOUS"
+    assert not host.is_symlink() and host.read_text(encoding="utf-8") == "ORIGINAL"

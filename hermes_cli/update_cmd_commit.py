@@ -115,8 +115,11 @@ def disarm_commit_obligations() -> None:
             if data is None:
                 path.unlink(missing_ok=True)
             else:
-                tmp = path.with_name(path.name + ".restore")
-                tmp.write_bytes(data)
+                # A fresh file, never through whatever a leftover ``.restore`` name points at.
+                tmp = path.with_name(f".{path.name}.{os.getpid()}.restore")
+                tmp.unlink(missing_ok=True)
+                with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as handle:
+                    handle.write(data)
                 os.replace(tmp, path)
         except OSError:
             pass  # an owed tail/restart left armed is a retry, never a lost obligation
