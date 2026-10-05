@@ -369,6 +369,8 @@ def _hermes_closure_repair():
             blobs = {__INIT__: b''}
             for rel in __CLOSURE__:
                 blobs[rel] = git_out('cat-file', 'blob', ids[rel])
+                if blob_id(blobs[rel]) != ids[rel]:  # an object that inflates to bytes pre never had
+                    raise OSError('%s does not hash to %s' % (rel, ids[rel]))
             blobs[__MANIFEST__] = ''.join('%s %s\\n' % (blob_id(data), rel) for rel, data in blobs.items()).encode('utf-8')
             for rel, data in blobs.items():
                 (staging / rel).parent.mkdir(parents=True, exist_ok=True)

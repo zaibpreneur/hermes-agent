@@ -17,6 +17,7 @@ import signal
 import subprocess
 import sys
 import time
+import zlib
 from pathlib import Path
 
 import pytest
@@ -176,3 +177,28 @@ def test_a_damaged_published_closure_is_rebuilt_from_git_objects_not_trusted(tmp
     assert "NOT_PRE_CODE_RAN" not in launch.stderr, launch.stderr
     assert (root / "hermes_bootstrap.py").read_bytes() == original
     assert not (root / ".git/hermes-update-pull").exists()
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_git_object_bytes_that_do_not_hash_to_pres_blob_never_run(tmp_path, corrupt):
+    """No published closure, and ``pre``'s loose object of the repair inflates to other bytes: they
+    never run and nothing is published; the marker stays for a later launch or update (N02)."""
+    ran = tmp_path / "FOREIGN_RAN"
+    root, env, original, launcher = _killed_mid_write(tmp_path, "hermes_bootstrap.py")
+    (closure,) = (root / ".git/hermes-update-recovery").iterdir()  # named for ``pre``
+    shutil.rmtree(closure.parent)
+    if corrupt:
+        oid = subprocess.check_output(["git", "-C", str(root), "rev-parse", f"{closure.name}:hermes_cli/_early_recovery.py"],
+                                      env=env, text=True).strip()
+        obj = root / ".git/objects" / oid[:2] / oid[2:]
+        foreign = f"open({str(ran)!r}, 'w').close()\n".encode()
+        obj.chmod(0o644)
+        obj.write_bytes(zlib.compress(b"blob %d\0" % len(foreign) + foreign))
+    launch = subprocess.run([str(launcher)], cwd=tmp_path, env=env, capture_output=True, text=True, encoding="utf-8",
+                            errors="replace", timeout=60)
+    assert not ran.exists(), launch.stderr
+    assert (launch.returncode == 0) is not corrupt, launch.stderr
+    assert (root / "hermes_bootstrap.py").exists() is not corrupt
+    assert (root / ".git/hermes-update-pull").exists() is corrupt
+    assert not (corrupt and (root / ".git/hermes-update-recovery").exists()), "published foreign bytes"
