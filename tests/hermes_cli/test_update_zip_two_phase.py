@@ -662,20 +662,99 @@ def test_a_backup_copy_killed_before_its_rename_is_cleared_by_the_recovery(tmp_p
     """On a file system without hardlinks ``_file_backup`` copies to ``<entry>.hermes-update-old.tmp``
     first. A kill inside that copy left the temp behind: recovery dropped only staging and the backup,
     so every later ZIP update refused on "uncommitted changes" (review C4)."""
-    from hermes_cli._early_recovery import ZIP_SWAP_JOURNAL, restore_interrupted_zip_swap, write_zip_swap_journal
+    from hermes_cli._early_recovery import (
+        ZIP_SWAP_JOURNAL, restore_interrupted_zip_swap, write_zip_swap_journal, zip_entry_identity)
 
     live = tmp_path / "live"
     live.mkdir()
     (live / "a.py").write_text("old\n", encoding="utf-8")
     (live / "a.py.hermes-update-staging").write_text("new\n", encoding="utf-8")
-    (live / "a.py.hermes-update-old.tmp").write_text("ol", encoding="utf-8")  # the killed copy
-    write_zip_swap_journal(live, "swapping", [["a.py", True]])
+    (live / "a.py.hermes-update-old.0123456789ab.tmp").write_text("ol", encoding="utf-8")  # the killed copy
+    write_zip_swap_journal(live, "swapping", [["a.py", True, zip_entry_identity(live / "a.py.hermes-update-staging"),
+                                              zip_entry_identity(live / "a.py")]], "0123456789ab")
 
     restore_interrupted_zip_swap(live)
 
     assert not (live / ZIP_SWAP_JOURNAL).exists()
     assert sorted(p.name for p in live.iterdir() if not p.name.endswith(".lock")) == ["a.py"]
     assert (live / "a.py").read_text(encoding="utf-8") == "old\n"
+
+
+def _swap_killed(tmp_path, monkeypatch, *, live: dict, new: dict, install_first: bool) -> Path:
+    """Run the real journaled stage+swap and kill it inside the swap: nothing renamed yet, or only the
+    first staged entry renamed into place. The journal the real writer left is what recovery reads."""
+    from hermes_cli import update_cmd_commit
+    from hermes_cli._early_recovery import ZIP_SWAP_JOURNAL
+
+    root, extracted = tmp_path / "live", tmp_path / "extracted"
+    for d, files in ((root, live), (extracted, new)):
+        d.mkdir()
+        for name, text in files.items():
+            (d / name).write_text(text, encoding="utf-8")
+    monkeypatch.setattr(update_cmd_commit, "arm_commit_obligations", lambda *a, **k: None)
+
+    def killed(staged, **_kw):
+        if install_first:  # the real swap's first step: backup (hardlink) when live, then the rename
+            staging, dst = staged[0]
+            if os.path.lexists(dst):
+                update_cmd_zip._file_backup(dst, dst + ".hermes-update-old")
+            os.replace(staging, dst)
+        raise RuntimeError("killed mid-swap")
+
+    with monkeypatch.context() as fault:
+        fault.setattr(update_cmd_zip, "_commit_staged_replacements", killed)
+        with pytest.raises(RuntimeError, match="killed"):
+            update_cmd_zip._journaled_stage_and_swap(str(extracted), sorted(new), root, None)
+    assert (root / ZIP_SWAP_JOURNAL).exists(), "harness: the kill must leave the journal"
+    return root
+
+
+def test_recovery_never_installs_or_deletes_a_backup_suffix_created_after_the_kill(tmp_path, monkeypatch):
+    """A swap killed before any rename; then a user file appears at ``cli.py.hermes-update-old``. The
+    path-only journal took it for the swap's backup: it overwrote the live cli.py with it, and the old
+    bytes were gone (review Z1). Recovery now proves a backup is the entry it recorded before using or
+    deleting it: the live file stays, the user's file is kept aside, byte for byte."""
+    from hermes_cli._early_recovery import ZIP_SWAP_JOURNAL, restore_interrupted_zip_swap
+
+    root = _swap_killed(tmp_path, monkeypatch, live={"cli.py": "LIVE"}, new={"cli.py": "NEW"}, install_first=False)
+    (root / "cli.py.hermes-update-old").write_text("USER LATER", encoding="utf-8")
+
+    restore_interrupted_zip_swap(root)
+
+    assert (root / "cli.py").read_text(encoding="utf-8") == "LIVE"
+    kept = [p for p in root.iterdir() if p.read_bytes() == b"USER LATER"]
+    assert len(kept) == 1 and kept[0].name != "cli.py"
+    assert not (root / "cli.py.hermes-update-staging").exists() and not (root / ZIP_SWAP_JOURNAL).exists()
+
+
+def test_recovery_never_deletes_a_user_file_that_replaced_an_installed_entry(tmp_path, monkeypatch):
+    """A new entry (notes.md) was renamed into place, then the swap was killed; the user then replaced
+    notes.md with a file of their own. Recovery deleted whatever sat at the journaled name (review Z1);
+    only the entry the swap installed (its recorded staging identity) may go."""
+    from hermes_cli._early_recovery import ZIP_SWAP_JOURNAL, restore_interrupted_zip_swap
+
+    root = _swap_killed(tmp_path, monkeypatch, live={}, new={"notes.md": "NEW"}, install_first=True)
+    (root / "notes.md").unlink()
+    (root / "notes.md").write_text("USER NOTES", encoding="utf-8")
+
+    restore_interrupted_zip_swap(root)
+
+    assert [p.read_text(encoding="utf-8") for p in root.iterdir() if p.name.startswith("notes.md")] == ["USER NOTES"]
+    assert not (root / ZIP_SWAP_JOURNAL).exists()
+
+
+def test_recovery_still_rolls_back_an_authentic_killed_swap(tmp_path, monkeypatch):
+    """The control: a swap killed after installing its first entry rolls back to the old tree, and every
+    staging copy and backup the swap itself made is deleted (provenance proven), with nothing kept aside."""
+    from hermes_cli._early_recovery import ZIP_SWAP_JOURNAL, restore_interrupted_zip_swap
+
+    root = _swap_killed(tmp_path, monkeypatch, live={"a.py": "OLD_A", "b.py": "OLD_B"},
+                        new={"a.py": "NEW_A", "b.py": "NEW_B", "c.py": "NEW_C"}, install_first=True)
+    assert (root / "a.py").read_text(encoding="utf-8") == "NEW_A", "harness: a.py was installed"
+    assert restore_interrupted_zip_swap(root) is True
+    assert {p.name: p.read_text(encoding="utf-8") for p in root.iterdir() if not p.name.startswith(".")} == {
+        "a.py": "OLD_A", "b.py": "OLD_B"}
+    assert not (root / ZIP_SWAP_JOURNAL).exists()
 
 
 @pytest.mark.parametrize("requires", [">=3.8", ">=3.99"])

@@ -6,6 +6,7 @@ import contextlib
 import errno
 import os
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -692,11 +693,30 @@ def zip_swap_owner_lock(root: Path, *, wait: float = 0.0):
         os.close(fd)
 
 
-def write_zip_swap_journal(root: Path, phase: str, entries: list) -> None:
+def write_zip_swap_journal(root: Path, phase: str, entries: list, gen: str) -> None:
+    """Publish the swap journal: ``entries`` are ``[name, existed, staged_id, live_id]`` (ids from
+    ``zip_entry_identity``, "" while unknown); ``gen`` is the run's random tag (its backup temps)."""
     import json
 
     write_durable_text(Path(root) / ZIP_SWAP_JOURNAL,
-                       json.dumps({"pid": os.getpid(), "phase": phase, "entries": entries}))
+                       json.dumps({"pid": os.getpid(), "gen": gen, "phase": phase, "entries": entries}))
+
+
+def zip_entry_identity(path) -> str:
+    """The entry's own identity (lstat, never its target); "" when absent or unidentifiable.
+
+    The ZIP journal's provenance: recovery deletes only an entry whose identity it recorded when the
+    swap made it (a staging copy, or the live entry its backup links/renames), never a lookalike. A
+    non-directory adds size and mtime: a file deleted and recreated often gets the same inode back.
+    A directory is ``dev:ino:type`` only: a staged tree's own mtime moves while it is being filled."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return ""
+    if not st.st_ino:
+        return ""
+    base = f"{st.st_dev}:{st.st_ino}:{stat.S_IFMT(st.st_mode):o}"
+    return base if stat.S_ISDIR(st.st_mode) else f"{base}:{st.st_size}:{st.st_mtime_ns}"
 
 
 def write_durable_text(path: Path, text: str) -> None:
@@ -729,7 +749,6 @@ def write_durable_text(path: Path, text: str) -> None:
 def _drop_path(path: Path) -> None:
     if path.is_dir() and not path.is_symlink():
         import shutil
-        import stat
 
         try:
             shutil.rmtree(path)
@@ -756,8 +775,8 @@ def _drop_path(path: Path) -> None:
         path.unlink()
 
 
-def _parse_zip_swap_journal(raw: str) -> tuple[str, list[tuple[str, bool]]] | None:
-    """``(phase, [(entry name, existed)])`` from a journal this code wrote, else None."""
+def _parse_zip_swap_journal(raw: str) -> tuple[str, str, list[tuple[str, bool, str, str]]] | None:
+    """``(phase, gen, [(entry name, existed, staged_id, live_id)])`` from a journal this code wrote, else None."""
     import json
 
     try:
@@ -766,13 +785,62 @@ def _parse_zip_swap_journal(raw: str) -> tuple[str, list[tuple[str, bool]]] | No
         return None
     if not isinstance(data, dict) or data.get("phase") not in ("staging", "swapping", "committed"):
         return None
-    entries = data.get("entries")
-    if not isinstance(entries, list):
+    entries, gen = data.get("entries"), data.get("gen")
+    if not isinstance(entries, list) or not isinstance(gen, str) or not re.fullmatch(r"[0-9a-f]{12}", gen):
         return None
-    if not all(isinstance(e, list) and len(e) == 2 and isinstance(e[0], str) and isinstance(e[1], bool)
-               and e[0] not in ("", ".", "..") and "/" not in e[0] and "\\" not in e[0] for e in entries):
+    if not all(isinstance(e, list) and len(e) == 4 and all(isinstance(v, str) for v in (e[0], e[2], e[3]))
+               and isinstance(e[1], bool) and e[0] not in ("", ".", "..") and "/" not in e[0] and "\\" not in e[0]
+               for e in entries):
         return None
-    return data["phase"], [(name, existed) for name, existed in entries]
+    return data["phase"], gen, [(name, existed, staged, live) for name, existed, staged, live in entries]
+
+
+def _discard_unless_owned(path: Path, identity: str, kept: list[Path]) -> None:
+    """Delete ``path`` only when it is provably the entry the swap recorded; anything else (a later
+    user file at the suffix, a foreign journal's victim) is renamed aside, never deleted (review Z1)."""
+    if not os.path.lexists(path):
+        return
+    if identity and zip_entry_identity(path) == identity:
+        _drop_path(path)
+    else:
+        kept.append(_keep_aside(path))
+
+
+def _settle_zip_entry(root: Path, phase: str, gen: str, entry: tuple[str, bool, str, str], kept: list[Path]) -> bool:
+    """Finish or roll back one journaled entry; True when the live tree changed.
+
+    Presence is the ENTRY's (lexists/lstat), never its target's: a dangling symlink backup is the only
+    copy of a tracked symlink, not "no backup" (review Z3). Restoring a backup never deletes bytes, so
+    it needs no provenance; every deletion does (``_discard_unless_owned``)."""
+    name, existed, staged_id, live_id = entry
+    here = os.path.lexists
+    dst = root / name
+    staging, old = Path(f"{dst}{_ZIP_STAGING_SUFFIX}"), Path(f"{dst}{_ZIP_OLD_SUFFIX}")
+    changed = False
+    if phase == "swapping":
+        # Staging finished before this phase, so a backup now is the one the swap made from the old
+        # entry: it existed, whatever an older journal recorded.
+        existed = existed or here(old)
+        if existed and here(old) and not (live_id and zip_entry_identity(dst) == live_id):
+            if (old.is_file() and not old.is_symlink() and staged_id and zip_entry_identity(dst) == staged_id
+                    and not dst.is_dir()):
+                os.replace(old, dst)  # a file entry never goes missing, not even here
+            else:
+                _discard_unless_owned(dst, staged_id, kept)
+                os.rename(old, dst)  # moves a symlink itself, never its target
+            changed = True
+        elif not existed and here(dst) and not here(staging):
+            _discard_unless_owned(dst, staged_id, kept)
+            changed = True
+    elif existed and not here(dst) and here(old):
+        os.rename(old, dst)  # the backup is the only copy left
+        changed = True
+    for leftover, identity in ((staging, staged_id), (old, live_id)):
+        _discard_unless_owned(leftover, identity, kept)
+    # ``<old>.<gen>.tmp``: a backup copy killed before its rename (no-hardlink file systems); the run's
+    # unpredictable tag is its provenance.
+    _drop_path(Path(f"{old}.{gen}.tmp"))
+    return changed
 
 
 def restore_interrupted_zip_swap(project_root: Path | None = None) -> bool:
@@ -783,6 +851,8 @@ def restore_interrupted_zip_swap(project_root: Path | None = None) -> bool:
     the venv was built for; ``hermes update`` redoes it). ``staging``: nothing live moved -> drop the
     staging copies. Either way no ``*.hermes-update-staging``/``-old`` sibling is left to wedge the
     next run's free-space or dirty-tree checks. A live owner (lock held) is never second-guessed.
+    Provenance (review Z1): a sibling or entry is deleted only when its identity is the one the journal
+    recorded; anything else is kept aside under a ``.hermes-update-kept`` name and reported.
     """
     root = _project_root() if project_root is None else Path(project_root)
     journal = root / ZIP_SWAP_JOURNAL
@@ -806,43 +876,24 @@ def restore_interrupted_zip_swap(project_root: Path | None = None) -> bool:
                   "it and every `*.hermes-update-old` backup were kept. Put back what each backup replaced "
                   "(or reinstall), then delete the journal.", file=sys.stderr)
             return False
-        phase, entries = parsed
+        phase, gen, entries = parsed
         changed = False
         failed = False
-        # Presence is the ENTRY's (lexists/lstat), never its target's: a dangling symlink backup is the
-        # only copy of a tracked symlink, not "no backup" (review Z3).
-        here = os.path.lexists
-        for name, existed in reversed(entries):
-            dst = root / name
-            staging, old = Path(f"{dst}{_ZIP_STAGING_SUFFIX}"), Path(f"{dst}{_ZIP_OLD_SUFFIX}")
+        kept: list[Path] = []
+        for entry in reversed(entries):
             try:
-                if phase == "swapping":
-                    # Staging finished before this phase, so a backup now is the one the swap made
-                    # from the old entry: it existed, whatever an older journal recorded.
-                    existed = existed or here(old)
-                    if existed and here(old):
-                        if old.is_file() and not old.is_symlink() and not dst.is_dir():
-                            os.replace(old, dst)  # a file entry never goes missing, not even here
-                        else:
-                            _drop_path(dst)
-                            os.rename(old, dst)  # moves a symlink itself, never its target
-                        changed = True
-                    elif not existed and here(dst) and not here(staging):
-                        _drop_path(dst)
-                        changed = True
-                elif existed and not here(dst) and here(old):
-                    os.rename(old, dst)  # the backup is the only copy left
-                    changed = True
-                # ``<old>.tmp``: a backup copy killed before its rename (no-hardlink file systems).
-                for leftover in (staging, old, Path(f"{old}.tmp")):
-                    _drop_path(leftover)
+                changed = _settle_zip_entry(root, phase, gen, entry, kept) or changed
             except OSError as exc:
                 failed = True
-                print(f"⚠ Could not settle {name} after an interrupted ZIP update: {exc}", file=sys.stderr)
+                print(f"⚠ Could not settle {entry[0]} after an interrupted ZIP update: {exc}", file=sys.stderr)
+        if kept:
+            print("⚠ An interrupted ZIP update's recovery found entries it could not prove were its own and "
+                  f"kept them aside instead of deleting them: {', '.join(map(str, kept))}. Delete each once "
+                  "you know it is not yours.", file=sys.stderr)
         # Retire the journal only on a verified terminal state, not an exception-free loop: no sibling
         # (staging copy, backup, backup temp) left that only this journal could still explain.
-        siblings = (_ZIP_STAGING_SUFFIX, _ZIP_OLD_SUFFIX, _ZIP_OLD_SUFFIX + ".tmp")
-        unsettled = [name for name, _existed in entries if any(here(f"{root / name}{s}") for s in siblings)]
+        siblings = (_ZIP_STAGING_SUFFIX, _ZIP_OLD_SUFFIX, f"{_ZIP_OLD_SUFFIX}.{gen}.tmp")
+        unsettled = [e[0] for e in entries if any(os.path.lexists(f"{root / e[0]}{x}") for x in siblings)]
         if failed or unsettled:
             if unsettled and not failed:
                 print(f"⚠ The interrupted ZIP update left {', '.join(unsettled)} unsettled; its journal "

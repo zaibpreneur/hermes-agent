@@ -333,13 +333,14 @@ def test_zip_gate_refuses_on_a_user_file_at_the_old_fixed_journal_temp_name(tmp_
 
 def test_zip_gate_admits_the_retry_after_an_interrupted_swap(tmp_path, monkeypatch):
     """The siblings an interrupted swap's journal owns never refuse the retry: they are settled first."""
-    from hermes_cli._early_recovery import ZIP_SWAP_JOURNAL, write_zip_swap_journal
+    from hermes_cli._early_recovery import ZIP_SWAP_JOURNAL, write_zip_swap_journal, zip_entry_identity
 
     _git_install(tmp_path)
     leftover = tmp_path / "alpha.hermes-update-staging"
     leftover.mkdir()
     (leftover / "x.py").write_text("x = 2\n", encoding="utf-8")
-    write_zip_swap_journal(tmp_path, "staging", [["alpha", True], ["cli.py", True]])
+    write_zip_swap_journal(tmp_path, "staging", [["alpha", True, zip_entry_identity(leftover), ""],
+                                                 ["cli.py", True, "", ""]], "0123456789ab")
     monkeypatch.setattr(hermes_main, "PROJECT_ROOT", tmp_path)
     update_cmd._abort_zip_update_if_dirty_tree()
     assert not leftover.exists() and not (tmp_path / ZIP_SWAP_JOURNAL).exists()

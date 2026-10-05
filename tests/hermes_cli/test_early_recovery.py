@@ -205,7 +205,7 @@ def test_zip_journal_writer_never_writes_through_a_preexisting_temp(tmp_path, li
             tmp.symlink_to(secret)
         except OSError:
             pytest.skip("symlinks need privileges here")
-    er.write_zip_swap_journal(root, "staging", [["a.py", True]])
+    er.write_zip_swap_journal(root, "staging", [["a.py", True, "", ""]], "0123456789ab")
     assert secret.read_text(encoding="utf-8-sig") == "API_KEY=keep\n"
     journal = root / er.ZIP_SWAP_JOURNAL
     assert not journal.is_symlink() and '"phase": "staging"' in journal.read_text(encoding="utf-8-sig")
@@ -218,8 +218,8 @@ def test_zip_journal_publication_never_deletes_a_file_at_its_old_fixed_temp_name
     root.mkdir()
     user = root / (er.ZIP_SWAP_JOURNAL + ".tmp")
     user.write_text("USER NOTES\n", encoding="utf-8")
-    er.write_zip_swap_journal(root, "staging", [["a.py", True]])
-    er.write_zip_swap_journal(root, "swapping", [["a.py", True]])
+    er.write_zip_swap_journal(root, "staging", [["a.py", True, "", ""]], "0123456789ab")
+    er.write_zip_swap_journal(root, "swapping", [["a.py", True, "", ""]], "0123456789ab")
     assert user.read_text(encoding="utf-8-sig") == "USER NOTES\n"
     assert '"phase": "swapping"' in (root / er.ZIP_SWAP_JOURNAL).read_text(encoding="utf-8-sig")
     assert sorted(p.name for p in root.iterdir()) == sorted([er.ZIP_SWAP_JOURNAL, user.name])
@@ -246,7 +246,9 @@ def test_an_interrupted_swap_restores_its_backup_by_entry_not_by_target(tmp_path
     else:
         _symlink_or_skip(old, "gone.txt" if kind == "dangling-symlink" else "target.txt")
     (root / "alpha").write_text("NEW", encoding="utf-8")
-    er.write_zip_swap_journal(root, "swapping", [["alpha", True]])
+    # As the swap journals it: the staged copy (now live) and the moved-aside original by identity.
+    er.write_zip_swap_journal(root, "swapping", [["alpha", True, er.zip_entry_identity(root / "alpha"),
+                                                  er.zip_entry_identity(old)]], "0123456789ab")
 
     assert er.restore_interrupted_zip_swap(root) is True
     alpha = root / "alpha"
@@ -269,8 +271,8 @@ def test_an_unparsed_zip_journal_keeps_itself_and_every_backup(tmp_path, monkeyp
                        "b.py.hermes-update-staging": "NEW_B"}.items():
         (root / name).write_text(text, encoding="utf-8")
     journal = root / er.ZIP_SWAP_JOURNAL
-    journal.write_text('{"phase": "swapping", "entries": [["a.py", true], ["b.py", true]]}'
-                       if body == "read-error" else body, encoding="utf-8")
+    journal.write_text('{"phase": "swapping", "gen": "0123456789ab", "entries": [["a.py", true, "", ""], '
+                       '["b.py", true, "", ""]]}' if body == "read-error" else body, encoding="utf-8")
     if body == "read-error":  # one transient read failure (AV scan, sharing violation)
         real = Path.read_text
 
