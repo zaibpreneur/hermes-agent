@@ -89,15 +89,7 @@ def host_obligation_present() -> bool:
 
 def amend_host_obligation(**fields: Any) -> None:
     """Merge ``fields`` into the armed record (test/diagnostic surface). Never raises."""
-    record = read_host_obligation()
-    path = host_obligation_path()
-    if record is None:
-        return
-    record.update(fields)
-    try:
-        _write_record(path, record)
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("Could not amend host update-restart obligation: %s", exc)
+    _update_record(lambda record: record.update(fields), "amend")
 
 
 def write_host_obligation(
@@ -114,6 +106,15 @@ def write_host_obligation(
     keeps that baseline (``_baseline_for``).
     """
     path = host_obligation_path()
+    try:
+        with _record_mutex(path):
+            return _write_locked(path, expected_sha=expected_sha, runtimes=runtimes, profile=profile, owner=owner)
+    except OSError as exc:  # the mutex busy or unopenable: the caller falls back to the per-home marker
+        logger.debug("Could not lock the host update-restart obligation: %s", exc)
+        return False
+
+
+def _write_locked(path: Path, *, expected_sha: str, runtimes: Optional[list], profile: str, owner: str) -> bool:
     existing = read_host_obligation()
     try:
         found = _baseline_for(owner, existing, path) if owner else None
@@ -156,10 +157,25 @@ def write_host_obligation(
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         _write_record(path, payload)
-    except Exception as exc:
+    except Exception as exc:  # health: allow BLE001 -- never raises: the caller falls back to the per-home marker
         logger.debug("Could not write host update-restart obligation: %s", exc)
         return False
     return True
+
+
+@contextlib.contextmanager
+def _record_mutex(path: Path):
+    """Serialize every read-judge-write of the record across processes (``update_lock.marker_mutex``).
+
+    The sidecar sits in a subdirectory: the state dir is the gateway lock dir, whose ``--replace``
+    cleanup unlinks every top-level ``*.lock``, and a deleted sidecar splits the lock in two.
+    """
+    from hermes_cli.update_lock import marker_mutex  # stdlib-only, like this module
+
+    guard = path.parent / f".{path.stem}.mutex"
+    guard.mkdir(parents=True, exist_ok=True)
+    with marker_mutex(guard / "record"):
+        yield
 
 
 def _owners(record: dict) -> list[str]:
@@ -201,12 +217,21 @@ def release_host_obligation(owner: str) -> None:
 
     A record without ``owner`` was rewritten since (another install's newer pull): it is theirs and
     stays. Raises OSError when the record cannot be rewritten (the caller keeps the debt armed).
+    Judged and rewritten under ``_record_mutex``, which every arm takes too, so no arm can land
+    between the look and the write and be undone by it (kshitijk4poor F22/N05).
     """
+    if not owner or owner not in _owners(read_host_obligation() or {}):
+        return  # nothing of ours to hand back: no lock taken, no state dir created
+    path = host_obligation_path()
+    with _record_mutex(path):
+        _release_locked(path, owner)
+
+
+def _release_locked(path: Path, owner: str) -> None:
     record = read_host_obligation()
     owners = _owners(record) if record is not None else []
-    if not owner or owner not in owners:
-        return
-    path = host_obligation_path()
+    if owner not in owners:
+        return  # rewritten since the unlocked look (another install's arm): theirs now
     remaining = [o for o in owners if o != owner]
     if remaining:
         _write_record(path, {**record, "owners": remaining})
@@ -264,15 +289,26 @@ def obligation_fields() -> Optional[dict[str, str]]:
 
 def mark_host_restart_completed(sha: str) -> None:
     """Record that the host process was restarted onto ``sha``. Never raises."""
-    record = read_host_obligation()
-    path = host_obligation_path()
-    if record is None:
+    _update_record(
+        lambda record: record.update(restarted={"sha": sha or "", "pid": os.getpid(), "at": time.time()}),
+        "stamp restart completion on")
+
+
+def _update_record(change: Callable[[dict], None], what: str) -> None:
+    """Read, ``change`` and rewrite an armed record under ``_record_mutex`` (an arm's new owner
+    stake is never overwritten by a stale copy). Never raises; no record, no write."""
+    if read_host_obligation() is None:
         return
-    record["restarted"] = {"sha": sha or "", "pid": os.getpid(), "at": time.time()}
+    path = host_obligation_path()
     try:
-        _write_record(path, record)
-    except Exception as exc:
-        logger.debug("Could not stamp host restart completion: %s", exc)
+        with _record_mutex(path):
+            record = read_host_obligation()
+            if record is None:
+                return
+            change(record)
+            _write_record(path, record)
+    except Exception as exc:  # health: allow BLE001 -- never raises: a lost stamp costs a repeat restart, never the debt
+        logger.debug("Could not %s host update-restart obligation: %s", what, exc)
 
 
 def host_restart_already_completed(sha: Optional[str]) -> bool:

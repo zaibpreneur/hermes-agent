@@ -403,3 +403,32 @@ def test_disarm_restores_through_an_unpredictable_temp_and_leaves_every_sibling(
         assert os.path.lexists(planted) and planted.read_bytes() == b"PRECIOUS"
     assert sorted(p.name for p in tail.parent.iterdir() if p.name.endswith(".restore")) == (
         [planted.name] if kind != "none" else [])
+
+
+def test_an_arm_racing_a_release_is_never_undone_by_it(root, monkeypatch):
+    """Run X's release judged the record (X its last owner, nothing found before it); another
+    install armed SHA S2 before X's release acted, and X's unlink then deleted that fresh debt: a
+    look-then-write with no compare-and-swap (kshitijk4poor F22/N05). Release and arm now judge and
+    write under one mutex, so the racing arm lands after the release, never under it."""
+    import threading
+
+    from hermes_cli.update_host_obligation import read_host_obligation, write_host_obligation
+
+    commit.arm_commit_obligations(root, "a" * 40)  # run X, over an absent record
+    host, real_unlink, racer = host_obligation_path(), Path.unlink, []
+
+    def unlink_after_a_racing_arm(self, *args, **kwargs):
+        if self == host and not racer:
+            racer.append(threading.Thread(target=write_host_obligation,
+                                          kwargs={"expected_sha": "e" * 40, "owner": "other-install"}))
+            racer[0].start()
+            racer[0].join(timeout=1.0)  # under the mutex it can only wait for this release
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", unlink_after_a_racing_arm)
+    commit.disarm_commit_obligations()
+    racer[0].join(timeout=15)
+    monkeypatch.setattr(Path, "unlink", real_unlink)
+
+    record = read_host_obligation() or {}
+    assert record.get("expected_sha") == "e" * 40 and record.get("owners") == ["other-install"]
