@@ -198,6 +198,27 @@ def test_unwritable_host_state_dir_still_arms_the_obligation(two_profiles, no_li
         lock_dir.chmod(0o700)
 
 
+@pytest.mark.skipif(getattr(os, "geteuid", lambda: 1)() == 0, reason="root ignores directory permissions")
+def test_unwritable_host_state_dir_never_hides_the_debt_from_another_profile(two_profiles, no_live_fleet, monkeypatch, tmp_path):
+    """With a second profile on the install, the arming profile's per-home marker is a debt the
+    other profile cannot see: it would read "no restart owed" for a tree about to move. Every
+    profile observes the debt, or the arm refuses and the commit point does not move (review S2).
+    """
+    for home in two_profiles.values():
+        (home / "config.yaml").write_text("{}\n", encoding="utf-8")  # real, listed profiles
+    _enter(monkeypatch, two_profiles["coder"])
+    lock_dir = tmp_path / "gateway-locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_dir.chmod(0o500)
+    try:
+        armed = fleet._write_fleet_restart_pending_marker(
+            expected_sha=SHA, runtimes=[{"kind": "gateway", "profile": "coder"}])
+        _enter(monkeypatch, two_profiles["writer"])
+        assert armed is False or fleet._fleet_restart_obligation_armed(), "writer cannot see the armed debt"
+    finally:
+        lock_dir.chmod(0o700)
+
+
 def test_unreadable_host_record_is_never_discharged_by_the_legacy_marker(two_profiles, no_live_fleet, monkeypatch, tmp_path):
     """A record whose terms are UNKNOWN cannot be settled by another record's terms.
 
