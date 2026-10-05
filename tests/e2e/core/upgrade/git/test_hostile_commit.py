@@ -345,11 +345,13 @@ def test_kill_during_branch_switch_without_local_branch_is_restored(world):
     _release(world, {"e2e_dwim_c.py": "C = 1\n"})
     # Die after writing one of main's files, in the checkout that moves the tree: a local main
     # exists, `-B` was given, or git may guess (no --no-guess) and create main from origin/main.
-    _hostile_git(world, 'case " $* " in *" checkout "*) case "${@: -1}" in main|origin/main) moves=0; '
+    # `-B main` names the resolved commit, not the ref (review O2), so it moves whatever comes last.
+    _hostile_git(world, 'case " $* " in *" checkout "*) moves=0; case " $* " in *" -B main "*) moves=1;; esac; '
+                        'case "${@: -1}" in main|origin/main) '
                         '"$REAL" rev-parse -q --verify refs/heads/main >/dev/null && moves=1; '
-                        'case " $* " in *" -B "*) moves=1;; *" --no-guess "*) ;; *) moves=1;; esac; '
+                        'case " $* " in *" --no-guess "*) ;; *) moves=1;; esac;; esac; '
                         'if [ $moves = 1 ]; then "$REAL" show origin/main:e2e_dwim_a.py > e2e_dwim_a.py; '
-                        'kill -KILL $PPID; exit 137; fi;; esac;; esac')
+                        'kill -KILL $PPID; exit 137; fi;; esac')
     killed = _update(sb)
     _hostile_git(world, "")
     assert (sb.checkout / "e2e_dwim_a.py").is_file() and _head(sb) == parked, (
@@ -361,7 +363,7 @@ def test_kill_during_branch_switch_without_local_branch_is_restored(world):
 
 
 def test_kill_during_syntax_rollback_lands_on_the_pre_update_commit(world):
-    """A broken release the preflight cannot see (its ``git show`` is answered with the old file)
+    """A broken release the preflight cannot see (its target read is answered with the old file)
     is rolled back by the post-pull guard; the updater dies while ``reset --hard`` is writing the old
     files back. The next launch must finish on the pre-update commit, not restore the broken one."""
     sb = world["sb"]
@@ -370,7 +372,9 @@ def test_kill_during_syntax_rollback_lands_on_the_pre_update_commit(world):
     broken = _release(world, {"hermes_constants.py": constants + "\ndef broken(:\n",
                               "e2e_rollback_extra.py": "X = 1\n"})
     _hostile_git(world, 'case " $* " in *" show "*":hermes_constants.py "*) "$REAL" show HEAD:hermes_constants.py; '
-                        'exit $?;; *" reset --hard "*) "$REAL" show "${@: -1}:hermes_constants.py" > hermes_constants.py; '
+                        'exit $?;; '
+                        '*" cat-file --batch "*) sed "s#^[^ ]*:hermes_constants.py\\$#HEAD:hermes_constants.py#" | "$REAL" "$@"; exit $?;; '
+                        '*" reset --hard "*) "$REAL" show "${@: -1}:hermes_constants.py" > hermes_constants.py; '
                         'kill -KILL $PPID; exit 137;; esac')
     killed = _update(sb)
     _hostile_git(world, "")
@@ -420,7 +424,9 @@ def test_git_killed_inside_the_rollback_reset_is_finished_by_the_next_launch(wor
     # The preflight reads the old file (so the broken release passes it); the rollback's first step,
     # `reset -q <pre>` (HEAD and index, no file), runs once under the killer.
     _hostile_git(world, 'case " $* " in *" show "*":model_tools.py "*) "$REAL" show HEAD:model_tools.py; '
-                        f'exit $?;; *" reset -q {pre} "*) if [ ! -e "{once}" ]; then : > "{once}"; '
+                        'exit $?;; '
+                        '*" cat-file --batch "*) sed "s#^[^ ]*:model_tools.py\\$#HEAD:model_tools.py#" | "$REAL" "$@"; exit $?;; '
+                        f'*" reset -q {pre} "*) if [ ! -e "{once}" ]; then : > "{once}"; '
                         f'exec "{sb.python}" "{killer}" "$REAL" "$@"; fi;; esac')
     killed = _update(sb)
     _hostile_git(world, "")
