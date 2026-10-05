@@ -580,3 +580,24 @@ def test_a_finish_child_that_cannot_start_after_the_commit_is_owed_not_failed(tm
     assert (get_hermes_home() / ".update_exit_code").read_text(encoding="utf-8").strip() == "0"
     assert json.loads(result.read_text(encoding="utf-8"))["resume_handled"] is False
     assert "finishing steps did not run" in capsys.readouterr().err
+
+
+def test_the_takeover_breadcrumb_is_written_temp_fsync_rename(tmp_path, monkeypatch):
+    """With the host record unwritable the takeover falls back to the per-home breadcrumb; it was
+    written in place (review C12, invariant 5): a crash mid-write left a truncated debt record."""
+    from hermes_cli import _update_takeover, update_host_obligation
+    from hermes_constants import get_hermes_home
+
+    monkeypatch.setattr(update_host_obligation, "write_host_obligation", lambda **_kw: False)
+    monkeypatch.setattr(_update_takeover, "_head_sha", lambda _root: "a" * 40)
+    synced, replaced = [], []
+    real_fsync, real_replace = os.fsync, os.replace
+    monkeypatch.setattr(os, "fsync", lambda fd: synced.append(fd) or real_fsync(fd))
+    monkeypatch.setattr(os, "replace", lambda src, dst: replaced.append((Path(dst), len(synced)))
+                        or real_replace(src, dst))
+
+    _update_takeover._arm_fleet_obligation(tmp_path)
+
+    crumb = get_hermes_home() / "fleet_restart_pending"
+    assert replaced and replaced[-1][0] == crumb and replaced[-1][1] > 0
+    assert f"expected_sha={'a' * 40}" in crumb.read_text(encoding="utf-8")

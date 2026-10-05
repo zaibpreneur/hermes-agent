@@ -80,11 +80,12 @@ def _arm_fleet_obligation(root: Path) -> None:
         return
     # Same fallback as ``update_cmd_fleet._write_fleet_restart_pending_marker``: the per-home
     # breadcrumb every reader still honours.
+    from hermes_cli._early_recovery import write_durable_text
     from hermes_constants import get_hermes_home
 
     lines = [f"started={time.time()}", f"pid={os.getpid()}"] + ([f"expected_sha={sha}"] if sha else [])
     try:
-        (get_hermes_home() / "fleet_restart_pending").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        write_durable_text(get_hermes_home() / "fleet_restart_pending", "\n".join(lines) + "\n")
     except OSError as exc:
         print(f"Warning: could not record the owed gateway restart ({exc}); run `hermes update` again "
               "to restart the gateway onto the new code.", file=sys.stderr)

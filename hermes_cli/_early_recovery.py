@@ -1133,9 +1133,7 @@ def _remember_foreign_lock(marker: Path, lock: Path) -> None:
         return
     lines = [line for line in marker.read_text(encoding="utf-8-sig").splitlines()
              if not line.startswith("foreign_lock=")]
-    tmp = marker.with_name(marker.name + ".tmp")
-    tmp.write_text("\n".join([*lines, f"foreign_lock={identity}"]) + "\n", encoding="utf-8")
-    os.replace(tmp, marker)
+    write_durable_text(marker, "\n".join([*lines, f"foreign_lock={identity}"]) + "\n")
 
 
 def _redo_rollback_head(git, git_dir: Path, root: Path, pre: str, mode: str, *, after_failure: bool) -> str | None:

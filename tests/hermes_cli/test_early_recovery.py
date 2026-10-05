@@ -273,3 +273,22 @@ def test_a_failed_repair_counts_its_attempt_even_on_an_undecodable_marker(tmp_pa
     er._count_failed_attempt(marker)
 
     assert er._read_marker_attempts(marker) == 1
+
+
+def test_the_foreign_lock_record_is_fsynced_under_a_per_writer_temp(tmp_path, monkeypatch):
+    """_remember_foreign_lock rewrote the restore's only record through a fixed-name ``.tmp`` with no
+    fsync (review C12, invariant 5): a crash could leave an empty marker, and two writers shared one temp."""
+    marker, lock = tmp_path / "hermes-update-pull", tmp_path / "update.lock"
+    marker.write_text("pid=1\npre=abc\n", encoding="utf-8")
+    lock.write_text("x", encoding="utf-8")
+    synced, replaced = [], []
+    real_fsync, real_replace = os.fsync, os.replace
+    monkeypatch.setattr(os, "fsync", lambda fd: synced.append(fd) or real_fsync(fd))
+    monkeypatch.setattr(os, "replace", lambda src, dst: replaced.append((Path(src), Path(dst), len(synced)))
+                        or real_replace(src, dst))
+
+    er._remember_foreign_lock(marker, lock)
+
+    assert [(dst, count > 0) for _src, dst, count in replaced] == [(marker, True)]
+    assert replaced[0][0].name != marker.name + ".tmp"
+    assert marker.read_text(encoding="utf-8").endswith(f"foreign_lock={er._lock_identity(lock)}\n")
