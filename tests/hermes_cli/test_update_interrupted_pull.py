@@ -423,6 +423,29 @@ def test_a_rollback_settles_beside_an_unrelated_tracked_edit_and_keeps_it(tmp_pa
     assert _git(root, "status", "--porcelain", "--untracked-files=no") == "M bulk/f1.txt"
 
 
+def test_an_index_lock_judged_foreign_after_our_git_exited_is_never_reclaimed_later(tmp_path):
+    """Our git exited mid-move and an index.lock was there (another git's, e.g. `git commit` in the editor
+    with its fd closed): no later launch may delete THAT lock; a new lock generation is judged afresh."""
+    root, pre, target = _broken_release(tmp_path, 2)
+    _git(root, "reset", "-q", "--hard", pre)
+    (root / "module.py").write_text("def broken(:\n", encoding="utf-8", newline="")  # git's write landed
+    marker = er.interrupted_pull_marker(root)
+    marker.write_text(f"pid=0\npre={pre}\ntarget={target}\nstash=\n", encoding="utf-8", newline="")
+    lock = root / ".git" / "index.lock"
+    lock.write_bytes(b"")
+    assert er.restore_interrupted_pull(root, after_failure=True) is False
+    assert er.restore_interrupted_pull(root) is False
+    assert lock.exists() and marker.exists(), "a lock judged foreign was deleted on the next launch"
+    if sys.platform == "darwin" and not shutil.which("lsof"):
+        pytest.skip("no lsof: a fresh dead lock cannot be proven dead here")
+    lock.unlink()
+    lock.write_bytes(b"")  # a later generation (our own killed git's): the dead-lock proof applies
+    os.utime(lock, ns=(1_000_000_000, 1_000_000_000))
+    assert er.restore_interrupted_pull(root) is True
+    assert not lock.exists() and not marker.exists()
+    assert (root / "module.py").read_text(encoding="utf-8") == "good = True\n"
+
+
 def test_a_launch_that_cannot_get_the_repair_claim_never_continues_from_the_torn_tree(tmp_path, monkeypatch):
     """Another launch holds the restore claim past the wait while the marker says the tree is torn:
     this launch must stop (fail closed) instead of reporting 'nothing to repair' and importing it."""

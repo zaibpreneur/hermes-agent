@@ -960,8 +960,15 @@ def _restore_holding_claim(root: Path, marker: Path, *, after_failure: bool = Fa
     # A killed git's index.lock goes first, before any git runs (an unresolvable or failing git
     # would otherwise strand it, and it refuses every later git command). Proven-dead only; after a
     # git that EXITED (``after_failure``) a lock now is another git's, never ours to drop.
-    foreign_lock = after_failure and (git_dir / "index.lock").exists()
-    index_free = foreign_lock or _release_dead_index_lock(git_dir, root)
+    lock = git_dir / "index.lock"
+    foreign_lock = after_failure and lock.exists()
+    if foreign_lock:
+        _remember_foreign_lock(marker, lock)
+    # The lock generation judged foreign when our git exited is never a killed git's to reclaim later:
+    # a live `git commit` in the editor holds it with its fd closed, which only Linux can still see.
+    known_foreign = bool(fields.get("foreign_lock", "").strip()) and \
+        fields["foreign_lock"].strip() == _lock_identity(lock)
+    index_free = foreign_lock or (not known_foreign and _release_dead_index_lock(git_dir, root))
 
     rollback = fields.get("rollback", "").strip()
     rollback = rollback if rollback in ("branch", "detach") else ""
@@ -984,7 +991,7 @@ def _restore_holding_claim(root: Path, marker: Path, *, after_failure: bool = Fa
         # so the restore below lands on ``pre`` (the code the update started from), not the broken tree.
         # Every step is checked, and the killed step's ``index.lock`` goes first, only once its git is
         # proven gone: until HEAD is on ``pre`` this marker is the rollback's only record.
-        reason = _redo_rollback_head(git, git_dir, root, pre, rollback, after_failure=after_failure)
+        reason = _redo_rollback_head(git, git_dir, root, pre, rollback, after_failure=after_failure or known_foreign)
         if reason is not None:
             print(f"⚠ An interrupted `hermes update` rollback to {pre[:10]} cannot resume yet ({reason}); "
                   "the next launch retries.", file=sys.stderr)
@@ -1055,6 +1062,27 @@ def _restore_holding_claim(root: Path, marker: Path, *, after_failure: bool = Fa
     if stash:
         print(f"  Your local changes are still in the update's stash ({stash}).", file=sys.stderr)
     return True
+
+
+def _lock_identity(lock: Path) -> str:
+    """``inode:mtime_ns`` of a lock file, "" when there is none: a recreated lock is a new generation."""
+    try:
+        st = lock.stat()
+    except OSError:
+        return ""
+    return f"{st.st_ino}:{st.st_mtime_ns}"
+
+
+def _remember_foreign_lock(marker: Path, lock: Path) -> None:
+    """Record ``lock``'s identity in the marker (atomically: the marker is the restore's only record)."""
+    identity = _lock_identity(lock)
+    if not identity:
+        return
+    lines = [line for line in marker.read_text(encoding="utf-8-sig").splitlines()
+             if not line.startswith("foreign_lock=")]
+    tmp = marker.with_name(marker.name + ".tmp")
+    tmp.write_text("\n".join([*lines, f"foreign_lock={identity}"]) + "\n", encoding="utf-8")
+    os.replace(tmp, marker)
 
 
 def _redo_rollback_head(git, git_dir: Path, root: Path, pre: str, mode: str, *, after_failure: bool) -> str | None:
