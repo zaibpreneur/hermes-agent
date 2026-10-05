@@ -145,6 +145,7 @@ def test_update_and_upstream_network_calls_disable_terminal_prompts(monkeypatch,
         return subprocess.CompletedProcess(cmd, 0, upstream if "rev-parse" in cmd else "", "")
 
     monkeypatch.setattr(subprocess, "run", run)
+    (tmp_path / ".git").mkdir()  # the fork ff's recovery marker lives there: no marker, no move
     update_cmd._git_run(["git"], ["fetch", "origin", "main"], cwd=tmp_path, network=True, check=True)
     assert update_cmd_git._sync_with_upstream_if_needed(["git"], tmp_path, assume_yes=True)
     from hermes_cli.update_custody import git_subcommand
