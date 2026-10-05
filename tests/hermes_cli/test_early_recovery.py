@@ -252,3 +252,12 @@ def test_dropping_a_staged_tree_never_changes_a_hardlinked_live_files_mode(tmp_p
     er._drop_path(staging.parent)
     assert not staging.parent.exists()
     assert (live / "Hermes.exe").stat().st_mode & 0o777 == 0o555
+
+
+@pytest.mark.parametrize("body", ['{"attempts": Infinity}', '{"attempts": -Infinity}', '{"attempts": NaN}',
+                                  '{"attempts": true}', '{"attempts": -4}'])
+def test_marker_attempts_from_a_hand_edited_body_are_a_nonnegative_int(tmp_path, body):
+    marker = tmp_path / ".update-incomplete"
+    marker.write_text(body, encoding="utf-8")
+    attempts = er._read_marker_attempts(marker)
+    assert type(attempts) is int and attempts >= 0

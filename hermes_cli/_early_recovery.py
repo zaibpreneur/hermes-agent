@@ -96,7 +96,10 @@ def _read_marker_attempts(marker_path: Path) -> int:
     try:
         import json
 
-        return int(json.loads(raw).get("attempts", 0))
+        attempts = json.loads(raw).get("attempts", 0)
+        if type(attempts) is not int:  # only our writers' ints count: Infinity/NaN/true never reach int()
+            raise TypeError(attempts)
+        return max(0, attempts)
     except (ValueError, AttributeError, TypeError):
         for line in reversed(raw.splitlines()):
             key, separator, value = line.partition("=")
