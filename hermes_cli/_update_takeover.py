@@ -166,31 +166,65 @@ def main() -> int:
     update_receipt.begin_update_receipt(previous=old_receipt, correlation_id=old_receipt.get("update_id"))
     request["update_id"] = update_receipt.current_correlation_id()
     try:
-        python, env = prepare(request)
-        request["receipt"] = update_receipt._current.get().data
-        context.write_text(json.dumps(request), encoding="utf-8")
-        # This file is new too. Direct execution bypasses normal launch-time
-        # update liveness checks while the waiting parent still holds its lock.
-        command = [str(python), "-I", "-B", "-X", "utf8", str(Path(request["root"]) / "hermes_cli/update_finish.py"),
-                   str(context), str(result)]
-        from hermes_cli.update_custody import popen_post_commit
-
-        # update_finish builds the checkout: POSIX lock fd; Windows bound to the job (or leased).
-        with popen_post_commit(command, label="update finish child", cwd=request["root"], env=env) as child:
-            try:
-                code = child.wait()
-            except BaseException:
-                child.kill()
-                raise
-        if code != 0 and not result.is_file():
-            _record_failure(request, result, code, f"completion child exited {code} without acknowledgement")
-        return code
-    except Exception as exc:
-        print(f"Update preparation failed: {exc}", file=sys.stderr, flush=True)
-        _record_failure(request, result, 1, f"historical takeover preparation failed: {exc}")
-        return 1
+        try:
+            python, env = prepare(request)
+            request["receipt"] = update_receipt._current.get().data
+            context.write_text(json.dumps(request), encoding="utf-8")
+        except Exception as exc:
+            print(f"Update preparation failed: {exc}", file=sys.stderr, flush=True)
+            _record_failure(request, result, 1, f"historical takeover preparation failed: {exc}")
+            return 1
+        try:
+            return _run_finish_child(request, context, result, python, env)
+        except Exception as exc:  # health: allow BLE001 -- post-commit boundary: the tree moved and the tail is armed
+            _record_owed_finish(request, result, f"the update finish child could not run ({exc})")
+            return 0
     finally:
         lock.release()
+
+
+def _run_finish_child(request: dict, context: Path, result: Path, python: Path, env: dict) -> int:
+    # This file is new too. Direct execution bypasses normal launch-time
+    # update liveness checks while the waiting parent still holds its lock.
+    command = [str(python), "-I", "-B", "-X", "utf8", str(Path(request["root"]) / "hermes_cli/update_finish.py"),
+               str(context), str(result)]
+    from hermes_cli.update_custody import popen_post_commit
+
+    # update_finish builds the checkout: POSIX lock fd; Windows bound to the job (or leased).
+    with popen_post_commit(command, label="update finish child", cwd=request["root"], env=env) as child:
+        try:
+            code = child.wait()
+        except BaseException:
+            child.kill()
+            raise
+    if code != 0 and not result.is_file():
+        _record_failure(request, result, code, f"completion child exited {code} without acknowledgement")
+    return code
+
+
+def _record_owed_finish(request: dict, result: Path, detail: str) -> None:
+    """The historical updater already moved the tree and ``prepare`` armed the completion tail, so a
+    finish child that could not be started or resumed is an owed follow-up, never a failed update:
+    the next launch runs the tail. Receipt finalized with exit 0. Never raises."""
+    from contextlib import suppress
+
+    print(f"  ⚠ The update is installed, but its finishing steps did not run: {detail}. "
+          "The next `hermes` launch finishes them.", file=sys.stderr, flush=True)
+    saved = None
+    # Receipt/exit-code writes are best effort: a committed update exits 0 whatever they hit.
+    with suppress(Exception):  # health: allow BLE001 -- post-commit boundary: a receipt error never fails the update
+        from hermes_cli import update_receipt
+
+        update_receipt.record_step("historical_takeover", False, f"owed: {detail}")
+        saved = update_receipt.finalize_pending_update_receipt(0, f"committed; finishing steps owed: {detail}")
+    if request.get("gateway_mode"):
+        with suppress(Exception):  # health: allow BLE001 -- post-commit boundary: see above
+            from hermes_constants import get_hermes_home
+
+            (get_hermes_home() / ".update_exit_code").write_text("0\n", encoding="utf-8")
+    with suppress(OSError):  # no result file: the old updater keeps its own receipt and resumes
+        result.write_text(json.dumps({"receipt_handled": saved is not None, "resume_handled": False}),
+                          encoding="utf-8")
 
 
 if __name__ == "__main__":

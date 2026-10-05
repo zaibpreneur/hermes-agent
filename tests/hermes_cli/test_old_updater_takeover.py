@@ -537,3 +537,46 @@ def test_takeover_arms_the_host_record_without_application_dependencies(tmp_path
     assert child.returncode == 0, child.stdout + child.stderr
     record = json.loads((lock_dir / "host-update-restart.json").read_text(encoding="utf-8-sig"))
     assert record["expected_sha"] == head
+
+
+def test_a_finish_child_that_cannot_start_after_the_commit_is_owed_not_failed(tmp_path, monkeypatch, capsys):
+    """The historical updater already moved the tree and prepare() armed the tail. A Popen/resume
+    OSError starting update_finish used to land in the preparation catch-all: receipt failed,
+    .update_exit_code=1, exit 1 for a committed update (review C7, invariant 3)."""
+    from hermes_cli import _update_takeover, update_custody, update_lock, update_receipt
+    from hermes_constants import get_hermes_home
+
+    class _Lock:
+        holder = None
+
+        def __init__(self, **_kwargs):
+            pass
+
+        def acquire(self):
+            return True
+
+        def release(self):
+            pass
+
+    def no_child(*_args, **_kwargs):
+        raise OSError(12, "Cannot allocate memory")
+
+    monkeypatch.setattr(update_lock, "UpdateLock", _Lock)
+    monkeypatch.setattr(_update_takeover, "prepare", lambda request: (Path(sys.executable), dict(os.environ)))
+    monkeypatch.setattr(update_custody, "popen_post_commit", no_child)
+    saved = []
+    real_finalize = update_receipt.finalize_pending_update_receipt
+    monkeypatch.setattr(update_receipt, "finalize_pending_update_receipt",
+                        lambda code=None, reason="": saved.append(code) or real_finalize(code, reason))
+    root = tmp_path / "root"
+    root.mkdir()
+    context, result = tmp_path / "context.json", tmp_path / "result.json"
+    context.write_text(json.dumps({"root": str(root), "gateway_mode": True, "receipt": {}}), encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["_update_takeover", str(context), str(result)])
+
+    assert _update_takeover.main() == 0
+
+    assert saved == [0]
+    assert (get_hermes_home() / ".update_exit_code").read_text(encoding="utf-8").strip() == "0"
+    assert json.loads(result.read_text(encoding="utf-8"))["resume_handled"] is False
+    assert "finishing steps did not run" in capsys.readouterr().err
