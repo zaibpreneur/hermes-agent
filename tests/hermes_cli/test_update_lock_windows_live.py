@@ -539,6 +539,9 @@ def test_the_old_updater_runs_its_takeover_in_the_job(tmp_path, monkeypatch, cap
 
 # --- C3: a normal release never frees the checkout under a build descendant ------------------
 
+# The launcher's own argv says "hermes: update custody", which the live-system guard reads as
+# `hermes update`; this test runs it in-process against a tmp_path checkout, never a real one.
+@pytest.mark.live_system_guard_bypass
 def test_a_build_descendant_left_by_its_leader_never_writes_after_a_normal_release(tmp_path):
     """C3: npm exits while a builder grandchild it started keeps running. The launcher returns
     only once that grandchild is gone, so after the owner's ordinary release a contender
