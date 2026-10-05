@@ -509,3 +509,31 @@ def test_takeover_arms_an_sha_less_obligation_for_a_git_less_root(tmp_path, monk
     record = read_host_obligation()
     assert record is not None and record["expected_sha"] == ""
 
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_takeover_arms_the_host_record_without_application_dependencies(tmp_path):
+    """The arm runs in the HISTORICAL interpreter, before PM installs the new dependencies. A
+    ruamel-less interpreter (-I -S here) must still write the HOST record every profile reads, not
+    only the arming profile's per-home breadcrumb (R1-1)."""
+    source = Path(__file__).resolve().parents[2]
+    root = tmp_path / "checkout"
+    git = ["git", "-C", str(root), "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false"]
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "init"], check=True)
+    rev_parse = [*git, "rev-parse", "HEAD"]
+    head = subprocess.run(rev_parse, check=True, capture_output=True, text=True, encoding="utf-8").stdout.strip()
+    lock_dir, home = tmp_path / "gateway-locks", tmp_path / "home"
+    home.mkdir()
+    child = subprocess.run(
+        [sys.executable, "-I", "-S", "-B", "-c",
+         "import importlib.util, sys\nfrom pathlib import Path\n"
+         f"sys.path.insert(0, {str(source)!r})\n"
+         "assert importlib.util.find_spec('ruamel') is None, 'precondition: no app dependencies'\n"
+         "from hermes_cli._update_takeover import _arm_fleet_obligation\n"
+         f"_arm_fleet_obligation(Path({str(root)!r}))\n"],
+        env={**os.environ, "HERMES_GATEWAY_LOCK_DIR": str(lock_dir), "HERMES_HOME": str(home)},
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", timeout=60,
+    )
+    assert child.returncode == 0, child.stdout + child.stderr
+    record = json.loads((lock_dir / "host-update-restart.json").read_text(encoding="utf-8-sig"))
+    assert record["expected_sha"] == head
