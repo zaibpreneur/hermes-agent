@@ -420,8 +420,12 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path, *, assume_yes: 
         run_git(git_cmd, ["merge", "--ff-only", upstream], cwd=cwd, check=True, **_no_prompt_git_kwargs())
     except subprocess.CalledProcessError as exc:
         if refused or _commit.settle_failed_tree_move(cwd):
-            # Back at ``pre``; that is still new code when the origin pull moved first, and
-            # disarm refuses then (it only hands obligations back at the run's start commit).
+            # Back at ``pre``; that is still new code when the origin pull moved first: owe the
+            # restart for it again, not for ``target`` (disarm refuses then: it only hands
+            # obligations back at the run's start commit).
+            if pre and _git_stdout(git_cmd, ["rev-parse", "HEAD"], cwd) == pre:
+                with suppress(OSError):
+                    _commit.arm_commit_obligations(cwd, pre)
             _commit.disarm_commit_obligations()
         print("  ✗ Failed to pull from upstream. You may need to resolve conflicts manually.")
         if exc.stderr:

@@ -109,3 +109,32 @@ def test_an_upstream_sync_whose_marker_cannot_be_written_never_moves_the_tree(tm
         update_cmd_commit.reset_for_tests()
     assert _git(clone, "rev-parse", "HEAD") == commits[1]
     assert _git(clone, "status", "--porcelain", "--untracked-files=no") == ""
+
+
+def test_a_failed_upstream_sync_after_the_pull_owes_the_restart_for_the_pulled_commit(tmp_path, monkeypatch):
+    """The origin pull moved c0 -> c1 and the fork ff to c2 failed back to c1: the obligation must name
+    c1 (dischargeable at HEAD), not the c2 the checkout never reached (F23)."""
+    from hermes_cli import update_cmd_commit, update_custody
+    from hermes_cli.update_host_obligation import read_host_obligation
+
+    clone, commits = _fork_behind_upstream(tmp_path, monkeypatch)
+    update_cmd_commit.reset_for_tests()
+    _git(clone, "reset", "-q", "--hard", commits[0])
+    update_cmd_commit.record_run_start(["git"], clone)
+    update_cmd_commit.arm_commit_obligations(clone, commits[1])
+    _git(clone, "reset", "-q", "--hard", commits[1])  # the committed origin pull
+    real = update_custody.run_git
+
+    def merge_fails(git_cmd, args, *rest, **kw):
+        if args[:1] == ["merge"]:
+            raise subprocess.CalledProcessError(128, args, stderr="fatal: Unable to create index.lock")
+        return real(git_cmd, args, *rest, **kw)
+
+    monkeypatch.setattr(update_custody, "run_git", merge_fails)
+    try:
+        assert _sync_with_upstream_if_needed(["git"], clone, assume_yes=True) is False
+        assert update_cmd_commit.commit_obligations_armed()
+    finally:
+        update_cmd_commit.reset_for_tests()
+    assert _git(clone, "rev-parse", "HEAD") == commits[1]
+    assert (read_host_obligation() or {}).get("expected_sha") == commits[1]
