@@ -601,3 +601,17 @@ def test_the_takeover_breadcrumb_is_written_temp_fsync_rename(tmp_path, monkeypa
     crumb = get_hermes_home() / "fleet_restart_pending"
     assert replaced and replaced[-1][0] == crumb and replaced[-1][1] > 0
     assert f"expected_sha={'a' * 40}" in crumb.read_text(encoding="utf-8")
+
+
+def test_a_historical_updater_arms_the_host_record_under_the_current_mutex(tmp_path, monkeypatch):
+    """An N-1 updater imported ``update_lock`` before its pull, then lazily imports the pulled
+    ``update_host_obligation``: the arm must still write the record, under the same sidecar lock
+    current processes hold, instead of crashing the update on the missing ``marker_mutex``."""
+    from hermes_cli import update_lock
+    from hermes_cli.update_host_obligation import read_host_obligation, write_host_obligation
+
+    monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "gateway-locks"))
+    monkeypatch.delattr(update_lock, "marker_mutex")  # N-1's in-memory update_lock had no such name
+    assert write_host_obligation(expected_sha="a" * 40)
+    assert read_host_obligation()["expected_sha"] == "a" * 40
+    assert (tmp_path / "gateway-locks" / ".host-update-restart.mutex" / "record.lock").exists()

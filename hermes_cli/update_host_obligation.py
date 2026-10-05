@@ -170,12 +170,31 @@ def _record_mutex(path: Path):
     The sidecar sits in a subdirectory: the state dir is the gateway lock dir, whose ``--replace``
     cleanup unlinks every top-level ``*.lock``, and a deleted sidecar splits the lock in two.
     """
-    from hermes_cli.update_lock import marker_mutex  # stdlib-only, like this module
-
     guard = path.parent / f".{path.stem}.mutex"
     guard.mkdir(parents=True, exist_ok=True)
-    with marker_mutex(guard / "record"):
+    with _marker_mutex()(guard / "record"):
         yield
+
+
+def _marker_mutex():
+    """``update_lock.marker_mutex``. A historical updater imported ``update_lock`` before its pull and
+    then lazily imports this pulled module, so its in-memory copy predates the mutex: load the pulled
+    ``update_lock`` (stdlib-only) beside it, which locks the same sidecar every current process does."""
+    import importlib.util
+    import sys
+
+    from hermes_cli import update_lock
+
+    if hasattr(update_lock, "marker_mutex"):
+        return update_lock.marker_mutex
+    name = "hermes_cli._update_lock_pulled"
+    pulled = sys.modules.get(name)
+    if pulled is None:
+        spec = importlib.util.spec_from_file_location(name, update_lock.__file__)
+        pulled = importlib.util.module_from_spec(spec)
+        sys.modules[name] = pulled  # before exec: dataclasses resolve the module by name
+        spec.loader.exec_module(pulled)
+    return pulled.marker_mutex
 
 
 def _owners(record: dict) -> list[str]:
