@@ -375,7 +375,10 @@ def test_zip_recovers_crashed_backup_before_failed_copy_and_retry(zip_update, mo
         assert error.value.code == 1
     witness = target / "code.py" if entry == "tools" else target
     assert witness.read_text(encoding="utf-8") == ("retained" if entry == "tools" else "old")
-    assert not _swap_leftovers(root)
+    # Nothing journaled the leftover copy: it is kept aside, never deleted (F78).
+    kept = root / (leftover.name + ".hermes-update-kept")
+    assert _swap_leftovers(root) == [kept] and kept.read_text(encoding="utf-8") == "interrupted copy"
+    kept.unlink()
     update_cmd_zip._download_and_swap_zip("main", "local fixture")
     assert witness.read_text(encoding="utf-8") == "new"
     assert not _swap_leftovers(root)

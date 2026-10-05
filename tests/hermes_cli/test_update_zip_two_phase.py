@@ -108,7 +108,9 @@ def test_commit_handles_entries_absent_from_the_install(tmp_path):
 
     assert (live / "brand_new" / "version.txt").read_text() == "new"
 
-def test_staging_clears_leftovers_from_an_interrupted_run(tmp_path):
+def test_staging_sets_aside_leftovers_it_cannot_prove_are_its_own(tmp_path):
+    """A staging-suffix entry nothing journaled (a pre-journal crash's, or a user's) is neither staged
+    over nor deleted (F78): it is kept aside byte for byte and the update proceeds."""
     live, new = tmp_path / "live", tmp_path / "new"
     _live_tree(live, {"agent": "old"})
     _live_tree(new, {"agent": "new"})
@@ -120,6 +122,8 @@ def test_staging_clears_leftovers_from_an_interrupted_run(tmp_path):
 
     assert (live / "agent" / "version.txt").read_text() == "new"
     assert not (live / "agent" / "junk.txt").exists()
+    assert [p.read_text() for p in live.glob("agent.hermes-update-staging.hermes-update-kept/*")] == [
+        "from a previous crash"]
 
 # ---------------------------------------------------------------------------
 # Shared venv helpers (#76105)
@@ -826,3 +830,29 @@ def test_a_committed_swap_keeps_its_journal_until_the_backup_is_gone(tmp_path, m
     assert not (live / "payload.hermes-update-old").exists() and not (live / ZIP_SWAP_JOURNAL).exists()
     assert update_cmd_zip._zip_overlay_block_reason(live) is None
 
+@pytest.mark.parametrize("planted", ["cli.py.hermes-update-staging", "cli.py.hermes-update-old"])
+def test_a_suffix_path_that_appears_after_the_preflight_is_never_deleted(tmp_path, monkeypatch, planted):
+    """F78: a file at the staging suffix (created during the download, after the clean-tree preflight)
+    or at the backup suffix (created after the pre-swap recheck) is nothing this transaction made. The
+    stage dropped the first unconditionally and the hardlink backup the second; both survive now, byte
+    for byte, and the swap is refused with the live tree left old."""
+    from hermes_cli import update_cmd_commit
+    from hermes_cli._early_recovery import ZIP_SWAP_JOURNAL, restore_interrupted_zip_swap
+
+    live, extracted = tmp_path / "live", tmp_path / "extracted"
+    live.mkdir()
+    extracted.mkdir()
+    _git_checkout(live, {"cli.py": "LIVE"})
+    (extracted / "cli.py").write_text("NEW", encoding="utf-8")
+    user = live / planted
+    if planted.endswith("-staging"):
+        user.write_text("USER NOTE", encoding="utf-8")
+    monkeypatch.setattr(update_cmd_commit, "arm_commit_obligations",  # the last step before the swap
+                        lambda *a, **k: user.exists() or user.write_text("USER NOTE", encoding="utf-8"))
+    with pytest.raises((SystemExit, OSError)):
+        update_cmd_zip._journaled_stage_and_swap(str(extracted), ["cli.py"], live, "b" * 40)
+    restore_interrupted_zip_swap(live)
+    assert (live / "cli.py").read_text(encoding="utf-8") == "LIVE"
+    kept = [p.name for p in live.iterdir() if p.is_file() and p.read_bytes() == b"USER NOTE"]
+    assert len(kept) == 1, sorted(p.name for p in live.iterdir())
+    assert not (live / ZIP_SWAP_JOURNAL).exists()
