@@ -823,6 +823,38 @@ def test_a_move_killed_after_git_wrote_a_symlink_change_is_restored(tmp_path, ba
     assert _what_is_at(root / "L") == before
 
 
+def _regular_naming_core(root: Path) -> None:
+    """A regular file holding ``core.py``: the same blob as a symlink to ``core.py``."""
+    (root / "L").unlink(missing_ok=True)
+    (root / "L").write_bytes(b"core.py")
+
+
+@pytest.mark.platforms("posix")  # creating symlinks needs Developer Mode/admin on Windows
+@pytest.mark.parametrize("kill", ["tree-written", "tree-and-index-written", "core-symlinks-false"])
+@pytest.mark.parametrize(("base", "change"), [(_regular_naming_core, _link), (_link, _regular_naming_core)],
+                         ids=["regular-to-symlink", "symlink-to-regular"])
+def test_an_equal_blob_type_change_git_wrote_is_restored(tmp_path, base, change, kill):
+    """A regular file holding ``core.py`` and a symlink to ``core.py`` are one blob id: only the entry's
+    mode tells that git wrote it. Killed with the tree (and index) written but HEAD still ``pre``, the
+    move is put back, never left as a type change with its marker spent (review N07). Under
+    ``core.symlinks=false`` git checks the link out as that very file: only the index shows the change."""
+    root, pre, target = _killed_move(tmp_path, change, base)
+    if kill == "core-symlinks-false":
+        _git(root, "config", "core.symlinks", "false")
+        (root / "L").unlink()
+        _git(root, "checkout", "--", "L")  # the link as git checks it out here: a plain file
+    before = _what_is_at(root / "L")
+    if kill == "tree-written":
+        change(root)
+    else:  # git's index/tree update, before its HEAD update
+        _git(root, "read-tree", "-u", "-m", pre, target)
+        assert _git(root, "status", "--porcelain") == "T  L"
+    assert er.restore_interrupted_pull(root) is True
+    assert _git(root, "rev-parse", "HEAD") == pre and not er.interrupted_pull_marker(root).exists()
+    assert _git(root, "status", "--porcelain", "--untracked-files=all") == ""
+    assert _what_is_at(root / "L") == before
+
+
 def test_the_tree_move_marker_is_durable_before_it_appears_under_its_name(checkout, commit_point, monkeypatch):
     """The marker is the restore's only record: it is written to a temp file, fsynced, then renamed
     over its name. An in-place write could leave a power cut with an empty or half marker over a

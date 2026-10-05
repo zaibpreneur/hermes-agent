@@ -381,6 +381,42 @@ def _hash_worktree(git, paths: list[str]) -> dict[str, str]:
     return blobs
 
 
+def _modes_git_wrote(git, root: Path, entries: dict, links: set[str]) -> set[str]:
+    """Paths whose new entry keeps the ``pre`` blob under another mode, already in that mode.
+
+    Equal bytes cannot tell a regular file holding ``original`` from a symlink to ``original`` (one
+    blob id), nor 644 from 755: only the entry's mode can (review N07). The worktree shows a link
+    (lstat), except under ``core.symlinks=false`` where git checks a link out as a plain file holding
+    its target, and the executable bit, except on Windows. The index shows the mode git staged where
+    the worktree cannot; git writes it after the files, so it covers a git killed after a whole tree.
+    """
+    wanted = {path: {m for m, b in new if b == old_blob and m != old_mode}
+              for path, (old_mode, old_blob, new) in entries.items() if old_blob is not None}
+    wanted = {path: modes for path, modes in wanted.items() if modes}
+    if not wanted:
+        return set()
+    symlinks = git("config", "--type=bool", "core.symlinks").stdout.strip() != "false"
+    staged = git("ls-files", "-s", "-z", "--", *wanted)
+    if staged.returncode != 0:
+        raise subprocess.SubprocessError(staged.stderr.strip())
+    index = {path: meta.split()[0] for meta, _tab, path in
+             (record.partition("\t") for record in staged.stdout.split("\0")) if path}
+    written = set()
+    for path, modes in wanted.items():
+        if path in links:
+            shown = {"120000"}
+        elif not (root / path).is_file():
+            shown = set()  # missing: the caller judges it by absence
+        else:
+            shown = set(_REGULAR_FILE_MODES) if sys.platform == "win32" else \
+                {"100755" if (root / path).stat().st_mode & 0o100 else "100644"}
+            if not symlinks:
+                shown.add("120000")
+        if (entries[path][0] not in shown and shown & modes) or index.get(path) in modes:
+            written.add(path)
+    return written
+
+
 def _paths_git_wrote(git, root: Path, pre: str, target: str) -> tuple[list[str], list[str], set[str], set[str]] | None:
     """Paths the killed git already touched on the way to ``target``: (restore from HEAD, remove as added,
     directories git may have created for its added files, the added ones to keep aside, not delete).
@@ -412,15 +448,14 @@ def _paths_git_wrote(git, root: Path, pre: str, target: str) -> tuple[list[str],
     links = {path for path in entries if os.path.islink(root / path)}
     worktree_blob = _hash_worktree(git, [path for path in entries if path not in links and (root / path).is_file()])
     worktree_blob.update({path: blob_id(os.fsencode(os.readlink(root / path)), pre) for path in links})
+    retyped = _modes_git_wrote(git, root, entries, links)
     restore, added, kept = [], [], set()
     for path, (old_mode, old_blob, new) in entries.items():
         file, blobs = root / path, {blob for _mode, blob in new if blob}
         if path not in worktree_blob:
             written = old_blob is not None  # unlinked (or deleted), not yet recreated
-        elif worktree_blob[path] == old_blob:  # only a mode change tells whether git got here
-            written = (sys.platform != "win32" and path not in links
-                       and any(b == old_blob and m != old_mode for m, b in new)
-                       and bool(file.stat().st_mode & 0o100) != (old_mode == "100755"))
+        elif worktree_blob[path] == old_blob:  # only the entry's mode tells whether git got here
+            written = path in retyped
         elif worktree_blob[path] in blobs or path in unknown:
             written = True
         elif path in links:  # git creates a symlink whole: any other target is the user's
