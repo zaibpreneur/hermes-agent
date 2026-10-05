@@ -410,6 +410,25 @@ def test_a_rollback_marker_outlives_a_lock_that_may_still_be_live(tmp_path):
     assert _git(root, "status", "--porcelain", "--untracked-files=no") == ""
 
 
+def test_a_launch_that_cannot_get_the_repair_claim_never_continues_from_the_torn_tree(tmp_path, monkeypatch):
+    """Another launch holds the restore claim past the wait while the marker says the tree is torn:
+    this launch must stop (fail closed) instead of reporting 'nothing to repair' and importing it."""
+    root, pre, target = _broken_release(tmp_path, 5)
+    marker = _rollback_marker(root, pre, target)
+    monkeypatch.setattr(er, "_RESTORE_CLAIM_WAIT_SECONDS", 0.2)
+    fd = os.open(marker.parent / er._RESTORE_CLAIM, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        assert er._lock_fd(fd, True)
+        with pytest.raises(RuntimeError, match="launch again"):
+            er.restore_interrupted_pull(root)
+    finally:
+        er._lock_fd(fd, False)
+        os.close(fd)
+    assert marker.exists() and _git(root, "rev-parse", "HEAD") == target
+    assert er.restore_interrupted_pull(root) is True  # once the claim is free the repair runs
+    assert _git(root, "rev-parse", "HEAD") == pre and not marker.exists()
+
+
 # --- R2: the launch-time repair holds the checkout kernel lock -------------------------------
 
 _HOLD_CHECKOUT = """

@@ -862,9 +862,12 @@ def restore_interrupted_pull(project_root: Path | None = None, *, after_failure:
             return False
         with _restore_claim(marker.parent) as claimed:
             if not claimed:
-                print("⚠ Another Hermes launch is still repairing the checkout after an interrupted "
-                      "`hermes update`; if this one fails, launch again in a moment.", file=sys.stderr)
-                return False
+                if after_failure:
+                    return False  # the marker stays: the updater reports the move as not settled
+                # The tree is still torn (the marker is there): importing checkout code now would run
+                # the half-written files. Fail closed like unprovable custody does.
+                raise RuntimeError("another Hermes launch is still repairing the checkout after an "
+                                   "interrupted `hermes update`; launch again in a moment")
             if not marker.is_file():
                 return True  # another launch finished while this one started: rerun from its tree
             # The claim orders launches; the checkout lock keeps out an update tree. Claim first, so a
