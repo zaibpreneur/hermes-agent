@@ -404,37 +404,34 @@ def _journaled_stage_and_swap(extracted: str, entries: list[str], root: Path, ta
         except BaseException:
             _drop_journal_if_clean(root, entries)  # _stage_entries dropped its copies, if it could
             raise
-        try:
-            # TOCTOU re-check right before the swap: download + extract + staging can take minutes and
-            # work created meanwhile would be destroyed. Our own staging siblings are filtered out.
-            recheck_reason = _zip_overlay_block_reason(root, ignore_staging_artifacts=True, shipped=entries)
-            if recheck_reason is not None:
-                _discard_staged(staged)
-                _drop_journal_if_clean(root, entries)
-                print(f"✗ ZIP fallback aborted before the swap: {recheck_reason}.")
-                print("  Files appeared in the checkout while the update was downloading; committing the swap would delete them.")
-                print(_STASH_HINT)
-                _m().sys.exit(1)
-            # Pre-commit gate: a target whose startup modules do not compile is refused untouched
-            # (unless it requires a Python this interpreter is not: its syntax is not ours to judge).
-            pyproject = Path(extracted, "pyproject.toml")
-            newer_python = pyproject.is_file() and _commit.requires_other_python(pyproject.read_bytes())
-            for rel in () if newer_python else _UPDATE_CRITICAL_FILES:
-                path = os.path.join(extracted, *rel.split("/"))
-                if os.path.isfile(path):
-                    with open(path, "rb") as handle:
-                        compile(handle.read(), rel, "exec", dont_inherit=True)
-            # The commit point: tail + fleet restart owed before the first live rename.
-            _commit.arm_commit_obligations(root, target_sha or "")
-            write_zip_swap_journal(root, "swapping", journal_entries)
-            _commit_staged_replacements(
-                staged, on_committed=lambda: write_zip_swap_journal(root, "committed", journal_entries))
-        except Exception:
-            # Rollback restored swapped entries but staging copies for the rest remain; drop them or the
-            # retry's up-front free-space check (runs BEFORE per-entry leftover cleanup) fails on our litter.
-            # Safe post-rollback: _discard_staged skips paths that no longer exist.
+        # A failure past here leaves the journal: the caller's restore_interrupted_zip_swap (or the next
+        # launch) settles it and drops every staging copy, so the retry's free-space check finds no litter.
+        # Never discard staging first: a staging copy still on disk is what proves its entry was never
+        # installed, so recovery must not delete whatever (a user's new file) now sits at that path.
+        # TOCTOU re-check right before the swap: download + extract + staging can take minutes and
+        # work created meanwhile would be destroyed. Our own staging siblings are filtered out.
+        recheck_reason = _zip_overlay_block_reason(root, ignore_staging_artifacts=True, shipped=entries)
+        if recheck_reason is not None:
             _discard_staged(staged)
-            raise
+            _drop_journal_if_clean(root, entries)
+            print(f"✗ ZIP fallback aborted before the swap: {recheck_reason}.")
+            print("  Files appeared in the checkout while the update was downloading; committing the swap would delete them.")
+            print(_STASH_HINT)
+            _m().sys.exit(1)
+        # Pre-commit gate: a target whose startup modules do not compile is refused untouched
+        # (unless it requires a Python this interpreter is not: its syntax is not ours to judge).
+        pyproject = Path(extracted, "pyproject.toml")
+        newer_python = pyproject.is_file() and _commit.requires_other_python(pyproject.read_bytes())
+        for rel in () if newer_python else _UPDATE_CRITICAL_FILES:
+            path = os.path.join(extracted, *rel.split("/"))
+            if os.path.isfile(path):
+                with open(path, "rb") as handle:
+                    compile(handle.read(), rel, "exec", dont_inherit=True)
+        # The commit point: tail + fleet restart owed before the first live rename.
+        _commit.arm_commit_obligations(root, target_sha or "")
+        write_zip_swap_journal(root, "swapping", journal_entries)
+        _commit_staged_replacements(
+            staged, on_committed=lambda: write_zip_swap_journal(root, "committed", journal_entries))
         (root / ZIP_SWAP_JOURNAL).unlink(missing_ok=True)
     return staged
 

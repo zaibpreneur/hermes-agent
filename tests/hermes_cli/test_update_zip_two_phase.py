@@ -539,3 +539,31 @@ def test_a_stale_backup_never_stands_in_for_the_live_entry(tmp_path, monkeypatch
     module = live / "pkg" / "m.py"
     assert module.is_file() and module.read_text() in ("LIVE_OLD", "NEW"), sorted(
         str(p.relative_to(live)) for p in live.rglob("*"))
+
+
+def test_a_failed_swap_keeps_a_file_the_user_made_at_a_never_installed_entry(tmp_path, monkeypatch):
+    """The swap fails before ``brand_new`` is installed; a file the user created there meanwhile is
+    theirs, and neither the rollback nor the journal recovery may delete it."""
+    from hermes_cli import update_cmd_commit
+
+    live, extracted = tmp_path / "live", tmp_path / "extracted"
+    for side, text in ((live, "old"), (extracted, "new")):
+        (side / "a").mkdir(parents=True)
+        (side / "a" / "v.txt").write_text(text)
+    (extracted / "brand_new").write_text("new entry")
+    user_file = live / "brand_new"
+    monkeypatch.setattr(update_cmd_commit, "arm_commit_obligations",
+                        lambda *a, **k: user_file.write_text("USER NOTE"))
+    real_rename = os.rename
+
+    def refuse_moving_a(src, dst):  # Windows AV holding ``a`` open
+        if os.fspath(src) == str(live / "a") and os.fspath(dst).endswith(".hermes-update-old"):
+            raise PermissionError(13, "in use")
+        return real_rename(src, dst)
+
+    monkeypatch.setattr(update_cmd_zip.os, "rename", refuse_moving_a)
+    _swap_or_recover(extracted, ["a", "brand_new"], live)
+    monkeypatch.undo()
+    assert user_file.is_file() and user_file.read_text() == "USER NOTE"
+    assert (live / "a" / "v.txt").read_text() == "old"
+    assert not [p.name for p in live.iterdir() if "hermes-update-staging" in p.name or p.name.endswith("-old")]
