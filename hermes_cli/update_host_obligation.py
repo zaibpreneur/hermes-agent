@@ -20,6 +20,7 @@ live ``MainPID``, so restarting each one restarts the host process N times.
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import json
 import logging
@@ -100,24 +101,44 @@ def amend_host_obligation(**fields: Any) -> None:
 
 
 def write_host_obligation(
-    *, expected_sha: str = "", runtimes: Optional[list] = None, profile: str = ""
+    *, expected_sha: str = "", runtimes: Optional[list] = None, profile: str = "", owner: str = ""
 ) -> bool:
     """Arm the host obligation. True when it was written. Never raises.
 
     Re-arming from a second profile for the SAME pulled SHA keeps the existing record (and its
     ``restarted`` proof) instead of resetting it: the host owes one restart, not one per profile.
+    ``owner`` (an update run's commit-point token) joins the record's ``owners``: a run that
+    fails before its move hands back only its own stake (``release_host_obligation``), never
+    another install's debt for the same SHA. The first owner also stores what it found there
+    (``found``), which the last owner to leave puts back.
     """
     path = host_obligation_path()
     existing = read_host_obligation()
+    try:
+        found = _found_field(path) if owner and not _owners(existing or {}) else None
+    except OSError as exc:  # unreadable is not absent: a guessed ``found`` would delete it later
+        logger.debug("Could not read the host update-restart obligation: %s", exc)
+        return False
     if existing is not None and expected_sha and existing.get("expected_sha") == expected_sha:
         # Same pull, second profile: the host owes ONE restart, so keep the standing record (and
         # any proof that the restart already happened) rather than resetting it. A later arm that
         # carries the owed inventory still upgrades it — an inventory-less record owes no set.
-        if runtimes is None:
-            return True
+        fields: dict[str, Any] = {}
+        owners = _owners(existing)
+        if owner and owner not in owners:
+            fields["owners"] = [*owners, owner]
+            if not owners:
+                fields["found"] = found
         inventory = {"version": 1, "runtimes": runtimes}
-        if existing.get("inventory") != inventory:
-            amend_host_obligation(inventory=inventory)
+        if runtimes is not None and existing.get("inventory") != inventory:
+            fields["inventory"] = inventory
+        if not fields:
+            return True
+        try:
+            _write_record(path, {**existing, **fields})
+        except Exception as exc:  # health: allow BLE001 -- never raises: the caller falls back to the per-home marker
+            logger.debug("Could not amend host update-restart obligation: %s", exc)
+            return False
         return True
     payload: dict[str, Any] = {
         "version": _RECORD_VERSION,
@@ -126,6 +147,9 @@ def write_host_obligation(
         "armed_by_profile": profile or "",
         "expected_sha": expected_sha or "",
     }
+    if owner:
+        payload["owners"] = [owner]
+        payload["found"] = found
     if runtimes is not None:
         payload["inventory"] = {"version": 1, "runtimes": runtimes}
     try:
@@ -135,6 +159,62 @@ def write_host_obligation(
         logger.debug("Could not write host update-restart obligation: %s", exc)
         return False
     return True
+
+
+def _owners(record: dict) -> list[str]:
+    owners = record.get("owners")
+    return [str(o) for o in owners] if isinstance(owners, list) else []
+
+
+def _found_field(path: Path) -> Optional[str]:
+    """The record's current bytes (base64), ``None`` when absent: what a first owner puts back.
+    Any other read error raises: custody is never guessed."""
+    try:
+        return base64.b64encode(path.read_bytes()).decode("ascii")
+    except FileNotFoundError:
+        return None
+
+
+def release_host_obligation(owner: str) -> None:
+    """Hand back ``owner``'s stake in the record. When no other run still owes through it, the
+    record goes back to what its first owner found (``found``; absent = unlinked).
+
+    A record without ``owner`` was rewritten since (another install's newer pull): it is theirs and
+    stays. Raises OSError when the record cannot be rewritten (the caller keeps the debt armed).
+    """
+    record = read_host_obligation()
+    owners = _owners(record) if record is not None else []
+    if not owner or owner not in owners:
+        return
+    path = host_obligation_path()
+    remaining = [o for o in owners if o != owner]
+    if remaining:
+        _write_record(path, {**record, "owners": remaining})
+        return
+    try:
+        found = base64.b64decode(record["found"], validate=True) if record.get("found") is not None else None
+    except (TypeError, ValueError):
+        return  # a damaged ``found`` cannot be put back: the debt stays armed, never guessed away
+    if found is None:
+        path.unlink(missing_ok=True)
+    else:
+        _replace_bytes(path, found)
+
+
+def _replace_bytes(path: Path, data: bytes) -> None:
+    """Put ``data`` back at ``path``: a fresh ``mkstemp`` file (never through a planted alias),
+    fsynced, then renamed over the record."""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.stem}_", suffix=".restore")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 def clear_host_obligation() -> None:

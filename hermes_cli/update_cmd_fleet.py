@@ -82,7 +82,7 @@ def _write_legacy_fleet_restart_pending_marker(
         return False
 
 
-def _write_fleet_restart_pending_marker(*, expected_sha: str = "", runtimes: list[dict] | None = None) -> bool:
+def _write_fleet_restart_pending_marker(*, expected_sha: str = "", runtimes: list[dict] | None = None, owner: str = "") -> bool:
     """Arm the HOST pull→restart obligation. Never raises; False when neither store took it.
 
     An unwritable host state dir (``HERMES_GATEWAY_LOCK_DIR`` on a read-only mount, a container
@@ -102,7 +102,7 @@ def _write_fleet_restart_pending_marker(*, expected_sha: str = "", runtimes: lis
         logger.debug("Skipping fleet-restart-pending obligation under pytest (live checkout)")
         return True
     if write_host_obligation(
-            expected_sha=expected_sha, runtimes=runtimes, profile=_current_profile_name()):
+            expected_sha=expected_sha, runtimes=runtimes, profile=_current_profile_name(), owner=owner):
         return True
     if _write_legacy_fleet_restart_pending_marker(expected_sha=expected_sha, runtimes=runtimes):
         logger.warning(

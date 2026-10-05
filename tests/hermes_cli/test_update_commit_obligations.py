@@ -157,3 +157,40 @@ def test_a_refused_pull_after_the_branch_switch_owes_the_head_the_switch_landed_
 
     assert reason and "the checkout was not changed" not in reason and a[:10] in reason
     assert (read_host_obligation() or {}).get("expected_sha") == a
+
+
+def _run_state() -> dict:
+    return {name: getattr(commit, name, None) for name in ("_armed_snapshot", "_owner")} | {
+        "_armed_bytes": dict(commit._armed_bytes)}
+
+
+def _enter_run(state: dict) -> None:
+    for name, value in state.items():
+        if name == "_armed_bytes":
+            commit._armed_bytes.clear()
+            commit._armed_bytes.update(value)
+        else:
+            setattr(commit, name, value)
+
+
+def test_one_installs_disarm_never_deletes_another_installs_debt_for_the_same_sha(root, tmp_path):
+    """Install A and install B both arm SHA X. Same-SHA arms share one host record, so a byte
+    compare cannot tell them apart: A's failed run used to delete the record B still owes through
+    (review C2). A's disarm hands back only A's stake; the last owner to leave puts back what the first found."""
+    from hermes_cli.update_host_obligation import read_host_obligation
+
+    other = tmp_path / "other-install"
+    other.mkdir()
+    commit.arm_commit_obligations(root, "a" * 40)  # install A
+    run_a = _run_state()
+    commit.reset_for_tests()
+    commit.arm_commit_obligations(other, "a" * 40)  # install B, same pulled SHA
+    run_b = _run_state()
+
+    _enter_run(run_a)
+    commit.disarm_commit_obligations()
+    assert (read_host_obligation() or {}).get("expected_sha") == "a" * 40  # B still owes it
+
+    _enter_run(run_b)
+    commit.disarm_commit_obligations()
+    assert not host_obligation_path().exists()  # the last owner puts back what the FIRST one found

@@ -44,6 +44,8 @@ _armed_bytes: dict[Path, Optional[bytes]] = {}
 # (git_cmd, (HEAD, branch)) when this run reached its checkout phase, and the checkout it names.
 _run_start: Optional[tuple[list, tuple[str, str]]] = None
 _obligation_root: Optional[Path] = None
+# This run's stake in the shared host record (``owners``): disarm removes only this one.
+_owner: str = ""
 
 
 def _owns_live_checkout(root: Path) -> bool:
@@ -76,7 +78,9 @@ def arm_commit_obligations(root: Path, expected_sha: str) -> None:
     raises: nothing has moved yet, and moving without the obligation is exactly the
     tail-never-runs state this exists to prevent.
     """
-    global _armed_snapshot
+    global _armed_snapshot, _owner
+    import uuid
+
     from hermes_cli.update_cmd_fleet import _write_fleet_restart_pending_marker
     from hermes_cli.venv_sync import arm_completion
 
@@ -85,9 +89,10 @@ def arm_commit_obligations(root: Path, expected_sha: str) -> None:
         return
     if _armed_snapshot is None:
         _armed_snapshot = {path: _read_or_none(path) for path in _obligation_paths(root)}
+        _owner = f"{root}|{os.getpid()}|{uuid.uuid4().hex}"
     try:
         arm_completion(root)
-        owed = _write_fleet_restart_pending_marker(expected_sha=expected_sha or "")
+        owed = _write_fleet_restart_pending_marker(expected_sha=expected_sha or "", owner=_owner)
     finally:  # even a half-done arm: disarm must still recognise what this run wrote
         _armed_bytes.update({path: _read_or_none(path) for path in _armed_snapshot})
     if not owed:
@@ -111,11 +116,19 @@ def disarm_commit_obligations() -> None:
             if root is not None:
                 _owe_for(root, head)
             return
+    from hermes_cli.update_host_obligation import host_obligation_path, release_host_obligation
+
     snapshot, _armed_snapshot = _armed_snapshot, None
     armed = dict(_armed_bytes)
     _armed_bytes.clear()
+    host = host_obligation_path()
     for path, data in (snapshot or {}).items():
         try:
+            if path == host:
+                # Shared by every install of the OS user: same-SHA arms join one record, so bytes
+                # cannot tell whose it is; the ``owners`` stake can (review C2).
+                release_host_obligation(_owner)
+                continue
             if path not in armed or _read_or_none(path) != armed[path]:
                 continue  # rewritten since this run armed it (another install's update): theirs now
             if data is None:
@@ -127,6 +140,8 @@ def disarm_commit_obligations() -> None:
                 fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                 with os.fdopen(fd, "wb") as handle:
                     handle.write(data)
+                    handle.flush()
+                    os.fsync(handle.fileno())
                 os.replace(tmp, path)
         except OSError:
             pass  # an owed tail/restart left armed is a retry, never a lost obligation
@@ -456,7 +471,8 @@ def preflight_refusal(git_cmd, root: Path, target_ref: str, critical_files) -> s
 
 
 def reset_for_tests() -> None:
-    global _armed_snapshot, _run_start, _obligation_root
+    global _armed_snapshot, _run_start, _obligation_root, _owner
+    _owner = ""
     _armed_snapshot = None
     _armed_bytes.clear()
     _run_start = None
