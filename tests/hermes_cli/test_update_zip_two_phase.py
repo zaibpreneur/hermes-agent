@@ -287,6 +287,23 @@ def test_staging_restores_backup_when_dst_is_missing(tmp_path, monkeypatch):
     assert (live / "agent" / "version.txt").read_text() == "new"
     assert not [p for p in os.listdir(live) if "hermes-update" in p]
 
+def test_staging_restores_a_dangling_symlink_backup_instead_of_deleting_it(tmp_path):
+    """The leftover-backup restore tested ``exists()``: a dangling symlink backup (the only copy of a
+    tracked symlink entry) read as absent and the leftover sweep deleted it (review Z3)."""
+    live, new = tmp_path / "live", tmp_path / "new"
+    live.mkdir()
+    new.mkdir()
+    (new / "alpha").write_text("NEW")
+    backup = live / "alpha.hermes-update-old"
+    try:
+        backup.symlink_to("gone.txt")
+    except OSError:
+        pytest.skip("symlinks need privileges here")
+    update_cmd._stage_replacement(str(new / "alpha"), str(live / "alpha"))
+    assert (live / "alpha").is_symlink() and os.readlink(live / "alpha") == "gone.txt"
+    assert not os.path.lexists(backup)
+
+
 def test_commit_failure_plus_discard_leaves_no_staging_litter(tmp_path, monkeypatch):
     """Phase-2 failure must not orphan staging copies for unswapped entries.
 

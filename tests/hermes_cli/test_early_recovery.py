@@ -225,6 +225,39 @@ def test_zip_journal_publication_never_deletes_a_file_at_its_old_fixed_temp_name
     assert sorted(p.name for p in root.iterdir()) == sorted([er.ZIP_SWAP_JOURNAL, user.name])
 
 
+def _symlink_or_skip(link: Path, target: str) -> None:
+    try:
+        link.symlink_to(target)
+    except OSError:
+        pytest.skip("symlinks need privileges here")
+
+
+@pytest.mark.parametrize("kind", ["dangling-symlink", "live-symlink", "regular"])
+def test_an_interrupted_swap_restores_its_backup_by_entry_not_by_target(tmp_path, kind):
+    """A swap killed after it moved a tracked symlink aside and installed a regular file: recovery took
+    a DANGLING backup for "no backup" (exists() follows it), then deleted it and retired the journal
+    (review Z3). The entry itself comes back, type and target intact; regular/live controls too."""
+    root = tmp_path / "install"
+    root.mkdir()
+    (root / "target.txt").write_text("T", encoding="utf-8")
+    old = root / "alpha.hermes-update-old"
+    if kind == "regular":
+        old.write_text("OLD", encoding="utf-8")
+    else:
+        _symlink_or_skip(old, "gone.txt" if kind == "dangling-symlink" else "target.txt")
+    (root / "alpha").write_text("NEW", encoding="utf-8")
+    er.write_zip_swap_journal(root, "swapping", [["alpha", True]])
+
+    assert er.restore_interrupted_zip_swap(root) is True
+    alpha = root / "alpha"
+    if kind == "regular":
+        assert not alpha.is_symlink() and alpha.read_text(encoding="utf-8") == "OLD"
+    else:
+        assert alpha.is_symlink() and os.readlink(alpha) == ("gone.txt" if kind == "dangling-symlink" else "target.txt")
+    assert not os.path.lexists(old) and not (root / er.ZIP_SWAP_JOURNAL).exists()
+    assert (root / "target.txt").read_text(encoding="utf-8") == "T"
+
+
 @pytest.mark.parametrize("body", ["", "{not json", '{"phase": "swap", "entries": [["a.py", true]]}',
                                   '{"phase": "swapping", "entries": [["../a.py", true]]}', "read-error"])
 def test_an_unparsed_zip_journal_keeps_itself_and_every_backup(tmp_path, monkeypatch, body):

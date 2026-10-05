@@ -82,7 +82,7 @@ def _stage_replacement(src: str, dst: str) -> str:
     backup = f"{dst}.hermes-update-old"
     # A prior run may have died mid-swap leaving the backup as the ONLY copy. Restore it BEFORE
     # clearing leftovers, else deleting it then failing to stage (disk exhaustion) leaves a hole.
-    if not os.path.exists(dst) and os.path.exists(backup):
+    if not os.path.lexists(dst) and os.path.lexists(backup):  # a dangling symlink backup is still one (Z3)
         os.rename(backup, dst)
     # Fail closed: a leftover backup that survives would later be taken for this swap's own backup
     # (rollback and journal recovery put it back as the live entry).

@@ -809,6 +809,9 @@ def restore_interrupted_zip_swap(project_root: Path | None = None) -> bool:
         phase, entries = parsed
         changed = False
         failed = False
+        # Presence is the ENTRY's (lexists/lstat), never its target's: a dangling symlink backup is the
+        # only copy of a tracked symlink, not "no backup" (review Z3).
+        here = os.path.lexists
         for name, existed in reversed(entries):
             dst = root / name
             staging, old = Path(f"{dst}{_ZIP_STAGING_SUFFIX}"), Path(f"{dst}{_ZIP_OLD_SUFFIX}")
@@ -816,18 +819,18 @@ def restore_interrupted_zip_swap(project_root: Path | None = None) -> bool:
                 if phase == "swapping":
                     # Staging finished before this phase, so a backup now is the one the swap made
                     # from the old entry: it existed, whatever an older journal recorded.
-                    existed = existed or old.exists()
-                    if existed and old.exists():
+                    existed = existed or here(old)
+                    if existed and here(old):
                         if old.is_file() and not old.is_symlink() and not dst.is_dir():
                             os.replace(old, dst)  # a file entry never goes missing, not even here
                         else:
                             _drop_path(dst)
-                            os.rename(old, dst)
+                            os.rename(old, dst)  # moves a symlink itself, never its target
                         changed = True
-                    elif not existed and dst.exists() and not staging.exists():
+                    elif not existed and here(dst) and not here(staging):
                         _drop_path(dst)
                         changed = True
-                elif existed and not dst.exists() and old.exists():
+                elif existed and not here(dst) and here(old):
                     os.rename(old, dst)  # the backup is the only copy left
                     changed = True
                 # ``<old>.tmp``: a backup copy killed before its rename (no-hardlink file systems).
@@ -836,7 +839,14 @@ def restore_interrupted_zip_swap(project_root: Path | None = None) -> bool:
             except OSError as exc:
                 failed = True
                 print(f"⚠ Could not settle {name} after an interrupted ZIP update: {exc}", file=sys.stderr)
-        if failed:
+        # Retire the journal only on a verified terminal state, not an exception-free loop: no sibling
+        # (staging copy, backup, backup temp) left that only this journal could still explain.
+        siblings = (_ZIP_STAGING_SUFFIX, _ZIP_OLD_SUFFIX, _ZIP_OLD_SUFFIX + ".tmp")
+        unsettled = [name for name, _existed in entries if any(here(f"{root / name}{s}") for s in siblings)]
+        if failed or unsettled:
+            if unsettled and not failed:
+                print(f"⚠ The interrupted ZIP update left {', '.join(unsettled)} unsettled; its journal "
+                      f"{journal} stays and the next launch retries.", file=sys.stderr)
             return changed  # the journal stays: the next launch retries
         journal.unlink(missing_ok=True)
     if changed:
