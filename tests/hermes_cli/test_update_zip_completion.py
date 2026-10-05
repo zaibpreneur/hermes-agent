@@ -58,6 +58,7 @@ def zip_update(tmp_path, monkeypatch, isolated_source_completion):
         for name in ("new-entry/data", "tools/code.py", "apps/desktop/source.js",
                      "venv/keep", "node_modules/keep", ".env"):
             out.writestr("hermes-agent-main/" + name, "new")
+        out.comment = b"8192da90e0afb20010a1c2f5da83db305d05ac5a"  # git archive's commit identity
     # Only redirect transport: extraction, staging, dirty recheck and swap run.
     monkeypatch.setattr("urllib.request.urlretrieve", lambda url, dst: urlretrieve(archive.as_uri(), dst))
     monkeypatch.setattr(main, "PROJECT_ROOT", root)
@@ -461,3 +462,29 @@ def test_unpinned_zip_update_owes_the_restart_for_the_archive_commit(tmp_path, m
     assert (root / "payload.txt").read_text(encoding="utf-8-sig") == "new"
     assert armed == [sha]
     assert [request["expected_sha"] for request in completed] == [sha]
+
+
+@pytest.mark.parametrize(("comment", "pinned"), [
+    (b"", None), (b"main", None), (b"a" * 40, "c" * 40), (b"", "c" * 40)])
+def test_a_zip_that_does_not_name_its_commit_is_refused_before_the_swap(tmp_path, monkeypatch, comment, pinned):
+    """S4: the installed identity must come from the downloaded bytes (``git archive``'s ZIP comment).
+    No comment, a malformed one, or one naming another commit than the pinned target: no live rename,
+    no obligation armed, never an empty durable SHA."""
+    from hermes_cli import update_cmd_commit
+
+    root = tmp_path / "checkout"
+    root.mkdir()
+    (root / "payload.txt").write_text("old", encoding="utf-8")
+    archive = tmp_path / "source.zip"
+    with zipfile.ZipFile(archive, "w") as out:
+        out.writestr("hermes-agent-main/payload.txt", "new")
+        out.comment = comment
+    monkeypatch.setattr("urllib.request.urlretrieve", lambda url, dst: urlretrieve(archive.as_uri(), dst))
+    monkeypatch.setattr(main, "PROJECT_ROOT", root)
+    armed = []
+    monkeypatch.setattr(update_cmd_commit, "arm_commit_obligations", lambda _root, expected: armed.append(expected))
+    with pytest.raises(SystemExit) as error:
+        update_cmd_zip._download_and_swap_zip("main", "local fixture", pinned)
+    assert error.value.code == 1
+    assert (root / "payload.txt").read_text(encoding="utf-8") == "old"
+    assert armed == []

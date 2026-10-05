@@ -528,7 +528,7 @@ def _journaled_stage_and_swap(extracted: str, entries: list[str], root: Path, ta
 
 def _download_and_swap_zip(branch: str, zip_url: str, target_sha: str | None = None) -> Optional[str]:
     """Download the source ZIP for *branch* and two-phase swap it into the checkout; return the commit it
-    installed (``target_sha``, else the archive's own, else None).
+    installed: the archive's own, which must equal ``target_sha`` when one is pinned.
     ``sys.exit(1)`` on any failure; the install ends fully updated or fully rolled back.
     Two-phase: stage every entry (dirs AND top-level files) beside its target, then swap all in with
     same-filesystem renames, rolling back on failure — one-at-a-time replacement left a mixed, unbootable
@@ -542,11 +542,15 @@ def _download_and_swap_zip(branch: str, zip_url: str, target_sha: str | None = N
     try:
         zip_path = os.path.join(tmp_dir, f"hermes-agent-{branch}.zip")
         urlretrieve(zip_url, zip_path)
-        # An unpinned branch ZIP still names its commit; without it the restart debt is armed for ''
-        # and can never be proven discharged.
-        target_sha = target_sha or _archive_commit(zip_path)
         print("→ Extracting...")
         _extract_zip_safely(zip_path, tmp_dir)
+        # The installed identity comes from the downloaded bytes (``git archive``'s comment), pinned or
+        # not: without it the restart debt is armed for '' and can never be proven discharged (S4).
+        archived = _archive_commit(zip_path)
+        if archived is None or (target_sha and archived != target_sha):
+            raise ValueError(f"the archive names commit {archived or 'none'}, not "
+                             f"{target_sha or 'a full commit SHA'}; refusing to install unidentified bytes")
+        target_sha = archived
         extracted = _extracted_root(tmp_dir, branch)
         entries = [i for i in os.listdir(extracted) if i not in _ZIP_PRESERVED_TOP_LEVEL]
         project_root = str(_m().PROJECT_ROOT)
