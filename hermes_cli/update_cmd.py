@@ -980,6 +980,7 @@ def _rollback_if_pulled_syntax_error(git_cmd, pre_pull_sha, *, rollback_branch=N
             if rollback_result.stderr.strip():
                 print(f"    ({rollback_result.stderr.strip().splitlines()[0]})")
             if interrupted_pull_marker(root).is_file():
+                _commit.owe_restore_of(root, pre_pull_sha)
                 print(f"  The next `hermes` launch also finishes the rollback to {pre_pull_sha[:10]} on its own.")
     else:
         print("  Could not capture pre-pull SHA — recover manually with:")
@@ -1072,10 +1073,13 @@ def _pull_updates(
             raise  # Ctrl-C reached git too (same process group): the tree may be torn, keep the marker
         except BaseException:
             # git exited on its own (sys.exit on conflict/reset failure, a locked or read-only file):
-            # put back what it wrote; the marker stays until the tree is verified whole.
-            if (_commit.settle_failed_tree_move(_m().PROJECT_ROOT)
-                    and _capture_head_sha(git_cmd, _m().PROJECT_ROOT) == (pre_sync_sha or pre_pull_sha)):
+            # put back what it wrote; the marker stays until the tree is verified whole. Settled:
+            # handed back at the run's start, else owed for the HEAD it settled on; torn: owed for
+            # the commit the next launch's restore lands on.
+            if _commit.settle_failed_tree_move(_m().PROJECT_ROOT):
                 _commit.disarm_commit_obligations()
+            else:
+                _commit.owe_restore_of(_m().PROJECT_ROOT, pre_pull_sha)
             raise
         pull_marker.unlink(missing_ok=True)  # git exited 0: the tree is whole at the target
         if sync_upstream:
@@ -1133,6 +1137,7 @@ def _switch_branch_at_commit_point(git_cmd, branch, target_ref, *, pre, stash):
         if not target:
             if args is attempts[0][0]:
                 continue  # no local branch: only the -B form can land on it
+            _commit.disarm_commit_obligations()  # an earlier attempt's arm, its move settled
             return _git_run(git_cmd, args)  # unresolvable: git fails before touching the tree
         # Owe what this attempt lands on: a stop before CP1 must be dischargeable at *target*
         # (CP1 retargets the obligation before its own move).
@@ -1144,15 +1149,19 @@ def _switch_branch_at_commit_point(git_cmd, branch, target_ref, *, pre, stash):
         except KeyboardInterrupt:
             raise
         except BaseException:
-            _commit.settle_failed_tree_move(root)
+            if _commit.settle_failed_tree_move(root):
+                _commit.disarm_commit_obligations()
+            else:
+                _commit.owe_restore_of(root, pre)
             raise
         if result.returncode == 0:
             interrupted_pull_marker(root).unlink(missing_ok=True)  # git exited 0: whole at *target*
             return result
         if not _commit.settle_failed_tree_move(root):
+            _commit.owe_restore_of(root, pre)  # owed for what the next launch's restore lands on
             return result  # torn and unrestorable now: the marker stays for the next launch
-    if _capture_head_sha(git_cmd, root) == pre:
-        _commit.disarm_commit_obligations()
+    # Back at *pre*: handed back at the run's start commit, else re-owed for the HEAD it is on.
+    _commit.disarm_commit_obligations()
     return result
 
 

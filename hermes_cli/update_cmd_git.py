@@ -407,8 +407,12 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path, *, assume_yes: 
     # A tree move like the pull itself: the marker and the owed tail are armed before git writes,
     # and the just-fetched ref is merged (a second `git pull` fetch could move past the marker's target).
     from hermes_cli import update_cmd_commit as _commit
-    from hermes_cli._early_recovery import interrupted_pull_marker
+    from hermes_cli._early_recovery import interrupted_pull_marker, is_object_id
     pre = _git_stdout(git_cmd, ["rev-parse", "HEAD"], cwd)
+    if not is_object_id(pre):
+        # The marker's ``pre`` is what a killed move is restored to: never arm ``pre=``.
+        print("  ✗ Could not resolve HEAD. Skipping upstream sync.")
+        return False
     target = upstream  # the counted commit is the marker's target and the merge's (m2)
     refused = _commit.arm_commit_point(git_cmd, cwd, target, pre=pre, target=target, stash=None)
     try:
@@ -418,18 +422,17 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path, *, assume_yes: 
         if refused:
             raise subprocess.CalledProcessError(1, "merge", stderr=refused)  # no marker, no move
         run_git(git_cmd, ["merge", "--ff-only", upstream], cwd=cwd, check=True, **_no_prompt_git_kwargs())
-    except subprocess.CalledProcessError as exc:
+    except (OSError, subprocess.SubprocessError) as exc:  # CustodyRefused is an OSError; a timeout too
         if refused or _commit.settle_failed_tree_move(cwd):
-            # Back at ``pre``; that is still new code when the origin pull moved first: owe the
-            # restart for it again, not for ``target`` (disarm refuses then: it only hands
-            # obligations back at the run's start commit).
-            if pre and _git_stdout(git_cmd, ["rev-parse", "HEAD"], cwd) == pre:
-                with suppress(OSError):
-                    _commit.arm_commit_obligations(cwd, pre)
+            # Back at ``pre``; that is still new code when the origin pull moved first, and disarm
+            # then owes the restart for it instead of ``target`` (it hands obligations back only at
+            # the run's start commit).
             _commit.disarm_commit_obligations()
+        else:
+            _commit.owe_restore_of(cwd, pre)  # torn under its marker: the restore lands on ``pre``
         print("  ✗ Failed to pull from upstream. You may need to resolve conflicts manually.")
-        if exc.stderr:
-            print(f"    ({exc.stderr})")
+        if detail := (getattr(exc, "stderr", None) or ("" if isinstance(exc, subprocess.CalledProcessError) else str(exc))):
+            print(f"    ({detail})")
         return False
     interrupted_pull_marker(cwd).unlink(missing_ok=True)
     print("  ✓ Updated from upstream")

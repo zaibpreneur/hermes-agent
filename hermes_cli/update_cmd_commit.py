@@ -15,6 +15,7 @@ this run found them once the tree is verified at its pre-update commit again.
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import sys
@@ -35,6 +36,7 @@ from hermes_cli._early_recovery import (
 )
 from hermes_cli.update_custody import run_git
 
+logger = logging.getLogger("hermes_cli.update_cmd")
 # What this run found before it armed anything: {path: bytes or None}. None = nothing armed yet.
 _armed_snapshot: Optional[dict[Path, Optional[bytes]]] = None
 # What this run's latest arm left at each path: disarm hands back only records still exactly these.
@@ -95,15 +97,19 @@ def arm_commit_obligations(root: Path, expected_sha: str) -> None:
 def disarm_commit_obligations() -> None:
     """Restore both obligations to what this run found: the tree never left its pre-update commit.
 
-    Refused (obligations stay armed) unless HEAD is the commit this run STARTED from: a failed later
-    move (the upstream fork ff after a committed origin pull) is put back to a commit that is
-    already new code, and that tree still owes its tail.
+    Off the commit this run STARTED from nothing is handed back: a failed later move (CP1 refused
+    or failed after the CP0 branch switch, the upstream fork ff after the origin pull) settles on a
+    commit that is already new code, so the obligations are owed for THAT head instead of the
+    failed move's target, which the checkout does not contain and no restart could discharge.
     """
     global _armed_snapshot
     if _run_start is not None:
         git_cmd, (start_head, _branch) = _run_start
         root = Path(_obligation_root) if _obligation_root is not None else None
-        if root is None or not start_head or head_and_branch(git_cmd, root)[0] != start_head:
+        head = head_and_branch(git_cmd, root)[0] if root is not None else ""
+        if root is None or not start_head or head != start_head:
+            if root is not None:
+                _owe_for(root, head)
             return
     snapshot, _armed_snapshot = _armed_snapshot, None
     armed = dict(_armed_bytes)
@@ -126,6 +132,24 @@ def disarm_commit_obligations() -> None:
             pass  # an owed tail/restart left armed is a retry, never a lost obligation
 
 
+def owe_restore_of(root: Path, pre: str | None) -> None:
+    """A failed move left a torn tree under its marker: the next launch's restore puts ``pre`` back,
+    so the obligations name ``pre``, never the target the checkout will not hold."""
+    _owe_for(Path(root), pre or "")
+
+
+def _owe_for(root: Path, sha: str) -> None:
+    """Re-arm what this run armed for ``sha``, the commit the checkout is (or is restored) on."""
+    if _armed_snapshot is None or not is_object_id(sha):
+        return  # nothing armed by this run, or nothing names the code: keep what stands
+    try:
+        arm_commit_obligations(root, sha)
+    except OSError as exc:
+        logger.warning("Could not re-arm the update obligations for %s: %s", sha[:10], exc)
+        print(f"  ⚠ Could not record the restart this update still owes for {sha[:10]} ({exc}); "
+              "run `hermes gateway restart` once the update is done.", file=sys.stderr)
+
+
 def commit_obligations_armed() -> bool:
     return _armed_snapshot is not None
 
@@ -141,6 +165,11 @@ def arm_commit_point(git_cmd, root: Path, expected_sha: str, **move) -> str | No
         arm_tree_move(git_cmd, root, **move)
     except OSError as exc:
         disarm_commit_obligations()
+        head = head_and_branch(git_cmd, root)[0] if _run_start is not None else ""
+        if head and head != _run_start[1][0]:
+            # A later move (CP1 after the CP0 switch): THIS step moved nothing, an earlier one did.
+            return (f"could not arm the update ({exc}); this step changed nothing, but an earlier step "
+                    f"of this update already moved the checkout to {head[:10]}")
         return f"could not arm the update ({exc}); the checkout was not changed"
     return None
 

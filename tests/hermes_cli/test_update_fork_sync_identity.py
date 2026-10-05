@@ -138,3 +138,33 @@ def test_a_failed_upstream_sync_after_the_pull_owes_the_restart_for_the_pulled_c
         update_cmd_commit.reset_for_tests()
     assert _git(clone, "rev-parse", "HEAD") == commits[1]
     assert (read_host_obligation() or {}).get("expected_sha") == commits[1]
+
+
+def test_a_custody_refused_upstream_merge_after_the_pull_still_owes_the_pulled_commit(tmp_path, monkeypatch, capsys):
+    """A merge refused by custody (CustodyRefused, an OSError) used to escape ``except
+    CalledProcessError`` with the obligation naming c2, which the checkout at c1 never holds
+    (review C1): it must settle like any failed merge and owe the restart for c1."""
+    from hermes_cli import update_cmd_commit, update_custody
+    from hermes_cli.update_host_obligation import read_host_obligation
+
+    clone, commits = _fork_behind_upstream(tmp_path, monkeypatch)
+    update_cmd_commit.reset_for_tests()
+    _git(clone, "reset", "-q", "--hard", commits[0])
+    update_cmd_commit.record_run_start(["git"], clone)
+    update_cmd_commit.arm_commit_obligations(clone, commits[1])
+    _git(clone, "reset", "-q", "--hard", commits[1])  # the committed origin pull
+    real = update_custody.run_git
+
+    def merge_refused(git_cmd, args, *rest, **kw):
+        if args[:1] == ["merge"]:
+            raise update_custody.CustodyRefused(["git"], "access denied")
+        return real(git_cmd, args, *rest, **kw)
+
+    monkeypatch.setattr(update_custody, "run_git", merge_refused)
+    try:
+        assert _sync_with_upstream_if_needed(["git"], clone, assume_yes=True) is False
+    finally:
+        update_cmd_commit.reset_for_tests()
+    assert "process job (access denied)" in capsys.readouterr().out
+    assert _git(clone, "rev-parse", "HEAD") == commits[1]
+    assert (read_host_obligation() or {}).get("expected_sha") == commits[1]

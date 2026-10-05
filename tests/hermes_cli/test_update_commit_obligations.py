@@ -8,6 +8,8 @@ tree at its start commit. The host record is shared by every install of the OS u
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -105,3 +107,53 @@ def test_disarm_never_writes_through_a_planted_restore_alias(root, tmp_path):
 
     assert sentinel.read_text(encoding="utf-8-sig") == "PRECIOUS"
     assert not host.is_symlink() and host.read_text(encoding="utf-8-sig") == "ORIGINAL"
+
+
+def _git(cwd: Path, *args: str) -> str:
+    env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+           "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
+    return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True,
+                          encoding="utf-8", env=env).stdout.strip()
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_a_refused_pull_after_the_branch_switch_owes_the_head_the_switch_landed_on(tmp_path, monkeypatch):
+    """CP0 switched a parked feature branch (X) to main (A); CP1's arm for B then failed. The
+    obligation used to stay on B, which the checkout at A never contains, while disarm refused
+    (HEAD != X): an undischargeable debt (review C1). It must name A, and the refusal must not
+    claim the checkout was untouched."""
+    import hermes_cli.main as hermes_main
+    from hermes_cli import update_cmd
+    from hermes_cli._early_recovery import interrupted_pull_marker
+    from hermes_cli.update_host_obligation import read_host_obligation
+
+    up, clone = tmp_path / "up", tmp_path / "clone"
+    up.mkdir()
+    _git(up, "init", "-q", "-b", "main")
+    (up / "f").write_text("A", encoding="utf-8")
+    _git(up, "add", "-A")
+    _git(up, "commit", "-qm", "A")
+    a = _git(up, "rev-parse", "HEAD")
+    _git(tmp_path, "clone", "-q", str(up), str(clone))
+    _git(clone, "checkout", "-q", "-b", "feat")
+    (clone / "g").write_text("X", encoding="utf-8")
+    _git(clone, "add", "-A")
+    _git(clone, "commit", "-qm", "X")
+    x = _git(clone, "rev-parse", "HEAD")
+    (up / "f").write_text("B", encoding="utf-8")
+    _git(up, "commit", "-qam", "B")
+    b = _git(up, "rev-parse", "HEAD")
+    _git(clone, "fetch", "-q", "origin")
+    monkeypatch.setattr(hermes_main, "PROJECT_ROOT", clone)
+    monkeypatch.setattr(commit, "_owns_live_checkout", lambda _root: False)
+    monkeypatch.chdir(clone)
+
+    commit.record_run_start(["git"], clone)
+    switched = update_cmd._switch_branch_at_commit_point(["git"], "main", "origin/main", pre=x, stash=None)
+    assert switched.returncode == 0 and _git(clone, "rev-parse", "HEAD") == a
+    interrupted_pull_marker(clone).mkdir()  # CP1's marker cannot be written
+    reason = commit.arm_commit_point(["git"], clone, b, pre=a, target=b, stash=None)
+
+    assert reason and "the checkout was not changed" not in reason and a[:10] in reason
+    assert (read_host_obligation() or {}).get("expected_sha") == a
