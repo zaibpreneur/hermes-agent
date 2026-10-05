@@ -70,3 +70,42 @@ def test_a_local_branch_named_upstream_main_never_changes_what_the_sync_counts_o
     # The deferred fork push checks HEAD against the same remote-tracking commit, not the shadow.
     _push_synced_fork(["git"], clone)
     assert _git(origin, "rev-parse", "refs/heads/main") == commits[2]
+
+
+def _fork_behind_upstream(tmp_path, monkeypatch):
+    """A fork clone at c1 (origin/main) whose fetched upstream/main is c2; returns (clone, commits)."""
+    for name, value in _env(tmp_path).items():
+        if name.startswith("GIT_") or name == "HOME":
+            monkeypatch.setenv(name, value)
+    upstream = tmp_path / "upstream"
+    upstream.mkdir()
+    _git(upstream, "init", "-q", "-b", "main")
+    commits = []
+    for i in range(3):
+        (upstream / "f.txt").write_text(f"{i}\n", encoding="utf-8")
+        _git(upstream, "add", "f.txt")
+        _git(upstream, "commit", "-qm", f"c{i}")
+        commits.append(_git(upstream, "rev-parse", "HEAD"))
+    origin = tmp_path / "origin.git"
+    _git(tmp_path, "clone", "-q", "--bare", str(upstream), str(origin))
+    _git(origin, "update-ref", "refs/heads/main", commits[1])
+    clone = tmp_path / "clone"
+    _git(tmp_path, "clone", "-q", str(origin), str(clone))
+    _git(clone, "remote", "add", "upstream", str(upstream))
+    return clone, commits
+
+
+def test_an_upstream_sync_whose_marker_cannot_be_written_never_moves_the_tree(tmp_path, monkeypatch):
+    """The fork fast-forward is a tree move like the pull: no marker, no merge (F24)."""
+    from hermes_cli import update_cmd_commit
+    from hermes_cli._early_recovery import interrupted_pull_marker
+
+    clone, commits = _fork_behind_upstream(tmp_path, monkeypatch)
+    update_cmd_commit.reset_for_tests()
+    interrupted_pull_marker(clone).mkdir()
+    try:
+        assert _sync_with_upstream_if_needed(["git"], clone, assume_yes=True) is False
+    finally:
+        update_cmd_commit.reset_for_tests()
+    assert _git(clone, "rev-parse", "HEAD") == commits[1]
+    assert _git(clone, "status", "--porcelain", "--untracked-files=no") == ""

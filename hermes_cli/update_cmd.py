@@ -28,7 +28,7 @@ from hermes_cli.update_channel import adopt_retired_channel
 from pm.receipt import accept_worker_receipt as _accept_completion_pm_receipt
 from hermes_cli import update_receipt as _completion_receipt, update_cmd_config as _completion_config
 from hermes_cli._old_updater import stop_for_relaunch
-from hermes_cli._early_recovery import git_operation_in_progress, interrupted_pull_marker
+from hermes_cli._early_recovery import git_operation_in_progress, interrupted_pull_marker, is_object_id
 from hermes_cli import update_cmd_commit as _commit
 from hermes_cli import update_cmd_check as _check
 
@@ -933,9 +933,12 @@ def _rollback_if_pulled_syntax_error(git_cmd, pre_pull_sha, *, rollback_branch=N
         # ``rollback=`` lets it redo the HEAD step when the kill came before it.
         mode = "branch" if rollback_branch is None else "detach"
         target_sha = _capture_head_sha(git_cmd, root)
-        with _best_effort('Could not write the interrupted-pull marker: %s'):
-            _commit.arm_tree_move(git_cmd, root, pre=pre_pull_sha, target=target_sha,
-                                  stash=None, rollback=mode)
+        try:
+            _commit.arm_tree_move(git_cmd, root, pre=pre_pull_sha, target=target_sha, stash=None, rollback=mode)
+        except OSError as exc:
+            # Refusing would leave the broken tree in place: roll back unmarked, and only a tree
+            # verified whole at pre_pull_sha below may report success (else the manual recipe).
+            print(f"  ⚠ Could not write the interrupted-pull marker ({exc}); rolling back without it.")
         added = _commit.files_added_by(git_cmd, root, pre_pull_sha, target_sha)
         if mode == "detach":  # never move the update branch onto a parked/detached commit
             rollback_args = ["update-ref", "--no-deref", "HEAD", pre_pull_sha]
@@ -1008,20 +1011,27 @@ def _pull_updates(
     pull_marker = interrupted_pull_marker(_m().PROJECT_ROOT)
     # A release update moves the tree to its tag, not the branch tip: the marker names what git writes.
     merge_ref = target_ref if target_ref is not None else f"origin/{branch}"
-    target_sha = (_git_run(git_cmd, ["rev-parse", f"{merge_ref}^{{commit}}"]).stdout or "").strip()
-    movement_baseline = _update_movement_baseline(
-        git_cmd, pre_pull_sha, pre_sync_sha, rollback_branch, target_sha)
-    if expected_sha and target_sha and target_sha != expected_sha:
-        # Channel verification is a precondition: refuse before anything moves.
-        print(f"✗ {merge_ref} resolves to {target_sha[:10]}, not the selected channel commit "
-              f"{expected_sha[:10]}. No update was applied.")
-        sys.exit(1)
-    # The commit point: the tail and the fleet restart are owed BEFORE git writes a file.
-    _commit.arm_commit_obligations(_m().PROJECT_ROOT, target_sha)
-    with _best_effort('Could not write the interrupted-pull marker: %s'):
-        _commit.arm_tree_move(git_cmd, _m().PROJECT_ROOT, pre=pre_pull_sha, target=target_sha,
-                              stash=auto_stash_ref)
+    # Every refusal below runs inside the try: its finally names the autostash this run took.
     try:
+        target_sha = (_git_run(git_cmd, ["rev-parse", "-q", "--verify", f"{merge_ref}^{{commit}}"]).stdout
+                      or "").strip()
+        if not is_object_id(target_sha):
+            # The marker must name the commit git moves to, or a killed move is unrecoverable.
+            print(f"✗ Could not resolve {merge_ref} to a commit. No update was applied.")
+            sys.exit(1)
+        movement_baseline = _update_movement_baseline(
+            git_cmd, pre_pull_sha, pre_sync_sha, rollback_branch, target_sha)
+        if expected_sha and target_sha != expected_sha:
+            # Channel verification is a precondition: refuse before anything moves.
+            print(f"✗ {merge_ref} resolves to {target_sha[:10]}, not the selected channel commit "
+                  f"{expected_sha[:10]}. No update was applied.")
+            sys.exit(1)
+        # The commit point: the tail, the fleet restart and the marker are durable BEFORE git writes.
+        refused = _commit.arm_commit_point(git_cmd, _m().PROJECT_ROOT, target_sha, pre=pre_pull_sha,
+                                           target=target_sha, stash=auto_stash_ref)
+        if refused:
+            print(f"✗ {refused}.")
+            sys.exit(1)
         try:
             # merge --ff-only the already-fetched ref instead of `git pull`, which would do a
             # SECOND network fetch; identical in effect given the fresh tracking ref.
@@ -1118,9 +1128,10 @@ def _switch_branch_at_commit_point(git_cmd, branch, target_ref, *, pre, stash):
             if args is attempts[0][0]:
                 continue  # no local branch: only the -B form can land on it
             return _git_run(git_cmd, args)  # unresolvable: git fails before touching the tree
-        _commit.arm_commit_obligations(root, resolve(target_ref) or target)
-        with _best_effort('Could not write the interrupted-pull marker: %s'):
-            _commit.arm_tree_move(git_cmd, root, pre=pre, target=target, stash=stash)
+        refused = _commit.arm_commit_point(git_cmd, root, resolve(target_ref) or target, pre=pre, target=target,
+                                           stash=stash)
+        if refused:  # nothing moved: the caller restores the autostash and exits
+            return subprocess.CompletedProcess(args, 1, "", refused)
         try:
             result = _git_run(git_cmd, args)
         except KeyboardInterrupt:

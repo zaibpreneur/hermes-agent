@@ -610,3 +610,97 @@ def test_a_refusal_whose_holder_exits_before_the_probe_retries_the_lock(tmp_path
         assert held is not None and held["path"] == str(update_lock.checkout_lock_path(root)), \
             "the repair ran without the checkout lock"
     assert update_lock._HELD is None and len(calls) == 2
+
+
+@pytest.fixture
+def commit_point():
+    from hermes_cli import update_cmd_commit as commit
+
+    commit.reset_for_tests()
+    yield commit
+    commit.reset_for_tests()
+
+
+def _unmovable(root: Path, a: str) -> None:
+    assert _git(root, "rev-parse", "HEAD") == a
+    assert _git(root, "status", "--porcelain", "--untracked-files=no") == ""
+
+
+def test_a_pull_whose_marker_cannot_be_written_never_moves_the_tree(checkout, commit_point):
+    """No recovery marker, no move: a kill inside an unmarked merge leaves a torn tree no launch
+    can identify (F23, F17)."""
+    root, a, _b = checkout
+    er.interrupted_pull_marker(root).mkdir()  # EISDIR stands in for ENOSPC/EROFS/a sharing violation
+
+    with pytest.raises(SystemExit):
+        _pull(root)
+
+    _unmovable(root, a)
+    assert not commit_point.commit_obligations_armed()
+
+
+def test_a_pull_whose_target_does_not_resolve_never_moves_the_tree(checkout, commit_point, monkeypatch):
+    """The marker must name the commit git moves to; an unresolved target is refused (F17)."""
+    root, a, _b = checkout
+    real = update_cmd._git_run
+
+    def no_rev_parse(git_cmd, args, *rest, **kw):
+        if args[:1] == ["rev-parse"] and any("origin/main" in arg for arg in args):
+            return subprocess.CompletedProcess(args, 128, "", "fatal: ambiguous argument")
+        return real(git_cmd, args, *rest, **kw)
+
+    monkeypatch.setattr(update_cmd, "_git_run", no_rev_parse)
+    with pytest.raises(SystemExit):
+        _pull(root)
+
+    _unmovable(root, a)
+
+
+def test_an_arm_failure_after_the_autostash_still_names_the_stash(checkout, commit_point, monkeypatch, capsys):
+    """An unwritable install state refuses the pull; the user is still told where their work is (F29)."""
+    root, _a, _b = checkout
+
+    def unwritable(*_args, **_kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(commit_point, "arm_commit_obligations", unwritable)
+    with pytest.raises((SystemExit, OSError)):
+        update_cmd._pull_updates(["git"], "main", "stash@{0}", prompt_for_restore=False, gw_input_fn=None,
+                                 discard_local_changes=False, keep_stash=False)
+
+    assert "stash@{0}" in capsys.readouterr().out
+
+
+def test_a_branch_switch_whose_marker_cannot_be_written_never_starts(checkout, commit_point):
+    """CP0 is a tree move like the pull: no marker, no checkout (F22)."""
+    root, a, _b = checkout
+    _git(root, "checkout", "-q", "-b", "feat")
+    er.interrupted_pull_marker(root).mkdir()
+
+    result = update_cmd._switch_branch_at_commit_point(["git"], "main", "origin/main", pre=a, stash=None)
+
+    assert result.returncode != 0
+    _unmovable(root, a)
+    assert _git(root, "rev-parse", "--abbrev-ref", "HEAD") == "feat"
+
+
+def test_an_unmarked_rollback_that_fails_never_reports_the_install_unchanged(checkout, commit_point, monkeypatch, capsys):
+    """The syntax rollback cannot refuse (the tree is already broken), but without a marker only a
+    tree verified whole at pre may be reported restored (F25)."""
+    root, a, b = checkout
+    _git(root, "reset", "-q", "--hard", b)
+    er.interrupted_pull_marker(root).mkdir()
+    monkeypatch.setattr(update_cmd, "_validate_critical_files_syntax", lambda _root: (False, "utils.py", "SyntaxError"))
+    real = update_cmd._git_run
+
+    def hard_reset_fails(git_cmd, args, *rest, **kw):
+        if args[:2] == ["reset", "--hard"]:
+            return subprocess.CompletedProcess(args, 1, "", "error: unable to unlink utils.py")
+        return real(git_cmd, args, *rest, **kw)
+
+    monkeypatch.setattr(update_cmd, "_git_run", hard_reset_fails)
+    with pytest.raises(SystemExit):
+        update_cmd._rollback_if_pulled_syntax_error(["git"], a)
+
+    out = capsys.readouterr().out
+    assert "Rollback complete" not in out and "Recover manually" in out

@@ -129,6 +129,21 @@ def commit_obligations_armed() -> bool:
     return _armed_snapshot is not None
 
 
+def arm_commit_point(git_cmd, root: Path, expected_sha: str, **move) -> str | None:
+    """Arm the obligations, then the tree-move marker (``arm_tree_move(**move)``): no marker, no move.
+
+    ``None`` when both are durable; otherwise why not, with the obligations handed back
+    (``disarm_commit_obligations``), and the caller must stop before git writes a file.
+    """
+    try:
+        arm_commit_obligations(root, expected_sha)
+        arm_tree_move(git_cmd, root, **move)
+    except OSError as exc:
+        disarm_commit_obligations()
+        return f"could not arm the update ({exc}); the checkout was not changed"
+    return None
+
+
 def arm_tree_move(git_cmd, root: Path, *, pre: str | None, target: str, stash: str | None,
                   rollback: str | None = None) -> Path:
     """Write the interrupted-pull marker for one git tree move (pre -> target).
@@ -277,8 +292,11 @@ def settle_failed_tree_move(root: Path) -> bool:
     True when the tree is verified whole again (at the pre-move commit, or at the target when git got
     there anyway); False leaves the marker for the next launch's ``restore_interrupted_pull``.
     """
+    marker = interrupted_pull_marker(Path(root))
+    if not marker.is_file():
+        return False  # no marker names the move: its absence proves nothing about the tree
     restore_interrupted_pull(Path(root), after_failure=True)
-    return not interrupted_pull_marker(Path(root)).is_file()
+    return not marker.is_file()
 
 
 def requires_other_python(pyproject: bytes | str | None) -> bool:

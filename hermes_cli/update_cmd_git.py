@@ -410,20 +410,22 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path, *, assume_yes: 
     from hermes_cli._early_recovery import interrupted_pull_marker
     pre = _git_stdout(git_cmd, ["rev-parse", "HEAD"], cwd)
     target = upstream  # the counted commit is the marker's target and the merge's (m2)
-    _commit.arm_commit_obligations(cwd, target)
-    with suppress(OSError):
-        _commit.arm_tree_move(git_cmd, cwd, pre=pre, target=target, stash=None)
+    refused = _commit.arm_commit_point(git_cmd, cwd, target, pre=pre, target=target, stash=None)
     try:
         # The fetch above already brought upstream/main: a local fast-forward (no network, so no
         # credential helper is started under the checkout lock fd a mutator inherits) to the
         # very commit counted above.
+        if refused:
+            raise subprocess.CalledProcessError(1, "merge", stderr=refused)  # no marker, no move
         run_git(git_cmd, ["merge", "--ff-only", upstream], cwd=cwd, check=True, **_no_prompt_git_kwargs())
-    except subprocess.CalledProcessError:
-        if _commit.settle_failed_tree_move(cwd):
+    except subprocess.CalledProcessError as exc:
+        if refused or _commit.settle_failed_tree_move(cwd):
             # Back at ``pre``; that is still new code when the origin pull moved first, and
             # disarm refuses then (it only hands obligations back at the run's start commit).
             _commit.disarm_commit_obligations()
         print("  ✗ Failed to pull from upstream. You may need to resolve conflicts manually.")
+        if exc.stderr:
+            print(f"    ({exc.stderr})")
         return False
     interrupted_pull_marker(cwd).unlink(missing_ok=True)
     print("  ✓ Updated from upstream")
