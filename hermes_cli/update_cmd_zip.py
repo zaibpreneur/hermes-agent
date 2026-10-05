@@ -83,7 +83,7 @@ def _stage_replacement(src: str, dst: str) -> str:
         os.rename(backup, dst)
     # Fail closed: a leftover backup that survives would later be taken for this swap's own backup
     # (rollback and journal recovery put it back as the live entry).
-    for leftover in (staging, backup):
+    for leftover in (staging, backup, f"{backup}.tmp"):
         _drop_path(Path(leftover))
         if os.path.lexists(leftover):
             raise OSError(f"could not remove the leftover {leftover}")
@@ -113,6 +113,23 @@ def _hardlink_backup(path: str, backup: str) -> bool:
     return True
 
 
+def _file_backup(path: str, backup: str) -> None:
+    """Back up the regular file ``path`` as a complete ``backup`` while ``path`` stays in place: a hardlink,
+    or where links are unsupported (FAT32/exFAT/SMB) a synced copy landed whole by ``os.replace``."""
+    if _hardlink_backup(path, backup):
+        return
+    tmp = f"{backup}.tmp"
+    try:
+        shutil.copy2(path, tmp)
+        with open(tmp, "rb+") as handle:
+            os.fsync(handle.fileno())
+        os.replace(tmp, backup)
+    except OSError:
+        with suppress(OSError):
+            os.remove(tmp)
+        raise
+
+
 def _commit_staged_replacements(staged, *, on_committed=None) -> None:
     """Phase 2: swap every staged entry into place, rolling back all on failure.
 
@@ -125,8 +142,9 @@ def _commit_staged_replacements(staged, *, on_committed=None) -> None:
     ``_atomic_replace_dir`` makes each *individual* directory swap safe, but the ZIP update replaces ~90
     top-level entries in a loop, and nothing made the loop atomic *as a whole*. See #63717, #76091, #76104.
 
-    A plain file is never absent, not even for one rename: its backup is a hardlink and ``os.replace``
-    lands the new bytes over it (a filesystem without hardlinks keeps the move-aside). The root modules every launcher imports first
+    A plain file is never absent, not even for one rename: its backup is a hardlink (or, without
+    hardlinks, a complete copy) and ``os.replace`` lands the new bytes over it; only directories move
+    aside. The root modules every launcher imports first
     (``hermes_constants``, ``hermes_bootstrap``) therefore always import, and ``hermes_bootstrap`` runs the
     journal-driven restore even while a killed swap left a directory (``hermes_cli/`` included) moved aside.
     """
@@ -134,7 +152,8 @@ def _commit_staged_replacements(staged, *, on_committed=None) -> None:
     try:
         for staging, dst in staged:
             backup = f"{dst}.hermes-update-old"
-            if os.path.isfile(dst) and not os.path.islink(dst) and _hardlink_backup(dst, backup):
+            if os.path.isfile(dst) and not os.path.islink(dst):
+                _file_backup(dst, backup)
                 swapped.append((dst, backup))
                 os.replace(staging, dst)
                 continue

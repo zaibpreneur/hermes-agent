@@ -329,10 +329,16 @@ def test_commit_failure_plus_discard_leaves_no_staging_litter(tmp_path, monkeypa
     assert litter == [], f"orphaned update litter: {litter}"
 
 
-def test_root_files_never_go_missing_mid_swap(tmp_path, monkeypatch):
+@pytest.mark.parametrize("hardlinks", [True, False])
+def test_root_files_never_go_missing_mid_swap(tmp_path, monkeypatch, hardlinks):
     """Every launcher imports ``hermes_constants``/``hermes_bootstrap`` before anything else, and
     ``hermes_bootstrap`` is what reaches the restore after a killed swap: a kill between any two
-    filesystem steps must find every root file present (old or new bytes), only directories moved."""
+    filesystem steps must find every root file present (old or new bytes), only directories moved.
+    That holds on filesystems without hardlinks too (FAT32/exFAT/SMB)."""
+    if not hardlinks:
+        def no_link(*_a, **_k):
+            raise OSError(1, "Operation not permitted")
+        monkeypatch.setattr(update_cmd_zip.os, "link", no_link)
     live, new = tmp_path / "live", tmp_path / "new"
     for side, text in ((live, "old"), (new, "new")):
         (side / "hermes_cli").mkdir(parents=True)
