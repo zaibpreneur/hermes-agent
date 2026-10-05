@@ -211,6 +211,20 @@ def test_zip_journal_writer_never_writes_through_a_preexisting_temp(tmp_path, li
     assert not journal.is_symlink() and '"phase": "staging"' in journal.read_text(encoding="utf-8-sig")
 
 
+def test_zip_journal_publication_never_deletes_a_file_at_its_old_fixed_temp_name(tmp_path):
+    """The writer unlinked ``.hermes-update-zip-swap.tmp`` before its exclusive create: a user's file by
+    that name was erased (review Z5). Its temp is now unpredictable: the file survives, byte for byte."""
+    root = tmp_path / "install"
+    root.mkdir()
+    user = root / (er.ZIP_SWAP_JOURNAL + ".tmp")
+    user.write_text("USER NOTES\n", encoding="utf-8")
+    er.write_zip_swap_journal(root, "staging", [["a.py", True]])
+    er.write_zip_swap_journal(root, "swapping", [["a.py", True]])
+    assert user.read_text(encoding="utf-8-sig") == "USER NOTES\n"
+    assert '"phase": "swapping"' in (root / er.ZIP_SWAP_JOURNAL).read_text(encoding="utf-8-sig")
+    assert sorted(p.name for p in root.iterdir()) == sorted([er.ZIP_SWAP_JOURNAL, user.name])
+
+
 @pytest.mark.parametrize("body", ["", "{not json", '{"phase": "swap", "entries": [["a.py", true]]}',
                                   '{"phase": "swapping", "entries": [["../a.py", true]]}', "read-error"])
 def test_an_unparsed_zip_journal_keeps_itself_and_every_backup(tmp_path, monkeypatch, body):

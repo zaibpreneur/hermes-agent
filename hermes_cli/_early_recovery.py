@@ -695,21 +695,26 @@ def zip_swap_owner_lock(root: Path, *, wait: float = 0.0):
 def write_zip_swap_journal(root: Path, phase: str, entries: list) -> None:
     import json
 
-    journal = Path(root) / ZIP_SWAP_JOURNAL
-    write_durable_text(journal, json.dumps({"pid": os.getpid(), "phase": phase, "entries": entries}),
-                       tmp=journal.with_name(journal.name + ".tmp"))
+    write_durable_text(Path(root) / ZIP_SWAP_JOURNAL,
+                       json.dumps({"pid": os.getpid(), "phase": phase, "entries": entries}))
 
 
-def write_durable_text(path: Path, text: str, *, tmp: Path | None = None) -> None:
+def write_durable_text(path: Path, text: str) -> None:
     """``text`` at ``path`` as one durable record, never a half-written one.
 
-    A fresh inode every time: writing into a pre-existing temp would follow its symlink or hardlink
-    onto another file (.env). fsync before the rename: an empty record over a mixed tree is no record.
-    The default temp name carries the pid, so two writers never unlink each other's temp.
+    The temp is an unpredictable name created exclusively (no-follow) beside ``path``: a pre-existing
+    name there is never written through (its symlink or hardlink would carry the record onto another
+    file) and never deleted (it may be a user's file: review Z5). fsync before the rename: an empty
+    record over a mixed tree is no record.
     """
-    tmp = tmp if tmp is not None else path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    tmp.unlink(missing_ok=True)
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    while True:
+        tmp = path.with_name(f"{path.name}.{os.urandom(6).hex()}.tmp")
+        try:
+            fd = os.open(tmp, flags, 0o644)
+            break
+        except FileExistsError:
+            continue  # 48 random bits taken: draw again, never reuse the name
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(text)

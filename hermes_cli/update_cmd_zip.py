@@ -24,8 +24,11 @@ _ZIP_STAGING_ARTIFACT_SUFFIXES = ".hermes-update-staging", ".hermes-update-old"
 # Hermes' own root breadcrumbs: the swap journal + its owner lock, and the update/refresh markers.
 # They are never user work, so the dirty-tree guard must not refuse (and wedge) on them.
 _ZIP_HERMES_ROOT_ARTIFACTS = frozenset({
-    ".hermes-update-zip-swap", ".hermes-update-zip-swap.lock", ".hermes-update-zip-swap.tmp",
-    ".update-incomplete", ".lazy-refresh-incomplete"})
+    ".hermes-update-zip-swap", ".hermes-update-zip-swap.lock", ".update-incomplete", ".lazy-refresh-incomplete"})
+# A journal temp a killed writer left (``write_durable_text``'s unpredictable name). The swap never
+# touches it (no ZIP ships it) and nothing deletes it, so admitting it risks no user bytes. A file at
+# the old fixed ``.hermes-update-zip-swap.tmp`` name is no longer Hermes': it blocks (review Z5).
+_ZIP_JOURNAL_TEMP = re.compile(r"\.hermes-update-zip-swap\.[0-9a-f]{12}\.tmp")
 
 # Single source of truth for entries the ZIP swap preserves — used by the dirty-tree filter and the swap loop.
 _ZIP_PRESERVED_TOP_LEVEL = {"venv", ".venv", "node_modules", ".git", ".env"}
@@ -270,7 +273,8 @@ def _is_zip_staging_artifact_status_line(line: str, staged: Collection[str] = ()
     entry this run staged. Any other ``*.hermes-update-staging``/``-old`` may be a user's file (a manual
     ``cp -r tools tools.hermes-update-old``) that staging would delete, so it blocks."""
     top = _status_top_level(line[3:] if len(line) >= 3 else line)
-    return top in _ZIP_HERMES_ROOT_ARTIFACTS or top in {item + _ZIP_STAGING_ARTIFACT_SUFFIXES[0] for item in staged}
+    return (top in _ZIP_HERMES_ROOT_ARTIFACTS or bool(_ZIP_JOURNAL_TEMP.fullmatch(top))
+            or top in {item + _ZIP_STAGING_ARTIFACT_SUFFIXES[0] for item in staged})
 
 
 def _abort_zip_update_if_dirty_tree() -> None:

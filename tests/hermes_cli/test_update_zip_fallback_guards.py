@@ -318,6 +318,19 @@ def test_zip_gate_refuses_and_keeps_a_user_file_named_like_an_update_artifact(tm
     assert (tmp_path / name).read_text(encoding="utf-8-sig") == "PRECIOUS USER BYTES"
 
 
+def test_zip_gate_refuses_on_a_user_file_at_the_old_fixed_journal_temp_name(tmp_path, monkeypatch):
+    """The gate exempted ``.hermes-update-zip-swap.tmp`` as Hermes' own before any journal existed, and
+    the journal writer then deleted it (review Z5). Only the writer's unpredictable temp is exempt now."""
+    _git_install(tmp_path)
+    user = tmp_path / ".hermes-update-zip-swap.tmp"
+    user.write_text("USER NOTES", encoding="utf-8")
+    monkeypatch.setattr(hermes_main, "PROJECT_ROOT", tmp_path)
+    with pytest.raises(SystemExit) as exc_info:
+        update_cmd._abort_zip_update_if_dirty_tree()
+    assert exc_info.value.code == 1 and user.read_text(encoding="utf-8-sig") == "USER NOTES"
+    assert update_cmd._is_zip_staging_artifact_status_line("?? .hermes-update-zip-swap.0123456789ab.tmp")
+
+
 def test_zip_gate_admits_the_retry_after_an_interrupted_swap(tmp_path, monkeypatch):
     """The siblings an interrupted swap's journal owns never refuse the retry: they are settled first."""
     from hermes_cli._early_recovery import ZIP_SWAP_JOURNAL, write_zip_swap_journal
