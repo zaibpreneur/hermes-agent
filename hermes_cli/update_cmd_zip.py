@@ -309,6 +309,14 @@ def _extract_zip_safely(zip_path: str, tmp_dir: str) -> None:
         zf.extractall(tmp_dir)
 
 
+def _archive_commit(zip_path: str) -> Optional[str]:
+    """The commit a GitHub archive was made from: ``git archive`` stores it as the ZIP comment."""
+    import zipfile
+    with zipfile.ZipFile(zip_path) as zf:
+        comment = zf.comment.decode("ascii", "replace").strip()
+    return comment if re.fullmatch(r"[0-9a-f]{40}", comment) else None
+
+
 def _extracted_root(tmp_dir: str, branch: str) -> str:
     """GitHub ZIPs extract to ``hermes-agent-<branch>/``; fall back to the first non-``__MACOSX`` dir."""
     extracted = os.path.join(tmp_dir, f"hermes-agent-{branch}")
@@ -458,8 +466,9 @@ def _journaled_stage_and_swap(extracted: str, entries: list[str], root: Path, ta
     return staged
 
 
-def _download_and_swap_zip(branch: str, zip_url: str, target_sha: str | None = None) -> None:
-    """Download the source ZIP for *branch* and two-phase swap it into the checkout.
+def _download_and_swap_zip(branch: str, zip_url: str, target_sha: str | None = None) -> Optional[str]:
+    """Download the source ZIP for *branch* and two-phase swap it into the checkout; return the commit it
+    installed (``target_sha``, else the archive's own, else None).
     ``sys.exit(1)`` on any failure; the install ends fully updated or fully rolled back.
     Two-phase: stage every entry (dirs AND top-level files) beside its target, then swap all in with
     same-filesystem renames, rolling back on failure — one-at-a-time replacement left a mixed, unbootable
@@ -473,6 +482,9 @@ def _download_and_swap_zip(branch: str, zip_url: str, target_sha: str | None = N
     try:
         zip_path = os.path.join(tmp_dir, f"hermes-agent-{branch}.zip")
         urlretrieve(zip_url, zip_path)
+        # An unpinned branch ZIP still names its commit; without it the restart debt is armed for ''
+        # and can never be proven discharged.
+        target_sha = target_sha or _archive_commit(zip_path)
         print("→ Extracting...")
         _extract_zip_safely(zip_path, tmp_dir)
         extracted = _extracted_root(tmp_dir, branch)
@@ -481,6 +493,7 @@ def _download_and_swap_zip(branch: str, zip_url: str, target_sha: str | None = N
         _require_staging_space(extracted, entries, project_root)
         staged = _journaled_stage_and_swap(extracted, entries, Path(project_root), target_sha)
         print(f"✓ Updated {len(staged)} items from ZIP")
+        return target_sha
     except Exception as e:
         # The swap rolled itself back; a rollback that could not finish leaves the journal, which
         # this settles now (or the next launch's _early_recovery does) instead of leaking siblings.
@@ -531,8 +544,8 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False,
     if (not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository)
             or any(part in (".", "..") for part in repository.split("/"))):
         raise ValueError("ZIP update requires a GitHub owner/repository")
-    _download_and_swap_zip(branch, f"https://github.com/{repository}/archive/{ref}.zip", target_sha)
-    completion_request["expected_sha"] = target_sha
+    installed = _download_and_swap_zip(branch, f"https://github.com/{repository}/archive/{ref}.zip", target_sha)
+    completion_request["expected_sha"] = installed or target_sha
     completion_request["apply_mode"] = "zip"
     _complete_source_update(completion_request)
     return True

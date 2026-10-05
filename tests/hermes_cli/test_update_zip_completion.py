@@ -435,3 +435,28 @@ def test_installed_app_without_a_checkout_build_is_still_rebuilt(zip_update, mon
     update_cmd._cmd_update_impl(SimpleNamespace(branch="main", yes=True), False)
 
     assert built == [rebuilt]
+
+
+def test_unpinned_zip_update_owes_the_restart_for_the_archive_commit(tmp_path, monkeypatch):
+    """A branch ZIP (no target SHA) still names its commit: GitHub archives carry it as the ZIP comment
+    (``git archive``). The restart debt and the completion are armed for that commit, never for ''."""
+    from hermes_cli import update_cmd_commit
+
+    sha = "8192da90e0afb20010a1c2f5da83db305d05ac5a"
+    root = tmp_path / "checkout"
+    root.mkdir()
+    (root / "payload.txt").write_text("old", encoding="utf-8")
+    archive = tmp_path / "source.zip"
+    with zipfile.ZipFile(archive, "w") as out:
+        out.writestr("hermes-agent-main/payload.txt", "new")
+        out.comment = sha.encode()
+    monkeypatch.setattr("urllib.request.urlretrieve", lambda url, dst: urlretrieve(archive.as_uri(), dst))
+    monkeypatch.setattr(main, "PROJECT_ROOT", root)
+    monkeypatch.setattr(update_cmd_zip, "_abort_zip_update_if_dirty_tree", lambda: None)
+    armed, completed = [], []
+    monkeypatch.setattr(update_cmd_commit, "arm_commit_obligations", lambda _root, expected: armed.append(expected))
+    monkeypatch.setattr(update_cmd, "_complete_source_update", lambda request: completed.append(dict(request)))
+    update_cmd_zip._update_via_zip(SimpleNamespace(branch="main"), completion_request={})
+    assert (root / "payload.txt").read_text(encoding="utf-8") == "new"
+    assert armed == [sha]
+    assert [request["expected_sha"] for request in completed] == [sha]
