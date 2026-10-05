@@ -228,9 +228,16 @@ def test_restore_never_touches_user_work_when_git_wrote_nothing(checkout, capsys
     assert er.restore_interrupted_pull(root) is False
     assert (root / "utils.py").read_text(encoding="utf-8") == "OLD = 1  # my stash, re-applied\n"
     assert not marker.exists(), "git wrote nothing: the marker is spent"
-    # A target git no longer knows (gc, re-clone) can never be compared against: drop the marker.
+    # A target git no longer knows (gc, re-clone) can never be compared against: the marker goes
+    # only over a clean tracked tree, since the dirty bytes may be the update's (review G2).
     marker.write_text(stale.replace(b, "0" * 40), encoding="utf-8", newline="")
+    capsys.readouterr()
+    assert er.restore_interrupted_pull(root) is False and marker.exists()
+    assert "the marker was kept" in capsys.readouterr().err
+    assert (root / "utils.py").read_text(encoding="utf-8") == "OLD = 1  # my stash, re-applied\n"
+    _git(root, "stash", "-q")
     assert er.restore_interrupted_pull(root) is False and not marker.exists()
+    _git(root, "stash", "pop", "-q")
 
     # Killed inside the custom-branch `git merge`: its files are the merge of both sides, not origin's
     # blob, and still git's (torn ones too), while the user's own edit survives.
@@ -898,3 +905,23 @@ def test_a_lock_that_predates_the_move_stays_foreign_after_our_git_exited(tmp_pa
     assert er.restore_interrupted_pull(root) is False
     assert lock.exists() and marker.exists(), "a lock that predates the move was deleted"
     assert _git(root, "rev-parse", "HEAD") == target
+
+
+@pytest.mark.parametrize("torn", [True, False])
+def test_a_gone_target_retires_its_marker_only_over_a_clean_pre_tree(tmp_path, torn):
+    """A killed move left HEAD on ``pre`` with the target's bytes in a tracked file, then git pruned
+    the target commit: recovery cannot attribute those bytes, and it dropped the only record over
+    the dirty tree (review G2). The marker now goes only when the tracked tree is clean at pre."""
+    root, pre, target = _broken_release(tmp_path, 2)
+    _git(root, "reset", "-q", "--hard", pre)
+    _git(root, "reflog", "expire", "--expire=now", "--all")
+    _git(root, "gc", "-q", "--prune=now")
+    assert subprocess.run(["git", "-C", str(root), "cat-file", "-e", target]).returncode != 0  # gone
+    if torn:
+        (root / "module.py").write_text("def broken(:\n", encoding="utf-8", newline="")
+    marker = er.interrupted_pull_marker(root)
+    marker.write_text(f"pid=0\npre={pre}\ntarget={target}\nstash=\n", encoding="utf-8", newline="")
+    assert er.restore_interrupted_pull(root) is False
+    assert marker.exists() is torn
+    if torn:
+        assert (root / "module.py").read_text(encoding="utf-8") == "def broken(:\n"  # never guessed back

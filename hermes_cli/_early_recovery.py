@@ -1144,9 +1144,12 @@ def _restore_holding_claim(root: Path, marker: Path, *, after_failure: bool = Fa
         return False
     written = _paths_git_wrote(git, root, pre, target)
     if written is None:  # after a gc or re-clone: nothing left to compare against
-        if rollback and not _rollback_verified(git, git_dir, pre):
-            print(f"⚠ An interrupted `hermes update` rollback to {pre[:10]} is not verified and commit "
-                  f"{target[:10]} is gone; the marker was kept. Inspect `git -C {root} status`.", file=sys.stderr)
+        # Unattributable bytes are not proof of a whole tree: only a clean tracked tree at ``pre``
+        # retires the record, rollback or not (review G2).
+        if not _rollback_verified(git, git_dir, pre):
+            print(f"⚠ An interrupted `hermes update` left tracked files that differ from {pre[:10]} and commit "
+                  f"{target[:10]} is gone; the marker was kept. Inspect `git -C {root} status`, then "
+                  f"`git -C {root} checkout {pre[:10]} -- <file>` for each file the update wrote.", file=sys.stderr)
             return False
         marker.unlink()
         print(f"⚠ Ignoring a stale interrupted-update marker: commit {target[:10]} is gone.", file=sys.stderr)
