@@ -780,3 +780,49 @@ def test_the_zip_gate_never_admits_a_conflict_marker_even_for_a_newer_python(tmp
 
     assert not armed  # refused before the commit point
     assert (live / "hermes_cli" / "main.py").read_text(encoding="utf-8") == "OLD = 1\n"
+
+
+def _git_checkout(root: Path, files: dict[str, str]) -> None:
+    import subprocess
+
+    for name, text in files.items():
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / name).write_text(text, encoding="utf-8")
+    for args in (["init", "-q"], ["add", "."], ["-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                                                 "commit", "-qm", "pre"]):
+        subprocess.run(["git", *args], cwd=root, check=True, capture_output=True)
+
+
+@_POSIX_MODES
+def test_a_committed_swap_keeps_its_journal_until_the_backup_is_gone(tmp_path, monkeypatch):
+    """Q1/F79: the swap committed but its backup could not be removed (a read-only directory in the old
+    tree here; an AV scan holding it on Windows). The journal is that backup's only ownership record: it
+    stays ``committed``, the next launch's recovery drops the backup and then the journal, keeping the
+    new tree, and the retry's dirty-tree gate is clean again."""
+    import json
+
+    from hermes_cli import update_cmd_commit
+    from hermes_cli._early_recovery import ZIP_SWAP_JOURNAL, restore_interrupted_zip_swap
+
+    monkeypatch.setattr(update_cmd_commit, "arm_commit_obligations", lambda *a, **k: None)
+    live, extracted = tmp_path / "live", tmp_path / "extracted"
+    for side in (live, extracted):  # identical payloads: only the swap's own leftovers can dirty the tree
+        side.mkdir()
+    _git_checkout(live, {"payload/ro/f.txt": "same"})
+    (extracted / "payload" / "ro").mkdir(parents=True)
+    (extracted / "payload" / "ro" / "f.txt").write_text("same", encoding="utf-8")
+    (live / "payload" / "ro").chmod(0o555)  # git does not track it; the backup's rmtree cannot empty it
+    try:
+        assert update_cmd_zip._journaled_stage_and_swap(str(extracted), ["payload"], live, "b" * 40)
+        assert (live / "payload.hermes-update-old").exists(), "harness: the backup cleanup was expected to fail"
+        journal = live / ZIP_SWAP_JOURNAL
+        assert journal.is_file(), "the journal went while the swap's backup was still on disk"
+        assert json.loads(journal.read_text(encoding="utf-8"))["phase"] == "committed"
+        assert restore_interrupted_zip_swap(live) is False  # the new tree stays: nothing to relaunch
+    finally:
+        for path in live.rglob("*"):
+            if path.is_dir() and not path.is_symlink():
+                path.chmod(0o755)
+    assert not (live / "payload.hermes-update-old").exists() and not (live / ZIP_SWAP_JOURNAL).exists()
+    assert update_cmd_zip._zip_overlay_block_reason(live) is None
+

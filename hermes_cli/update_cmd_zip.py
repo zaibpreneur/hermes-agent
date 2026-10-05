@@ -447,16 +447,12 @@ def _stage_entries(extracted: str, entries: list[str], project_root: str,
     return staged
 
 
-def _staging_left(root: Path, entries: list[str]) -> list[str]:
-    """The declared staging paths still on disk (a cleanup that could not finish)."""
-    return [item for item in entries if os.path.lexists(os.path.join(root, item + ".hermes-update-staging"))]
-
-
-def _drop_journal_if_clean(root: Path, entries: list[str]) -> None:
-    """The journal is the only record of the staging paths: it goes only once every one of them is gone."""
-    left = _staging_left(root, entries)
+def _drop_journal_if_clean(root: Path, entries: list[str], suffixes=(".hermes-update-staging",)) -> None:
+    """The journal is the only record of the swap's siblings (``<entry><suffix>``): it goes only once
+    every one of them is gone, else the next launch's recovery could not tell them from a user's file."""
+    left = [item for item in entries if any(os.path.lexists(os.path.join(root, item + x)) for x in suffixes)]
     if left:
-        print(f"  ⚠ Could not remove the staged copies of {', '.join(left)}; the next `hermes` launch "
+        print(f"  ⚠ Could not remove the update's own copies of {', '.join(left)}; the next `hermes` launch "
               "removes them.")
         return
     (root / ZIP_SWAP_JOURNAL).unlink(missing_ok=True)
@@ -521,9 +517,12 @@ def _journaled_stage_and_swap(extracted: str, entries: list[str], root: Path, ta
         _commit_staged_replacements(
             staged, on_committed=lambda: write_zip_swap_journal(root, "committed", journal_entries, gen), tag=gen)
         # Committed: the new tree is whole. A journal that cannot go now (AV/indexer holding it) says
-        # "committed", which the next launch's recovery settles by keeping the new tree.
+        # "committed", which the next launch's recovery settles by keeping the new tree. It stays, too,
+        # while a backup (or backup temp) the best-effort cleanup could not remove is still on disk:
+        # recovery's own terminal check, else that backup is orphaned and wedges the retry (Q1/F79).
         with suppress(OSError):
-            (root / ZIP_SWAP_JOURNAL).unlink(missing_ok=True)
+            _drop_journal_if_clean(root, entries, (".hermes-update-staging", ".hermes-update-old",
+                                                   f".hermes-update-old.{gen}.tmp"))
     return staged
 
 
