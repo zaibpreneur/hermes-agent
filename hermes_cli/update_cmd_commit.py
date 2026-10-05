@@ -33,6 +33,7 @@ from hermes_cli._early_recovery import (
     recovery_closure_dir,
     recovery_closure_verified,
     restore_interrupted_pull,
+    write_durable_text,
 )
 from hermes_cli.update_custody import run_git
 
@@ -206,9 +207,10 @@ def arm_tree_move(git_cmd, root: Path, *, pre: str | None, target: str, stash: s
     if pre:
         with suppress(OSError, subprocess.SubprocessError):  # no closure: the in-tree repair still runs
             publish_recovery_closure(git_cmd, root, pre)
-    marker.write_text(f"pid={os.getpid()}\npre={pre or ''}\ntarget={target}\nstash={stash or ''}\n"
-                      + (f"rollback={rollback}\nref={ref}\n" if rollback else "")
-                      + (f"git={git}\n" if (git := _absolute_git(git_cmd)) else ""), encoding="utf-8")
+    # The restore's only record, durable before git writes: temp + fsync + rename, never in place.
+    write_durable_text(marker, f"pid={os.getpid()}\npre={pre or ''}\ntarget={target}\nstash={stash or ''}\n"
+                       + (f"rollback={rollback}\nref={ref}\n" if rollback else "")
+                       + (f"git={git}\n" if (git := _absolute_git(git_cmd)) else ""))
     return marker
 
 

@@ -806,3 +806,34 @@ def test_a_move_killed_after_git_wrote_a_symlink_change_is_restored(tmp_path, ba
     assert _git(root, "rev-parse", "HEAD") == pre and not er.interrupted_pull_marker(root).exists()
     assert _git(root, "status", "--porcelain", "--untracked-files=all") == ""
     assert _what_is_at(root / "L") == before
+
+
+def test_the_tree_move_marker_is_durable_before_it_appears_under_its_name(checkout, commit_point, monkeypatch):
+    """The marker is the restore's only record: it is written to a temp file, fsynced, then renamed
+    over its name. An in-place write could leave a power cut with an empty or half marker over a
+    torn tree, which no launch can identify (review C3)."""
+    from hermes_cli import update_cmd_commit
+
+    root, a, b = checkout
+    marker = er.interrupted_pull_marker(root)
+    marker.write_text("pid=1\npre=older\n", encoding="utf-8")
+    synced, replaced = [], []
+    real_fsync, real_replace = os.fsync, os.replace
+
+    def fsync(fd):
+        synced.append(fd)
+        return real_fsync(fd)
+
+    def replace(src, dst):
+        assert synced, "renamed into place before its bytes were fsynced"
+        assert marker.read_text(encoding="utf-8") == "pid=1\npre=older\n"  # never rewritten in place
+        replaced.append((Path(src), Path(dst)))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(os, "replace", replace)
+    update_cmd_commit.arm_tree_move(["git"], root, pre=None, target=b, stash=None)
+
+    assert [dst for _src, dst in replaced] == [marker]
+    assert f"target={b}" in marker.read_text(encoding="utf-8")
+    assert not list(marker.parent.glob(marker.name + "*.tmp"))

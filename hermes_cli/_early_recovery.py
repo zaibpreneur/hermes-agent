@@ -696,17 +696,26 @@ def write_zip_swap_journal(root: Path, phase: str, entries: list) -> None:
     import json
 
     journal = Path(root) / ZIP_SWAP_JOURNAL
-    tmp = journal.with_name(journal.name + ".tmp")
-    # A fresh inode every time: writing into a pre-existing temp would follow its symlink or hardlink
-    # onto another file (.env). fsync before the rename: an empty journal over a mixed tree is no record.
+    write_durable_text(journal, json.dumps({"pid": os.getpid(), "phase": phase, "entries": entries}),
+                       tmp=journal.with_name(journal.name + ".tmp"))
+
+
+def write_durable_text(path: Path, text: str, *, tmp: Path | None = None) -> None:
+    """``text`` at ``path`` as one durable record, never a half-written one.
+
+    A fresh inode every time: writing into a pre-existing temp would follow its symlink or hardlink
+    onto another file (.env). fsync before the rename: an empty record over a mixed tree is no record.
+    The default temp name carries the pid, so two writers never unlink each other's temp.
+    """
+    tmp = tmp if tmp is not None else path.with_name(f"{path.name}.{os.getpid()}.tmp")
     tmp.unlink(missing_ok=True)
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(json.dumps({"pid": os.getpid(), "phase": phase, "entries": entries}))
+            handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(tmp, journal)
+        os.replace(tmp, path)
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
