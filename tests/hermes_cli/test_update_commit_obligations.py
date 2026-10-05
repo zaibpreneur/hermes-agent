@@ -53,7 +53,7 @@ def test_disarm_leaves_another_installs_newer_host_record(root):
 
     commit.disarm_commit_obligations()
 
-    assert host.read_text(encoding="utf-8") == "OTHER-INSTALL"
+    assert host.read_text(encoding="utf-8-sig") == "OTHER-INSTALL"
 
 
 def test_plain_arm_and_disarm_restores_what_the_run_found(root):
@@ -61,11 +61,11 @@ def test_plain_arm_and_disarm_restores_what_the_run_found(root):
     host.parent.mkdir(parents=True, exist_ok=True)
     host.write_text("OLD", encoding="utf-8")
     commit.arm_commit_obligations(root, "a" * 40)
-    assert host.read_text(encoding="utf-8") != "OLD"
+    assert host.read_text(encoding="utf-8-sig") != "OLD"
 
     commit.disarm_commit_obligations()
 
-    assert host.read_text(encoding="utf-8") == "OLD"
+    assert host.read_text(encoding="utf-8-sig") == "OLD"
 
 
 def test_an_unreadable_record_refuses_the_arm_and_survives(root, monkeypatch):
@@ -86,7 +86,7 @@ def test_an_unreadable_record_refuses_the_arm_and_survives(root, monkeypatch):
     monkeypatch.setattr(Path, "read_bytes", real)
     commit.disarm_commit_obligations()
 
-    assert host.read_text(encoding="utf-8") == "OLD"
+    assert host.read_text(encoding="utf-8-sig") == "OLD"
 
 
 @pytest.mark.platforms("posix")  # unprivileged symlinks
@@ -103,5 +103,5 @@ def test_disarm_never_writes_through_a_planted_restore_alias(root, tmp_path):
 
     commit.disarm_commit_obligations()
 
-    assert sentinel.read_text(encoding="utf-8") == "PRECIOUS"
-    assert not host.is_symlink() and host.read_text(encoding="utf-8") == "ORIGINAL"
+    assert sentinel.read_text(encoding="utf-8-sig") == "PRECIOUS"
+    assert not host.is_symlink() and host.read_text(encoding="utf-8-sig") == "ORIGINAL"

@@ -596,4 +596,4 @@ def test_a_journal_that_cannot_be_dropped_after_the_commit_never_fails_the_updat
         assert update_cmd_commit.commit_obligations_armed()
     finally:
         update_cmd_commit.reset_for_tests()
-    assert (live / "payload" / "version.txt").read_text() == "new"
+    assert (live / "payload" / "version.txt").read_text(encoding="utf-8-sig") == "new"
