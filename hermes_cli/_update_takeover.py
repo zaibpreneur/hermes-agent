@@ -171,7 +171,7 @@ def main() -> int:
             python, env = prepare(request)
             request["receipt"] = update_receipt._current.get().data
             context.write_text(json.dumps(request), encoding="utf-8")
-        except Exception as exc:
+        except Exception as exc:  # health: allow BLE001 -- pre-commit boundary: any preparation failure is the takeover's recorded failure
             print(f"Update preparation failed: {exc}", file=sys.stderr, flush=True)
             _record_failure(request, result, 1, f"historical takeover preparation failed: {exc}")
             return 1
