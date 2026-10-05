@@ -1120,6 +1120,10 @@ def _pull_updates(
     return movement_baseline
 
 
+#: ``args`` of the result ``_switch_branch_at_commit_point`` returns when the commit point refused.
+_ARM_REFUSED = ["arm_commit_point"]
+
+
 def _switch_branch_at_commit_point(git_cmd, branch, target_ref, *, pre, stash):
     """CP0: switch the parked checkout to *branch* under the interrupted-pull marker and the armed
     obligations, so a kill mid-switch is restored by the next launch like a killed pull."""
@@ -1143,7 +1147,7 @@ def _switch_branch_at_commit_point(git_cmd, branch, target_ref, *, pre, stash):
         # (CP1 retargets the obligation before its own move).
         refused = _commit.arm_commit_point(git_cmd, root, target, pre=pre, target=target, stash=stash)
         if refused:  # nothing moved: the caller restores the autostash and exits
-            return subprocess.CompletedProcess(args, 1, "", refused)
+            return subprocess.CompletedProcess(_ARM_REFUSED, 1, "", refused)
         try:
             result = _git_run(git_cmd, args)
         except KeyboardInterrupt:
@@ -1173,6 +1177,35 @@ def _refuse_before_commit_point(git_cmd, target_ref, _windows_gateway_resume) ->
     print(reason)
     print("  No update was applied; your install is unchanged.")
     _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+    sys.exit(1)
+
+
+def _exit_after_failed_branch_switch(git_cmd, branch, track_result, auto_stash_ref, gw_input_fn) -> NoReturn:
+    """CP0 did not land: say which of refused / torn / missing branch it was, then ``sys.exit(1)``.
+
+    A torn switch keeps its marker for the next launch's restore, so the autostash stays parked:
+    re-applying it onto a half-written tree would mix the user's edits into git's partial writes.
+    """
+    detail = (track_result.stderr or "").strip()
+    if interrupted_pull_marker(_m().PROJECT_ROOT).is_file():
+        print(f"✗ Switching to '{branch}' stopped part-way; the next `hermes` launch puts the checkout back.")
+        if detail:
+            print(f"  {detail.splitlines()[0]}")
+        if auto_stash_ref is not None:
+            print(f"  ℹ️  Local changes preserved in stash (ref: {auto_stash_ref})")
+            print("  Restore manually with: git stash apply")
+            _clear_pending_autostash()
+        sys.exit(1)
+    # Nothing moved: restore the stash before bailing so the user isn't stranded.
+    if auto_stash_ref is not None:
+        _m()._restore_stashed_changes(
+            git_cmd, _m().PROJECT_ROOT, auto_stash_ref, prompt_user=False, input_fn=gw_input_fn)
+    if track_result.args == _ARM_REFUSED:
+        print(f"✗ {detail}.")
+    else:
+        print(f"✗ Branch '{branch}' does not exist locally or on origin.")
+        if detail:
+            print(f"  {detail.splitlines()[0]}")
     sys.exit(1)
 
 
@@ -1270,14 +1303,7 @@ def _prepare_checkout_for_update(
         track_result = _switch_branch_at_commit_point(
             git_cmd, branch, target_ref, pre=moved_from_sha, stash=auto_stash_ref)
         if track_result.returncode != 0:
-            # Restore the stash before bailing so the user isn't stranded.
-            if auto_stash_ref is not None:
-                _m()._restore_stashed_changes(
-                    git_cmd, _m().PROJECT_ROOT, auto_stash_ref, prompt_user=False, input_fn=gw_input_fn)
-            print(f"✗ Branch '{branch}' does not exist locally or on origin.")
-            if track_result.stderr.strip():
-                print(f"  {track_result.stderr.strip().splitlines()[0]}")
-            sys.exit(1)
+            _exit_after_failed_branch_switch(git_cmd, branch, track_result, auto_stash_ref, gw_input_fn)
 
     prompt_for_restore = (
         auto_stash_ref is not None
