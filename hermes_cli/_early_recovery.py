@@ -217,6 +217,8 @@ _INTERRUPTED_PULL_MAX_AGE_SECONDS = 10 * 60
 # The user (or a killed updater) is mid-operation: its own state files own the tree.
 _GIT_OPERATION_IN_PROGRESS = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply")
 _REGULAR_FILE_MODES = ("100644", "100755")
+# What git writes into the tree itself: files and symlinks (a gitlink, 160000, is a submodule's own checkout).
+_WORKTREE_BLOB_MODES = (*_REGULAR_FILE_MODES, "120000")
 
 
 def git_operation_in_progress(root: Path) -> str | None:
@@ -400,21 +402,28 @@ def _paths_git_wrote(git, root: Path, pre: str, target: str) -> tuple[list[str],
         parts = diff.stdout.split("\0")
         for meta, path in zip(parts[::2], parts[1::2]):
             old_mode, new_mode, old_blob, new_blob, status = meta.lstrip(":").split()
-            if (old_mode if status == "D" else new_mode) not in _REGULAR_FILE_MODES:
+            if (old_mode if status == "D" else new_mode) not in _WORKTREE_BLOB_MODES:
                 continue
             entry = entries.setdefault(path, (old_mode, None if status == "A" else old_blob, []))
             entry[2].append((new_mode, None if status == "D" else new_blob))
-    worktree_blob = _hash_worktree(git, [path for path in entries if (root / path).is_file()])
+    # A symlink's blob is its target text, read without following it; core.symlinks=false checks a
+    # link out as a plain file holding that text, which hash-object already matches.
+    links = {path for path in entries if os.path.islink(root / path)}
+    worktree_blob = _hash_worktree(git, [path for path in entries if path not in links and (root / path).is_file()])
+    worktree_blob.update({path: blob_id(os.fsencode(os.readlink(root / path)), pre) for path in links})
     restore, added, kept = [], [], set()
     for path, (old_mode, old_blob, new) in entries.items():
         file, blobs = root / path, {blob for _mode, blob in new if blob}
         if path not in worktree_blob:
             written = old_blob is not None  # unlinked (or deleted), not yet recreated
         elif worktree_blob[path] == old_blob:  # only a mode change tells whether git got here
-            written = (sys.platform != "win32" and any(b == old_blob and m != old_mode for m, b in new)
+            written = (sys.platform != "win32" and path not in links
+                       and any(b == old_blob and m != old_mode for m, b in new)
                        and bool(file.stat().st_mode & 0o100) != (old_mode == "100755"))
         elif worktree_blob[path] in blobs or path in unknown:
             written = True
+        elif path in links:  # git creates a symlink whole: any other target is the user's
+            written = False
         else:  # git's own file cut short starts one of the new blobs
             content = file.read_bytes()
             written = False

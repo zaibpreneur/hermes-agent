@@ -735,14 +735,15 @@ def test_a_rollback_never_rewinds_a_branch_checked_out_at_its_target_since(tmp_p
     assert _git(root, "rev-parse", "feature") == target
     assert er.interrupted_pull_marker(root).exists()
 
-def _killed_move(tmp_path: Path, change) -> tuple[Path, str, str]:
-    """A checkout back on ``pre`` (one module) with a dead updater's marker for ``target`` = ``change(pre)``."""
+def _killed_move(tmp_path: Path, change, base=lambda root: None) -> tuple[Path, str, str]:
+    """A checkout back on ``pre`` (a module + ``base``) with a dead updater's marker for ``target`` = ``change(pre)``."""
     root = tmp_path / "install"
     root.mkdir()
     _git(root, "init", "-q", "-b", "main")
     _git(root, "config", "user.email", "t@example.invalid")
     _git(root, "config", "user.name", "t")
     (root / "core.py").write_text("OLD = 1\n", encoding="utf-8", newline="")
+    base(root)
     _git(root, "add", "-A")
     _git(root, "commit", "-qm", "pre")
     pre = _git(root, "rev-parse", "HEAD")
@@ -772,3 +773,36 @@ def test_a_users_file_at_a_path_the_update_adds_is_kept_aside_never_deleted(tmp_
     assert (root / "started.py.hermes-update-kept").read_bytes() == b"started"
     assert (root / "touched.py.hermes-update-kept").read_bytes() == b""
     assert not (root / "started.py").exists() and not (root / "touched.py").exists()
+
+
+def _regular(root: Path) -> None:
+    (root / "L").unlink(missing_ok=True)
+    (root / "L").write_text("L = 'regular'\n", encoding="utf-8", newline="")
+
+
+def _link(root: Path) -> None:
+    (root / "L").unlink(missing_ok=True)
+    os.symlink("core.py", root / "L")
+
+
+def _what_is_at(path: Path):
+    """A link's target, a file's bytes, or None: never following the link."""
+    if os.path.islink(path):
+        return ("link", os.readlink(path))
+    return ("file", path.read_bytes()) if path.exists() else None
+
+
+@pytest.mark.platforms("posix")  # creating symlinks needs Developer Mode/admin on Windows
+@pytest.mark.parametrize(("base", "change"), [
+    (_regular, _link), (lambda root: None, _link), (_link, lambda root: (root / "L").unlink()), (_link, _regular),
+], ids=["regular-to-symlink", "added-symlink", "deleted-symlink", "symlink-to-regular"])
+def test_a_move_killed_after_git_wrote_a_symlink_change_is_restored(tmp_path, base, change):
+    """Symlinks are blobs git moves like files: a kill after git wrote the link change (added, deleted,
+    or a type change either way) is put back to ``pre``, never left with the marker spent."""
+    root, pre, _target = _killed_move(tmp_path, change, base)
+    before = _what_is_at(root / "L")
+    change(root)  # git wrote this path, then the kill came before HEAD moved
+    assert er.restore_interrupted_pull(root) is True
+    assert _git(root, "rev-parse", "HEAD") == pre and not er.interrupted_pull_marker(root).exists()
+    assert _git(root, "status", "--porcelain", "--untracked-files=all") == ""
+    assert _what_is_at(root / "L") == before
