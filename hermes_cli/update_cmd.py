@@ -910,8 +910,14 @@ def _rollback_if_pulled_syntax_error(git_cmd, pre_pull_sha, *, rollback_branch=N
     file no longer compiles (a bad admin-merge past CI must not brick the CLI)."""
     pyproject = Path(_m().PROJECT_ROOT) / "pyproject.toml"
     if pyproject.is_file() and _commit.requires_other_python(pyproject.read_bytes()):
-        return  # a newer Python's syntax: this interpreter's compile() cannot judge it
-    syntax_ok, failing_path, syntax_error = _validate_critical_files_syntax(_m().PROJECT_ROOT)
+        # A newer Python's syntax: this interpreter's compile() cannot judge it; a conflict marker
+        # is broken under every Python.
+        marked = [(rel, reason) for rel in _UPDATE_CRITICAL_FILES
+                  if (path := Path(_m().PROJECT_ROOT) / rel).is_file()
+                  and (reason := _commit.conflict_marker(path.read_bytes()))]
+        syntax_ok, failing_path, syntax_error = (not marked, *(marked[0] if marked else (None, None)))
+    else:
+        syntax_ok, failing_path, syntax_error = _validate_critical_files_syntax(_m().PROJECT_ROOT)
     if syntax_ok:
         return
     print()

@@ -330,22 +330,36 @@ def requires_other_python(pyproject: bytes | str | None) -> bool:
         return False
 
 
+def conflict_marker(data: bytes) -> str | None:
+    """Why ``data`` is broken under EVERY Python (a merge-conflict marker line), else None: no
+    ``requires-python`` bump excuses it. Only git's ``<<<<<<< ``/``>>>>>>> `` lines: a bare
+    ``=======`` is also a reST heading in a docstring."""
+    for number, line in enumerate(data.splitlines(), 1):
+        if line.startswith((b"<<<<<<< ", b">>>>>>> ")):
+            return f"unresolved merge-conflict marker at line {number}"
+    return None
+
+
 def target_syntax_error(git_cmd, root: Path, target_ref: str, relpaths) -> tuple[str, str] | None:
     """``(path, error)`` for the first startup-critical file that does not compile at ``target_ref``.
 
     Read from the object store, never written to the tree: this runs BEFORE HEAD moves, so a broken
     release is refused with the install untouched (the post-pull rollback stays as the backstop).
-    Skipped for a target that requires a Python this interpreter is not (``requires_other_python``).
+    A target that requires a Python this interpreter is not (``requires_other_python``) is held only
+    to ``conflict_marker``: its syntax may be a newer Python's.
     """
     pyproject = run_git(git_cmd, ["show", f"{target_ref}:pyproject.toml"], cwd=str(root),
                                capture_output=True, stdin=subprocess.DEVNULL, timeout=120)
-    if pyproject.returncode == 0 and requires_other_python(pyproject.stdout):
-        return None
+    other_python = pyproject.returncode == 0 and requires_other_python(pyproject.stdout)
     for rel in relpaths:
         shown = run_git(git_cmd, ["show", f"{target_ref}:{rel}"], cwd=str(root), capture_output=True,
                                stdin=subprocess.DEVNULL, timeout=120)
         if shown.returncode != 0:
             continue  # absent at the target (or unreadable): the post-pull guard has the last word
+        if other_python:
+            if reason := conflict_marker(shown.stdout or b""):
+                return rel, reason
+            continue
         try:
             compile(shown.stdout, rel, "exec", dont_inherit=True)
         except (SyntaxError, ValueError) as exc:
