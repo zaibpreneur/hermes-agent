@@ -184,13 +184,13 @@ def _commit_staged_replacements(staged, *, on_committed=None) -> None:
 
 
 def _zip_overlay_block_reason(
-    root: Path, *, ignore_staging_artifacts: bool = False, shipped: Optional[Collection[str]] = None,
+    root: Path, *, staged: Collection[str] = (), shipped: Optional[Collection[str]] = None,
 ) -> Optional[str]:
     """Why overlaying a ZIP onto ``root`` would destroy work, or None if safe.
 
     The swap replaces every top-level entry (minus a tiny preserve set) and deletes backups, so uncommitted
-    edits and untracked files are gone. Fails closed when git status cannot run. ``ignore_staging_artifacts``
-    is for the pre-swap re-check: phase 1 leaves our own ``*.hermes-update-staging`` siblings that git
+    edits and untracked files are gone. Fails closed when git status cannot run. ``staged`` is for the
+    pre-swap re-check: phase 1 leaves ``<entry>.hermes-update-staging`` for those entries, which git
     reports as untracked; without the filter the re-check always refuses. ``shipped`` is the extracted
     ZIP's top-level entry set once known (the re-check); before the download the tracked root entries stand
     in for it. A gitignored path under a root entry the ZIP does not ship is never touched by the swap.
@@ -228,7 +228,7 @@ def _zip_overlay_block_reason(
     dirty = any(
         line.strip()
         and not _is_zip_preserved_entry_status_line(line, shipped)
-        and not (ignore_staging_artifacts and _is_zip_staging_artifact_status_line(line))
+        and not _is_zip_staging_artifact_status_line(line, staged)
         for line in (result.stdout or "").splitlines()
     )
     return "the working tree has uncommitted changes or untracked files" if dirty else None
@@ -265,10 +265,12 @@ def _is_zip_preserved_entry_status_line(line: str, shipped: Optional[Collection[
         nested == keep or nested.startswith(f"{keep}/") for keep in _ZIP_PRESERVED_NESTED.get(top, ()))
 
 
-def _is_zip_staging_artifact_status_line(line: str) -> bool:
-    """True when a porcelain status line is our own two-phase-swap artifact."""
+def _is_zip_staging_artifact_status_line(line: str, staged: Collection[str] = ()) -> bool:
+    """True when a porcelain status line is Hermes' own: a root breadcrumb, or the staging copy of an
+    entry this run staged. Any other ``*.hermes-update-staging``/``-old`` may be a user's file (a manual
+    ``cp -r tools tools.hermes-update-old``) that staging would delete, so it blocks."""
     top = _status_top_level(line[3:] if len(line) >= 3 else line)
-    return top.endswith(_ZIP_STAGING_ARTIFACT_SUFFIXES) or top in _ZIP_HERMES_ROOT_ARTIFACTS
+    return top in _ZIP_HERMES_ROOT_ARTIFACTS or top in {item + _ZIP_STAGING_ARTIFACT_SUFFIXES[0] for item in staged}
 
 
 def _abort_zip_update_if_dirty_tree() -> None:
@@ -277,9 +279,10 @@ def _abort_zip_update_if_dirty_tree() -> None:
     See #87304.
     """
     from hermes_cli.update_cmd import _m
-    # Our own staging/backup siblings and breadcrumbs are never user work: counting them refused
-    # every retry after an interrupted swap (the next run's staging clears them per entry).
-    reason = _zip_overlay_block_reason(_m().PROJECT_ROOT, ignore_staging_artifacts=True)
+    # Settle an interrupted swap first: only its journal tells its staging/backup siblings apart from a
+    # user's lookalike file, and once settled none are left to refuse the retry on.
+    restore_interrupted_zip_swap(_m().PROJECT_ROOT)
+    reason = _zip_overlay_block_reason(_m().PROJECT_ROOT)
     if reason is None:
         return
     print(f"✗ ZIP fallback refused: {reason}.")
@@ -429,7 +432,7 @@ def _journaled_stage_and_swap(extracted: str, entries: list[str], root: Path, ta
         # installed, so recovery must not delete whatever (a user's new file) now sits at that path.
         # TOCTOU re-check right before the swap: download + extract + staging can take minutes and
         # work created meanwhile would be destroyed. Our own staging siblings are filtered out.
-        recheck_reason = _zip_overlay_block_reason(root, ignore_staging_artifacts=True, shipped=entries)
+        recheck_reason = _zip_overlay_block_reason(root, staged=entries, shipped=entries)
         if recheck_reason is not None:
             _discard_staged(staged)
             _drop_journal_if_clean(root, entries)
