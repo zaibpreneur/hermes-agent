@@ -10,7 +10,8 @@ SHARED process, and every other profile's CLI could neither see nor discharge th
 The record therefore lives beside the host rendezvous record, in
 :func:`gateway.host_rendezvous.host_state_dir` (``$HERMES_GATEWAY_LOCK_DIR`` else
 ``$XDG_STATE_HOME/hermes/gateway-locks``) — the one cross-profile, per-OS-user state root the
-tree already has. It is written once per host, read by every profile's CLI, and cleared once.
+tree already has. It is written once per host and installation (keyed by the checkout), read by
+every profile's CLI, and cleared once.
 
 The same "one host process, not one per profile" identity is what
 :func:`collapse_units_to_host_processes` applies to enumerated systemd units: leftover
@@ -22,6 +23,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -32,20 +34,36 @@ from typing import Any, Callable, Iterable, Optional
 
 logger = logging.getLogger("hermes_cli.update_cmd")
 
-#: One file per OS user, beside ``host-gateway.json`` / ``host-serve.json``.
+#: The record before it carried an install key, beside ``host-gateway.json`` / ``host-serve.json``.
+#: Still read, and cleared on discharge, so a debt an older release armed survives the upgrade; it
+#: names no install, so it keeps its old meaning: owed by whichever install reads it.
 HOST_OBLIGATION_NAME = "host-update-restart.json"
 
 _RECORD_VERSION = 1
 
 
 def host_obligation_path() -> Path:
-    """Path of the host obligation record."""
+    """This installation's host obligation record.
+
+    Keyed by the checkout this module runs from: every profile of one install arms, reads and
+    clears the same record, while a second install of the same OS user (another checkout, a ZIP
+    install) owes its own, so its completed restart never erases this install's debt (review S3).
+    """
     # Not ``gateway.host_rendezvous.host_state_dir``: ``gateway.status`` imports ``utils`` -> ruamel,
     # absent from the historical interpreter an old updater's takeover arms this record in; the
     # recovery module's stdlib copy of the rule is drift-tested against the gateway resolver.
     from hermes_cli.update_restart_recovery import _host_state_dir
 
-    return Path(_host_state_dir()) / HOST_OBLIGATION_NAME
+    install = os.path.normcase(str(Path(__file__).resolve().parents[1]))
+    key = hashlib.sha256(install.encode("utf-8")).hexdigest()[:16]
+    return Path(_host_state_dir()) / f"{Path(HOST_OBLIGATION_NAME).stem}-{key}.json"
+
+
+def _owed_path() -> Path:
+    """The record a reader honours: this install's, else an older release's unkeyed one."""
+    path = host_obligation_path()
+    legacy = path.with_name(HOST_OBLIGATION_NAME)
+    return legacy if not os.path.exists(path) and os.path.exists(legacy) else path  # never raises
 
 
 def _write_record(path: Path, record: dict) -> None:
@@ -66,8 +84,12 @@ def _write_record(path: Path, record: dict) -> None:
 
 def read_host_obligation() -> Optional[dict]:
     """The published obligation record, or ``None`` when absent/corrupt/foreign-versioned."""
+    return _read_record(_owed_path())
+
+
+def _read_record(path: Path) -> Optional[dict]:
     try:
-        payload = json.loads(host_obligation_path().read_text(encoding="utf-8-sig"))
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, UnicodeDecodeError, ValueError):
         return None
     if not isinstance(payload, dict) or payload.get("version") != _RECORD_VERSION:
@@ -82,7 +104,7 @@ def host_obligation_present() -> bool:
     one — the restart is still owed and the reader falls back to "no recorded inventory".
     """
     try:
-        return host_obligation_path().is_file()
+        return _owed_path().is_file()
     except OSError:
         return False
 
@@ -101,7 +123,7 @@ def write_host_obligation(
     ``restarted`` proof) instead of resetting it: the host owes one restart, not one per profile.
     ``owner`` (an update run's commit-point token) joins the record's ``owners``: a run that
     fails before its move hands back only its own stake (``release_host_obligation``), never
-    another install's debt for the same SHA. The first owner also stores what it found there
+    another run's debt for the same SHA. The first owner also stores what it found there
     (``found``), which the last owner to leave puts back; an owner retargeting to another SHA
     keeps that baseline (``_baseline_for``).
     """
@@ -115,7 +137,7 @@ def write_host_obligation(
 
 
 def _write_locked(path: Path, *, expected_sha: str, runtimes: Optional[list], profile: str, owner: str) -> bool:
-    existing = read_host_obligation()
+    existing = _read_record(path)
     try:
         found = _baseline_for(owner, existing, path) if owner else None
     except OSError as exc:  # unreadable is not absent: a guessed ``found`` would delete it later
@@ -170,7 +192,8 @@ def _record_mutex(path: Path):
     The sidecar sits in a subdirectory: the state dir is the gateway lock dir, whose ``--replace``
     cleanup unlinks every top-level ``*.lock``, and a deleted sidecar splits the lock in two.
     """
-    guard = path.parent / f".{path.stem}.mutex"
+    # One guard for every install's record (and the unkeyed one an older release still locks).
+    guard = path.parent / f".{Path(HOST_OBLIGATION_NAME).stem}.mutex"
     guard.mkdir(parents=True, exist_ok=True)
     with _marker_mutex()(guard / "record"):
         yield
@@ -234,23 +257,23 @@ def release_host_obligation(owner: str) -> None:
     """Hand back ``owner``'s stake in the record. When no other run still owes through it, the
     record goes back to what its first owner found (``found``; absent = unlinked).
 
-    A record without ``owner`` was rewritten since (another install's newer pull): it is theirs and
+    A record without ``owner`` was rewritten since (another run's newer pull): it is theirs and
     stays. Raises OSError when the record cannot be rewritten (the caller keeps the debt armed).
     Judged and rewritten under ``_record_mutex``, which every arm takes too, so no arm can land
     between the look and the write and be undone by it (kshitijk4poor F22/N05).
     """
-    if not owner or owner not in _owners(read_host_obligation() or {}):
-        return  # nothing of ours to hand back: no lock taken, no state dir created
     path = host_obligation_path()
+    if not owner or owner not in _owners(_read_record(path) or {}):
+        return  # nothing of ours to hand back: no lock taken, no state dir created
     with _record_mutex(path):
         _release_locked(path, owner)
 
 
 def _release_locked(path: Path, owner: str) -> None:
-    record = read_host_obligation()
+    record = _read_record(path)
     owners = _owners(record) if record is not None else []
     if owner not in owners:
-        return  # rewritten since the unlocked look (another install's arm): theirs now
+        return  # rewritten since the unlocked look (another run's arm): theirs now
     remaining = [o for o in owners if o != owner]
     if remaining:
         _write_record(path, {**record, "owners": remaining})
@@ -282,11 +305,13 @@ def replace_bytes(path: Path, data: bytes) -> None:
 
 
 def clear_host_obligation() -> None:
-    """Discharge the obligation for the whole host. Never raises."""
-    try:
-        host_obligation_path().unlink(missing_ok=True)
-    except OSError as exc:
-        logger.debug("Could not clear host update-restart obligation: %s", exc)
+    """Discharge this install's obligation (and an older release's unkeyed one). Never raises."""
+    path = host_obligation_path()
+    for owed in (path, path.with_name(HOST_OBLIGATION_NAME)):
+        try:
+            owed.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.debug("Could not clear host update-restart obligation: %s", exc)
 
 
 def obligation_fields() -> Optional[dict[str, str]]:
@@ -316,12 +341,12 @@ def mark_host_restart_completed(sha: str) -> None:
 def _update_record(change: Callable[[dict], None], what: str) -> None:
     """Read, ``change`` and rewrite an armed record under ``_record_mutex`` (an arm's new owner
     stake is never overwritten by a stale copy). Never raises; no record, no write."""
-    if read_host_obligation() is None:
+    path = _owed_path()
+    if _read_record(path) is None:
         return
-    path = host_obligation_path()
     try:
         with _record_mutex(path):
-            record = read_host_obligation()
+            record = _read_record(path)
             if record is None:
                 return
             change(record)

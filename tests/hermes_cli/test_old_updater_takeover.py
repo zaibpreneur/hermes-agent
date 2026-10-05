@@ -535,8 +535,8 @@ def test_takeover_arms_the_host_record_without_application_dependencies(tmp_path
         stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", timeout=60,
     )
     assert child.returncode == 0, child.stdout + child.stderr
-    record = json.loads((lock_dir / "host-update-restart.json").read_text(encoding="utf-8-sig"))
-    assert record["expected_sha"] == head
+    [armed] = lock_dir.glob("host-update-restart-*.json")  # the install-keyed record (review S3)
+    assert json.loads(armed.read_text(encoding="utf-8-sig"))["expected_sha"] == head
 
 
 def test_a_finish_child_that_cannot_start_after_the_commit_is_owed_not_failed(tmp_path, monkeypatch, capsys):

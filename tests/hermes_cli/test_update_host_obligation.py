@@ -219,6 +219,42 @@ def test_unwritable_host_state_dir_never_hides_the_debt_from_another_profile(two
         lock_dir.chmod(0o700)
 
 
+def test_one_installs_completed_restart_never_erases_another_installs_debt(tmp_path):
+    """Two installations of one OS user share the host state dir. Install B arming its own pull and
+    then completing its restart must leave install A's debt standing; each install arms, reads and
+    clears from its own process, the way two checkouts' ``hermes update`` runs do (review S3)."""
+    import shutil
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    source = Path(__file__).resolve().parents[2]
+    files = ("hermes_constants.py", "hermes_cli/__init__.py", "hermes_cli/update_host_obligation.py",
+             "hermes_cli/update_restart_recovery.py", "hermes_cli/update_lock.py")
+    roots = {}
+    for name in ("install-a", "install-b"):
+        roots[name] = tmp_path / name
+        for rel in files:
+            (roots[name] / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source / rel, roots[name] / rel)
+    env = {**os.environ, "HERMES_GATEWAY_LOCK_DIR": str(tmp_path / "gateway-locks")}
+
+    def run(install: str, body: str) -> str:
+        code = (f"import sys\nsys.path.insert(0, {str(roots[install])!r})\n"
+                "from hermes_cli.update_host_obligation import *\n" + body)
+        child = subprocess.run([sys.executable, "-I", "-S", "-B", "-c", code], env=env, capture_output=True,
+                               text=True, encoding="utf-8", stdin=subprocess.DEVNULL, timeout=60)
+        assert child.returncode == 0, child.stdout + child.stderr
+        return child.stdout.strip()
+
+    run("install-a", f"assert write_host_obligation(expected_sha={'a' * 40!r}, owner='run-a')")
+    run("install-b", f"assert write_host_obligation(expected_sha={'b' * 40!r}, owner='run-b')\n"
+                     f"mark_host_restart_completed({'b' * 40!r})\nclear_host_obligation()")
+
+    assert run("install-a", "print((read_host_obligation() or {}).get('expected_sha'))") == "a" * 40
+    assert run("install-b", "print(host_obligation_present())") == "False"
+
+
 def test_unreadable_host_record_is_never_discharged_by_the_legacy_marker(two_profiles, no_live_fleet, monkeypatch, tmp_path):
     """A record whose terms are UNKNOWN cannot be settled by another record's terms.
 
