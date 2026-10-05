@@ -150,14 +150,19 @@ def arm_tree_move(git_cmd, root: Path, *, pre: str | None, target: str, stash: s
 
     ``rollback`` (``branch``/``detach``): a syntax rollback that moves HEAD and the index back to
     ``pre`` before any file; a kill before that step finds HEAD still on ``target`` and the restore
-    redoes it first.
+    redoes it first, only while HEAD still names the ``ref`` recorded here (empty: detached).
     """
     marker = interrupted_pull_marker(root)
+    ref = ""
+    if rollback:
+        named = run_git(git_cmd, ["symbolic-ref", "-q", "HEAD"], cwd=str(root), capture_output=True, text=True,
+                        encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL, timeout=60)
+        ref = named.stdout.strip() if named.returncode == 0 else ""
     if pre:
         with suppress(OSError, subprocess.SubprocessError):  # no closure: the in-tree repair still runs
             publish_recovery_closure(git_cmd, root, pre)
     marker.write_text(f"pid={os.getpid()}\npre={pre or ''}\ntarget={target}\nstash={stash or ''}\n"
-                      + (f"rollback={rollback}\n" if rollback else "")
+                      + (f"rollback={rollback}\nref={ref}\n" if rollback else "")
                       + (f"git={git}\n" if (git := _absolute_git(git_cmd)) else ""), encoding="utf-8")
     return marker
 

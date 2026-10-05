@@ -987,6 +987,14 @@ def _restore_holding_claim(root: Path, marker: Path, *, after_failure: bool = Fa
     if head is None:
         return False
     if rollback and pre and target and head == target:
+        # Only the ref the rollback left HEAD on may be rewound: a branch the user checked out at
+        # ``target`` since is theirs (and the update's branch would stay on the broken commit).
+        named = git("symbolic-ref", "-q", "HEAD")
+        if "ref" not in fields or (named.stdout.strip() if named.returncode == 0 else "") != fields["ref"].strip():
+            print(f"⚠ An interrupted `hermes update` rollback to {pre[:10]} was not resumed: HEAD now names "
+                  f"another branch. Run `git reset --hard {pre[:10]}` on the updated branch to finish it.",
+                  file=sys.stderr)
+            return False
         # A syntax rollback killed before it moved HEAD back: redo that step (HEAD and index, no file),
         # so the restore below lands on ``pre`` (the code the update started from), not the broken tree.
         # Every step is checked, and the killed step's ``index.lock`` goes first, only once its git is

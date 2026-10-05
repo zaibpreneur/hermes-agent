@@ -334,7 +334,8 @@ def _broken_release(tmp_path: Path, nfiles: int) -> tuple[Path, str, str]:
 
 def _rollback_marker(root: Path, pre: str, target: str) -> Path:
     marker = er.interrupted_pull_marker(root)
-    marker.write_text(f"pid=0\npre={pre}\ntarget={target}\nstash=\nrollback=branch\n", encoding="utf-8", newline="")
+    marker.write_text(f"pid=0\npre={pre}\ntarget={target}\nstash=\nrollback=branch\nref=refs/heads/main\n",
+                      encoding="utf-8", newline="")
     return marker
 
 
@@ -560,7 +561,7 @@ def test_a_recorded_git_that_is_no_longer_git_falls_back_and_still_repairs(tmp_p
     if stub.startswith("#!"):
         stub_path.chmod(0o755)
     marker = er.interrupted_pull_marker(root)
-    marker.write_text(f"pid=0\npre={pre}\ntarget={target}\nstash=\nrollback=branch\ngit={stub_path}\n",
+    marker.write_text(f"pid=0\npre={pre}\ntarget={target}\nstash=\nrollback=branch\nref=refs/heads/main\ngit={stub_path}\n",
                       encoding="utf-8", newline="")
     assert er.restore_interrupted_pull(root) is True
     assert _git(root, "rev-parse", "HEAD") == pre and not marker.exists()
@@ -720,3 +721,16 @@ def test_an_unmarked_rollback_that_fails_never_reports_the_install_unchanged(che
 
     out = capsys.readouterr().out
     assert "Rollback complete" not in out and "Recover manually" in out
+
+
+def test_a_rollback_never_rewinds_a_branch_checked_out_at_its_target_since(tmp_path, commit_point):
+    """The user ran `git checkout -b feature` on the broken release before relaunching: the redo must
+    not reset *feature*, and main must not be left behind with the marker gone (F18)."""
+    root, pre, target = _broken_release(tmp_path, 3)
+    commit_point.arm_tree_move(["git"], root, pre=pre, target=target, stash=None, rollback="branch")
+    _git(root, "checkout", "-q", "-b", "feature")
+
+    er.restore_interrupted_pull(root)
+
+    assert _git(root, "rev-parse", "feature") == target
+    assert er.interrupted_pull_marker(root).exists()
