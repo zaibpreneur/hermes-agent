@@ -4,9 +4,12 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
+
+_SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
 
 def prepare(request: dict) -> tuple[Path, dict[str, str]]:
@@ -63,23 +66,61 @@ def prepare(request: dict) -> tuple[Path, dict[str, str]]:
 
 
 def _arm_fleet_obligation(root: Path) -> None:
-    head = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True, encoding="utf-8",
-                          stdin=subprocess.DEVNULL, timeout=60)
-    sha = head.stdout.strip() if head.returncode == 0 else ""
-    if not sha:  # an SHA-less record names no code the fleet could be proven current on
-        return
+    """Owe the fleet restart for the moved tree. Never raises: the update is already committed, and
+    ``main`` would report any exception here as a failed update."""
     # This runs in the HISTORICAL interpreter, before PM syncs the new dependencies: only stdlib-only
     # modules here (``update_cmd_fleet``'s writer imports ``update_cmd`` -> config -> ruamel, which a
     # release older than ruamel does not have).
     from hermes_cli.update_host_obligation import write_host_obligation
 
-    if not write_host_obligation(expected_sha=sha):
-        # Same fallback as ``update_cmd_fleet._write_fleet_restart_pending_marker``: the per-home
-        # breadcrumb every reader still honours.
-        from hermes_constants import get_hermes_home
+    # A git-less archive root has no SHA: an SHA-less record still owes the restart; its readers hold
+    # the fleet to the checkout instead of a named pull.
+    sha = _head_sha(root)
+    if write_host_obligation(expected_sha=sha):
+        return
+    # Same fallback as ``update_cmd_fleet._write_fleet_restart_pending_marker``: the per-home
+    # breadcrumb every reader still honours.
+    from hermes_constants import get_hermes_home
 
-        (get_hermes_home() / "fleet_restart_pending").write_text(
-            f"started={time.time()}\npid={os.getpid()}\nexpected_sha={sha}\n", encoding="utf-8")
+    lines = [f"started={time.time()}", f"pid={os.getpid()}"] + ([f"expected_sha={sha}"] if sha else [])
+    try:
+        (get_hermes_home() / "fleet_restart_pending").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except OSError as exc:
+        print(f"Warning: could not record the owed gateway restart ({exc}); run `hermes update` again "
+              "to restart the gateway onto the new code.", file=sys.stderr)
+
+
+def _head_sha(root: Path) -> str:
+    """HEAD of ``root``, or ``''``. Git may be off PATH (only PM's store copy) or broken here, so a
+    failed ``rev-parse`` falls back to reading the ref files git itself would read."""
+    from hermes_cli._early_recovery import _git_executable
+
+    try:
+        head = subprocess.run([_git_executable(), "-C", str(root), "rev-parse", "HEAD"], capture_output=True,
+                              text=True, encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL, timeout=60)
+        if head.returncode == 0 and _SHA.fullmatch(head.stdout.strip()):
+            return head.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass  # no runnable git: the ref files below are the whole of the evidence
+    try:
+        git_dir = root / ".git"
+        if git_dir.is_file():  # a linked worktree / submodule: ``gitdir: <path>``
+            git_dir = root / git_dir.read_text(encoding="utf-8-sig").strip().removeprefix("gitdir:").strip()
+        # Branch refs live in the common dir a linked worktree's ``commondir`` names.
+        common = git_dir / (git_dir / "commondir").read_text(encoding="utf-8-sig").strip() \
+            if (git_dir / "commondir").is_file() else git_dir
+        head = (git_dir / "HEAD").read_text(encoding="utf-8-sig").strip()
+        if head.startswith("ref:"):
+            ref = head.removeprefix("ref:").strip()
+            loose = common / ref
+            if loose.is_file():
+                head = loose.read_text(encoding="utf-8-sig").strip()
+            else:
+                packed = (common / "packed-refs").read_text(encoding="utf-8-sig").splitlines()
+                head = next((line.split(" ", 1)[0] for line in packed if line.endswith(f" {ref}")), "")
+    except (OSError, UnicodeDecodeError):
+        return ""
+    return head if _SHA.fullmatch(head) else ""
 
 
 def _record_failure(request: dict, result: Path, code: int, detail: str) -> None:

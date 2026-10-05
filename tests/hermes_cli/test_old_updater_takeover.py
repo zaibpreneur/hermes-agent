@@ -445,3 +445,67 @@ def test_bootstrap_lock_remains_live_without_application_dependencies(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     assert holder.returncode == 0
     assert not lock.exists()
+
+
+SHA = "c" * 40
+
+
+@pytest.mark.parametrize("git", [
+    "missing",
+    pytest.param("failing", marks=pytest.mark.platforms("posix")),  # POSIX shell stub
+])
+def test_takeover_arms_the_checkout_head_when_git_cannot_answer(tmp_path, monkeypatch, git):
+    """The historical takeover arms the fleet restart AFTER the tree moved. A host whose git is off
+    PATH (only PM's store copy) used to raise FileNotFoundError there, reporting a committed update
+    as failed (F20); a git that runs but fails silently armed nothing (F25). Either way the record
+    must still name the HEAD the checkout's own ref files hold."""
+    from hermes_cli import _early_recovery, _update_takeover
+    from hermes_cli.update_host_obligation import read_host_obligation
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    monkeypatch.setenv("PATH", str(bin_dir))
+    root = tmp_path / "checkout"
+    if git == "missing":
+        # The git PATH and PM's store cannot find; the checkout is a linked worktree whose branch
+        # is only in the common dir's packed-refs.
+        monkeypatch.setattr(_early_recovery, "_git_executable", lambda *args, **kwargs: "git")
+        worktree = tmp_path / "repo.git" / "worktrees" / "checkout"
+        worktree.mkdir(parents=True)
+        (worktree / "commondir").write_text("../..\n", encoding="utf-8")
+        (worktree / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+        (tmp_path / "repo.git" / "packed-refs").write_text(
+            f"# pack-refs with: peeled fully-peeled sorted\n{'d' * 40} refs/heads/other\n{SHA} refs/heads/main\n",
+            encoding="utf-8")
+        root.mkdir()
+        (root / ".git").write_text(f"gitdir: {worktree}\n", encoding="utf-8")
+    else:
+        stub = bin_dir / "git"
+        stub.write_text("#!/bin/sh\nexit 128\n", encoding="utf-8")
+        stub.chmod(0o755)
+        monkeypatch.setattr(_early_recovery, "_git_executable", lambda *args, **kwargs: str(stub))
+        (root / ".git" / "refs" / "heads").mkdir(parents=True)
+        (root / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+        (root / ".git" / "refs" / "heads" / "main").write_text(f"{SHA}\n", encoding="utf-8")
+
+    _update_takeover._arm_fleet_obligation(root)
+
+    assert (read_host_obligation() or {}).get("expected_sha") == SHA
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_takeover_arms_an_sha_less_obligation_for_a_git_less_root(tmp_path, monkeypatch):
+    """An archive install has no HEAD to name, yet its update still owes the fleet a restart (F21):
+    an SHA-less record (readers hold the fleet to the checkout) instead of no record at all."""
+    from hermes_cli import _update_takeover
+    from hermes_cli.update_host_obligation import read_host_obligation
+
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))  # no enclosing repo answers for it
+    root = tmp_path / "archive"
+    root.mkdir()
+
+    _update_takeover._arm_fleet_obligation(root)
+
+    record = read_host_obligation()
+    assert record is not None and record["expected_sha"] == ""
+
