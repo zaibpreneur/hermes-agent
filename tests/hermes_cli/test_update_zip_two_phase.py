@@ -617,3 +617,28 @@ def test_a_backup_copy_killed_before_its_rename_is_cleared_by_the_recovery(tmp_p
     assert not (live / ZIP_SWAP_JOURNAL).exists()
     assert sorted(p.name for p in live.iterdir() if not p.name.endswith(".lock")) == ["a.py"]
     assert (live / "a.py").read_text(encoding="utf-8") == "old\n"
+
+
+@pytest.mark.parametrize("requires", [">=3.8", ">=3.99"])
+def test_the_zip_gate_never_admits_a_conflict_marker_even_for_a_newer_python(tmp_path, monkeypatch, requires):
+    """A release whose requires-python excludes this interpreter skipped the ZIP pre-commit gate
+    entirely, so a startup module with a merge-conflict marker (broken under EVERY Python) was
+    swapped in (review C5). Its syntax may be a newer Python's, the marker never is."""
+    from hermes_cli import update_cmd_commit
+
+    armed = []
+    monkeypatch.setattr(update_cmd_commit, "arm_commit_obligations", lambda *a, **k: armed.append(a))
+    live, extracted = tmp_path / "live", tmp_path / "extracted"
+    (live / "hermes_cli").mkdir(parents=True)
+    (live / "hermes_cli" / "main.py").write_text("OLD = 1\n", encoding="utf-8")
+    (extracted / "hermes_cli").mkdir(parents=True)
+    (extracted / "hermes_cli" / "main.py").write_text(
+        "<<<<<<< HEAD\nA = 1\n=======\nA = 2\n>>>>>>> branch\n", encoding="utf-8")
+    (extracted / "pyproject.toml").write_text(
+        f'[project]\nname = "x"\nrequires-python = "{requires}"\n', encoding="utf-8")
+
+    with pytest.raises(SyntaxError):
+        update_cmd_zip._journaled_stage_and_swap(str(extracted), ["hermes_cli", "pyproject.toml"], live, None)
+
+    assert not armed  # refused before the commit point
+    assert (live / "hermes_cli" / "main.py").read_text(encoding="utf-8") == "OLD = 1\n"
