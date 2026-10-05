@@ -369,3 +369,37 @@ def test_a_second_update_in_one_process_never_hands_back_the_first_updates_debt(
     commit.disarm_commit_obligations()
 
     assert {path: path.read_bytes() if path.exists() else None for path in owed} == owed
+
+
+@pytest.mark.platforms("posix")  # unprivileged symlinks
+@pytest.mark.parametrize("kind", ["regular", "symlink", "hardlink", "none"])
+def test_disarm_restores_through_an_unpredictable_temp_and_leaves_every_sibling(root, tmp_path, kind):
+    """The restore used a fixed ``.<name>.<pid>.restore`` temp and unlinked whatever stood there
+    first: a user's ordinary file of that name was deleted (review O1). Nothing at the old name, or
+    any alias target, is touched; the record still comes back."""
+    from hermes_cli.venv_sync import completion_pending_path
+
+    tail = completion_pending_path(root)
+    tail.parent.mkdir(parents=True, exist_ok=True)
+    tail.write_bytes(b"OLD-TAIL")
+    sentinel = tmp_path / "sentinel"
+    sentinel.write_bytes(b"PRECIOUS")
+    commit.arm_commit_obligations(root, "a" * 40)
+    planted = tail.with_name(f".{tail.name}.{os.getpid()}.restore")
+    if kind == "regular":
+        planted.write_bytes(b"USER-FILE")
+    elif kind == "symlink":
+        planted.symlink_to(sentinel)
+    elif kind == "hardlink":
+        os.link(sentinel, planted)
+
+    commit.disarm_commit_obligations()
+
+    assert tail.read_bytes() == b"OLD-TAIL" and not tail.is_symlink()
+    assert sentinel.read_bytes() == b"PRECIOUS"
+    if kind == "regular":
+        assert planted.read_bytes() == b"USER-FILE"
+    elif kind != "none":
+        assert os.path.lexists(planted) and planted.read_bytes() == b"PRECIOUS"
+    assert sorted(p.name for p in tail.parent.iterdir() if p.name.endswith(".restore")) == (
+        [planted.name] if kind != "none" else [])

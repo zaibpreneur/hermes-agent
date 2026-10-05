@@ -118,7 +118,7 @@ def disarm_commit_obligations() -> None:
             if root is not None:
                 _owe_for(root, head)
             return
-    from hermes_cli.update_host_obligation import host_obligation_path, release_host_obligation
+    from hermes_cli.update_host_obligation import host_obligation_path, release_host_obligation, replace_bytes
 
     snapshot, _armed_snapshot = _armed_snapshot, None
     armed = dict(_armed_bytes)
@@ -136,15 +136,9 @@ def disarm_commit_obligations() -> None:
             if data is None:
                 path.unlink(missing_ok=True)
             else:
-                # A fresh file, never through whatever a leftover ``.restore`` name points at.
-                tmp = path.with_name(f".{path.name}.{os.getpid()}.restore")
-                tmp.unlink(missing_ok=True)
-                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                with os.fdopen(fd, "wb") as handle:
-                    handle.write(data)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(tmp, path)
+                # An unpredictable exclusive temp, never a fixed name: nothing at any guessable
+                # sibling is written through or deleted first (reviews N05, O1).
+                replace_bytes(path, data)
         except OSError:
             pass  # an owed tail/restart left armed is a retry, never a lost obligation
 

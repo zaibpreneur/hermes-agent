@@ -218,10 +218,10 @@ def release_host_obligation(owner: str) -> None:
     if found is None:
         path.unlink(missing_ok=True)
     else:
-        _replace_bytes(path, found)
+        replace_bytes(path, found)
 
 
-def _replace_bytes(path: Path, data: bytes) -> None:
+def replace_bytes(path: Path, data: bytes) -> None:
     """Put ``data`` back at ``path``: a fresh ``mkstemp`` file (never through a planted alias),
     fsynced, then renamed over the record."""
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.stem}_", suffix=".restore")
