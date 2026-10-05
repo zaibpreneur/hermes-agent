@@ -534,3 +534,36 @@ def test_the_old_updater_runs_its_takeover_in_the_job(tmp_path, monkeypatch, cap
         lock.release()
     assert code == 0 and started.exists()
     assert "would not take the takeover" in capsys.readouterr().out
+
+
+
+# --- C3: a normal release never frees the checkout under a build descendant ------------------
+
+def test_a_build_descendant_left_by_its_leader_never_writes_after_a_normal_release(tmp_path):
+    """C3: npm exits while a builder grandchild it started keeps running. The launcher returns
+    only once that grandchild is gone, so after the owner's ordinary release a contender
+    admitted to the checkout sees no late write. Control: the leader's exit status passes through."""
+    from hermes_cli.update_custody import contained_command
+
+    install = tmp_path / "checkout"
+    install.mkdir()
+    late = tmp_path / "late"
+    writer = f"import pathlib, time; time.sleep(4); pathlib.Path({str(late)!r}).touch()"
+    leader = [sys.executable, "-c",
+              "import subprocess, sys; d = subprocess.DEVNULL; "
+              f"subprocess.Popen([sys.executable, '-c', {writer!r}], stdin=d, stdout=d, stderr=d); sys.exit(3)"]
+    lock = UpdateLock(path=tmp_path / "m", install_root=install)
+    assert lock.acquire()
+    try:
+        with contained_command(leader, root=install) as (argv, custody):
+            done = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, timeout=60, **custody)
+    finally:
+        lock.release()
+    assert done.returncode == 3, done
+    contender = UpdateLock(path=tmp_path / "other-home-marker", install_root=install)
+    assert contender.acquire(), "the checkout stayed locked after a normal release"
+    try:
+        time.sleep(6)
+        assert not late.exists(), "a build descendant wrote after the checkout was handed to a contender"
+    finally:
+        contender.release()
