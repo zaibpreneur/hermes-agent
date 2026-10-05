@@ -410,6 +410,19 @@ def test_a_rollback_marker_outlives_a_lock_that_may_still_be_live(tmp_path):
     assert _git(root, "status", "--porcelain", "--untracked-files=no") == ""
 
 
+def test_a_rollback_settles_beside_an_unrelated_tracked_edit_and_keeps_it(tmp_path, capsys):
+    """HEAD and the index are back on ``pre`` but the broken files are still on disk, and the user has
+    since edited a file the update never touched: the rollback finishes on its own paths, the edit stays."""
+    root, pre, target = _broken_release(tmp_path, 4)
+    marker = _rollback_marker(root, pre, target)
+    _git(root, "reset", "-q", pre)  # the rollback's reset landed; its file restore was killed
+    (root / "bulk" / "f1.txt").write_text("my edit\n", encoding="utf-8", newline="")
+    assert er.restore_interrupted_pull(root) is True
+    assert "reset --hard" not in capsys.readouterr().err
+    assert not marker.exists() and (root / "module.py").read_text(encoding="utf-8") == "good = True\n"
+    assert _git(root, "status", "--porcelain", "--untracked-files=no") == "M bulk/f1.txt"
+
+
 def test_a_launch_that_cannot_get_the_repair_claim_never_continues_from_the_torn_tree(tmp_path, monkeypatch):
     """Another launch holds the restore claim past the wait while the marker says the tree is torn:
     this launch must stop (fail closed) instead of reporting 'nothing to repair' and importing it."""

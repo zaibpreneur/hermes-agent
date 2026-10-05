@@ -1016,8 +1016,7 @@ def _restore_holding_claim(root: Path, marker: Path, *, after_failure: bool = Fa
     if written is None:  # after a gc or re-clone: nothing left to compare against
         if rollback and not _rollback_verified(git, git_dir, pre):
             print(f"⚠ An interrupted `hermes update` rollback to {pre[:10]} is not verified and commit "
-                  f"{target[:10]} is gone. Inspect `git -C {root} status`; `git -C {root} reset --hard "
-                  f"{pre[:10]}` finishes it.", file=sys.stderr)
+                  f"{target[:10]} is gone; the marker was kept. Inspect `git -C {root} status`.", file=sys.stderr)
             return False
         marker.unlink()
         print(f"⚠ Ignoring a stale interrupted-update marker: commit {target[:10]} is gone.", file=sys.stderr)
@@ -1042,12 +1041,12 @@ def _restore_holding_claim(root: Path, marker: Path, *, after_failure: bool = Fa
     for rel in sorted(new_dirs, key=lambda d: d.count("/"), reverse=True):
         with contextlib.suppress(OSError):
             (root / rel).rmdir()  # only when empty: an untracked file inside keeps it
-    if rollback and not _rollback_verified(git, git_dir, pre):
-        # A rollback owns the whole tree (the update parked local edits first): only HEAD on ``pre``
-        # with no tracked change left is a finished rollback. Anything less keeps its only record.
-        print(f"  ✗ The rollback to {pre[:10]} is not verified yet (tracked files still differ); the next "
-              f"launch retries. Inspect `git -C {root} status`; `git -C {root} reset --hard {pre[:10]}` "
-              "finishes it by hand.", file=sys.stderr)
+    if rollback and not _rollback_verified(git, git_dir, pre, owned=set(restore)):
+        # Only HEAD on ``pre`` with every path the update wrote back at ``pre`` is a finished rollback;
+        # anything less keeps its only record. Other tracked edits (made after the kill, or autocrlf /
+        # filemode noise) are not the rollback's to judge, and no reset is advised: it would wipe them.
+        print(f"  ✗ The rollback to {pre[:10]} is not verified yet (files the update wrote still differ); "
+              f"the next launch retries. Inspect `git -C {root} status`.", file=sys.stderr)
         return bool(restore or added)
     marker.unlink()
     if not restore and not added:
@@ -1080,13 +1079,15 @@ def _redo_rollback_head(git, git_dir: Path, root: Path, pre: str, mode: str, *, 
     return None
 
 
-def _rollback_verified(git, git_dir: Path, pre: str) -> bool:
-    """The whole-tree rollback landed: HEAD is ``pre``, no index lock, no tracked change."""
+def _rollback_verified(git, git_dir: Path, pre: str, owned: set[str] | None = None) -> bool:
+    """The rollback landed: HEAD is ``pre``, no index lock, and no tracked change among ``owned`` (the
+    paths the update wrote), or anywhere when they are unknown (``target`` gone)."""
     head = git("rev-parse", "HEAD")
     if head.returncode != 0 or head.stdout.strip() != pre or (git_dir / "index.lock").exists():
         return False
-    status = git("status", "--porcelain", "-z", "--untracked-files=no")
-    return status.returncode == 0 and not status.stdout.strip("\0")
+    status = git("status", "--porcelain", "-z", "--untracked-files=no", "--no-renames")
+    changed = {entry[3:] for entry in status.stdout.split("\0") if entry}
+    return status.returncode == 0 and not (changed if owned is None else changed & owned)
 
 
 def _put_back_paths(git, root: Path, restore: list[str], added: list[str]) -> subprocess.CompletedProcess | None:
