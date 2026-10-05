@@ -456,11 +456,19 @@ def test_a_launch_that_cannot_get_the_repair_claim_never_continues_from_the_torn
     fd = os.open(marker.parent / er._RESTORE_CLAIM, os.O_RDWR | os.O_CREAT, 0o644)
     try:
         assert er._lock_fd(fd, True)
-        with pytest.raises(RuntimeError, match="launch again"):
+        with pytest.raises(SystemExit, match="launch again"):
             er.restore_interrupted_pull(root)
+        # A real launch sees one line and exit 1, never a traceback (review C14).
+        launch = subprocess.run(
+            [sys.executable, "-c", "import sys; from pathlib import Path; from hermes_cli import _early_recovery as er; "
+             "er._RESTORE_CLAIM_WAIT_SECONDS = 0.2; er.restore_interrupted_pull(Path(sys.argv[1]))", str(root)],
+            cwd=Path(er.__file__).resolve().parent.parent, capture_output=True, text=True, encoding="utf-8",
+            timeout=60)
     finally:
         er._lock_fd(fd, False)
         os.close(fd)
+    assert launch.returncode == 1 and "Traceback" not in launch.stderr
+    assert launch.stderr.strip().count("\n") == 0 and "launch again" in launch.stderr
     assert marker.exists() and _git(root, "rev-parse", "HEAD") == target
     assert er.restore_interrupted_pull(root) is True  # once the claim is free the repair runs
     assert _git(root, "rev-parse", "HEAD") == pre and not marker.exists()
