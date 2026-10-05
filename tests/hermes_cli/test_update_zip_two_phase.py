@@ -597,3 +597,23 @@ def test_a_journal_that_cannot_be_dropped_after_the_commit_never_fails_the_updat
     finally:
         update_cmd_commit.reset_for_tests()
     assert (live / "payload" / "version.txt").read_text(encoding="utf-8-sig") == "new"
+
+
+def test_a_backup_copy_killed_before_its_rename_is_cleared_by_the_recovery(tmp_path):
+    """On a file system without hardlinks ``_file_backup`` copies to ``<entry>.hermes-update-old.tmp``
+    first. A kill inside that copy left the temp behind: recovery dropped only staging and the backup,
+    so every later ZIP update refused on "uncommitted changes" (review C4)."""
+    from hermes_cli._early_recovery import ZIP_SWAP_JOURNAL, restore_interrupted_zip_swap, write_zip_swap_journal
+
+    live = tmp_path / "live"
+    live.mkdir()
+    (live / "a.py").write_text("old\n", encoding="utf-8")
+    (live / "a.py.hermes-update-staging").write_text("new\n", encoding="utf-8")
+    (live / "a.py.hermes-update-old.tmp").write_text("ol", encoding="utf-8")  # the killed copy
+    write_zip_swap_journal(live, "swapping", [["a.py", True]])
+
+    restore_interrupted_zip_swap(live)
+
+    assert not (live / ZIP_SWAP_JOURNAL).exists()
+    assert sorted(p.name for p in live.iterdir() if not p.name.endswith(".lock")) == ["a.py"]
+    assert (live / "a.py").read_text(encoding="utf-8") == "old\n"

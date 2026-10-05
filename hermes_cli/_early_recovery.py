@@ -825,7 +825,8 @@ def restore_interrupted_zip_swap(project_root: Path | None = None) -> bool:
                 elif existed and not dst.exists() and old.exists():
                     os.rename(old, dst)  # the backup is the only copy left
                     changed = True
-                for leftover in (staging, old):
+                # ``<old>.tmp``: a backup copy killed before its rename (no-hardlink file systems).
+                for leftover in (staging, old, Path(f"{old}.tmp")):
                     _drop_path(leftover)
             except OSError as exc:
                 failed = True
