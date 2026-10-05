@@ -28,6 +28,7 @@ from hermes_cli._early_recovery import (
     RECOVERY_CLOSURE_INIT,
     RECOVERY_CLOSURE_MANIFEST,
     blob_id,
+    _lock_identity,
     interrupted_pull_marker,
     is_object_id,
     recovery_closure_dir,
@@ -208,7 +209,10 @@ def arm_tree_move(git_cmd, root: Path, *, pre: str | None, target: str, stash: s
         with suppress(OSError, subprocess.SubprocessError):  # no closure: the in-tree repair still runs
             publish_recovery_closure(git_cmd, root, pre)
     # The restore's only record, durable before git writes: temp + fsync + rename, never in place.
+    # ``index_lock``: the lock generation already there before this move's git ran (empty: none). Only
+    # THAT one is another git's for sure; a lock that appears later can be our own killed git's.
     write_durable_text(marker, f"pid={os.getpid()}\npre={pre or ''}\ntarget={target}\nstash={stash or ''}\n"
+                       + f"index_lock={_lock_identity(marker.parent / 'index.lock')}\n"
                        + (f"rollback={rollback}\nref={ref}\n" if rollback else "")
                        + (f"git={git}\n" if (git := _absolute_git(git_cmd)) else ""))
     return marker

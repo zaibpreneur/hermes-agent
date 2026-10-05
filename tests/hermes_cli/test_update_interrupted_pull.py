@@ -860,3 +860,41 @@ def test_a_rollback_whose_branch_was_switched_away_never_advises_a_reset(tmp_pat
     err = capsys.readouterr().err
     assert "was not resumed" in err and "reset --hard" not in err
     assert "checkout main" in err and marker.exists()
+
+
+def test_a_lock_our_killed_rollback_git_left_is_reclaimed_by_the_next_launch(tmp_path):
+    """C15: the syntax rollback's own `reset -q` is SIGKILLed holding index.lock and the updater's
+    in-process settle (after_failure) recorded THAT lock as foreign, so every later launch printed
+    "cannot resume yet" forever. Only the lock generation that predates the move is foreign."""
+    if sys.platform == "darwin" and not shutil.which("lsof"):
+        pytest.skip("no lsof: a fresh dead lock cannot be proven dead here")
+    from hermes_cli import update_cmd_commit
+
+    root, pre, target = _broken_release(tmp_path, 2)
+    marker = update_cmd_commit.arm_tree_move(["git"], root, pre=pre, target=target, stash=None,
+                                             rollback="branch")
+    lock = root / ".git" / "index.lock"
+    lock.write_bytes(b"")  # our killed git's: it appeared after the marker was armed
+    os.utime(lock, ns=(1_000_000_000, 1_000_000_000))
+
+    assert er.restore_interrupted_pull(root, after_failure=True) is False  # the updater: never judges it
+    assert "foreign_lock=" not in marker.read_text(encoding="utf-8")
+    assert er.restore_interrupted_pull(root) is True  # the next launch: proven dead, reclaimed
+    assert _git(root, "rev-parse", "HEAD") == pre and not lock.exists() and not marker.exists()
+
+
+def test_a_lock_that_predates_the_move_stays_foreign_after_our_git_exited(tmp_path):
+    """F05/F06 unchanged: the lock generation already there when the move was armed is another
+    git's (e.g. `git commit` waiting in the editor, fd closed); no later launch deletes it."""
+    from hermes_cli import update_cmd_commit
+
+    root, pre, target = _broken_release(tmp_path, 2)
+    lock = root / ".git" / "index.lock"
+    lock.write_bytes(b"")
+    marker = update_cmd_commit.arm_tree_move(["git"], root, pre=pre, target=target, stash=None,
+                                             rollback="branch")
+
+    assert er.restore_interrupted_pull(root, after_failure=True) is False
+    assert er.restore_interrupted_pull(root) is False
+    assert lock.exists() and marker.exists(), "a lock that predates the move was deleted"
+    assert _git(root, "rev-parse", "HEAD") == target

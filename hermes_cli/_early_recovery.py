@@ -1031,7 +1031,10 @@ def _restore_holding_claim(root: Path, marker: Path, *, after_failure: bool = Fa
     # git that EXITED (``after_failure``) a lock now is another git's, never ours to drop.
     lock = git_dir / "index.lock"
     foreign_lock = after_failure and lock.exists()
-    if foreign_lock:
+    if foreign_lock and _lock_predates_move(fields, lock):
+        # Only the generation that was there before our git ran is another git's for sure. A lock
+        # that appeared during the move can be our own SIGKILLed git's: never judged here (this
+        # process cannot tell), but a later launch reclaims it once no git holds it (C15).
         _remember_foreign_lock(marker, lock)
     # The lock generation judged foreign when our git exited is never a killed git's to reclaim later:
     # a live `git commit` in the editor holds it with its fd closed, which only Linux can still see.
@@ -1125,6 +1128,15 @@ def _lock_identity(lock: Path) -> str:
     except OSError:
         return ""
     return f"{st.st_ino}:{st.st_mtime_ns}"
+
+
+def _lock_predates_move(fields: dict[str, str], lock: Path) -> bool:
+    """``lock`` is the generation ``arm_tree_move`` saw before the move's git ran. A marker without
+    the record (an older updater's, hand-written) cannot say: every lock counts as foreign."""
+    if "index_lock" not in fields:
+        return True
+    before = fields["index_lock"].strip()
+    return bool(before) and before == _lock_identity(lock)
 
 
 def _remember_foreign_lock(marker: Path, lock: Path) -> None:
