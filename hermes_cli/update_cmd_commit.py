@@ -118,7 +118,8 @@ def disarm_commit_obligations() -> None:
                 # A fresh file, never through whatever a leftover ``.restore`` name points at.
                 tmp = path.with_name(f".{path.name}.{os.getpid()}.restore")
                 tmp.unlink(missing_ok=True)
-                with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as handle:
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "wb") as handle:
                     handle.write(data)
                 os.replace(tmp, path)
         except OSError:
