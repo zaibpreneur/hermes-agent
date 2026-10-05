@@ -529,12 +529,12 @@ def test_a_stale_backup_never_stands_in_for_the_live_entry(tmp_path, monkeypatch
     monkeypatch.setattr(update_cmd_commit, "arm_commit_obligations", lambda *a, **k: None)
     live, extracted = tmp_path / "live", tmp_path / "extracted"
     (live / "pkg").mkdir(parents=True)
-    (live / "pkg" / "m.py").write_text("LIVE_OLD")
+    (live / "pkg" / "m.py").write_text("LIVE_OLD", encoding="utf-8")
     (extracted / "pkg").mkdir(parents=True)
-    (extracted / "pkg" / "m.py").write_text("NEW")
+    (extracted / "pkg" / "m.py").write_text("NEW", encoding="utf-8")
     stale = live / "pkg.hermes-update-old" / "ro"
     stale.mkdir(parents=True)
-    (stale / "f").write_text("stale remnant")
+    (stale / "f").write_text("stale remnant", encoding="utf-8")
     stale.chmod(0o555)
     try:
         _swap_or_recover(extracted, ["pkg"], live)
@@ -543,7 +543,7 @@ def test_a_stale_backup_never_stands_in_for_the_live_entry(tmp_path, monkeypatch
             if path.is_dir():
                 path.chmod(0o755)
     module = live / "pkg" / "m.py"
-    assert module.is_file() and module.read_text() in ("LIVE_OLD", "NEW"), sorted(
+    assert module.is_file() and module.read_text(encoding="utf-8-sig") in ("LIVE_OLD", "NEW"), sorted(
         str(p.relative_to(live)) for p in live.rglob("*"))
 
 
@@ -555,11 +555,11 @@ def test_a_failed_swap_keeps_a_file_the_user_made_at_a_never_installed_entry(tmp
     live, extracted = tmp_path / "live", tmp_path / "extracted"
     for side, text in ((live, "old"), (extracted, "new")):
         (side / "a").mkdir(parents=True)
-        (side / "a" / "v.txt").write_text(text)
-    (extracted / "brand_new").write_text("new entry")
+        (side / "a" / "v.txt").write_text(text, encoding="utf-8")
+    (extracted / "brand_new").write_text("new entry", encoding="utf-8")
     user_file = live / "brand_new"
     monkeypatch.setattr(update_cmd_commit, "arm_commit_obligations",
-                        lambda *a, **k: user_file.write_text("USER NOTE"))
+                        lambda *a, **k: user_file.write_text("USER NOTE", encoding="utf-8"))
     real_rename = os.rename
 
     def refuse_moving_a(src, dst):  # Windows AV holding ``a`` open
@@ -570,6 +570,6 @@ def test_a_failed_swap_keeps_a_file_the_user_made_at_a_never_installed_entry(tmp
     monkeypatch.setattr(update_cmd_zip.os, "rename", refuse_moving_a)
     _swap_or_recover(extracted, ["a", "brand_new"], live)
     monkeypatch.undo()
-    assert user_file.is_file() and user_file.read_text() == "USER NOTE"
-    assert (live / "a" / "v.txt").read_text() == "old"
+    assert user_file.is_file() and user_file.read_text(encoding="utf-8-sig") == "USER NOTE"
+    assert (live / "a" / "v.txt").read_text(encoding="utf-8-sig") == "old"
     assert not [p.name for p in live.iterdir() if "hermes-update-staging" in p.name or p.name.endswith("-old")]

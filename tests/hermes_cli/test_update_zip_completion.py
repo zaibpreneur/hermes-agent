@@ -457,6 +457,6 @@ def test_unpinned_zip_update_owes_the_restart_for_the_archive_commit(tmp_path, m
     monkeypatch.setattr(update_cmd_commit, "arm_commit_obligations", lambda _root, expected: armed.append(expected))
     monkeypatch.setattr(update_cmd, "_complete_source_update", lambda request: completed.append(dict(request)))
     update_cmd_zip._update_via_zip(SimpleNamespace(branch="main"), completion_request={})
-    assert (root / "payload.txt").read_text(encoding="utf-8") == "new"
+    assert (root / "payload.txt").read_text(encoding="utf-8-sig") == "new"
     assert armed == [sha]
     assert [request["expected_sha"] for request in completed] == [sha]

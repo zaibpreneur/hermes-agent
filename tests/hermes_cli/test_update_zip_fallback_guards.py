@@ -315,7 +315,7 @@ def test_zip_gate_refuses_and_keeps_a_user_file_named_like_an_update_artifact(tm
     with pytest.raises(SystemExit) as exc_info:
         update_cmd._abort_zip_update_if_dirty_tree()
     assert exc_info.value.code == 1
-    assert (tmp_path / name).read_text(encoding="utf-8") == "PRECIOUS USER BYTES"
+    assert (tmp_path / name).read_text(encoding="utf-8-sig") == "PRECIOUS USER BYTES"
 
 
 def test_zip_gate_admits_the_retry_after_an_interrupted_swap(tmp_path, monkeypatch):
@@ -330,7 +330,7 @@ def test_zip_gate_admits_the_retry_after_an_interrupted_swap(tmp_path, monkeypat
     monkeypatch.setattr(hermes_main, "PROJECT_ROOT", tmp_path)
     update_cmd._abort_zip_update_if_dirty_tree()
     assert not leftover.exists() and not (tmp_path / ZIP_SWAP_JOURNAL).exists()
-    assert (tmp_path / "alpha" / "x.py").read_text(encoding="utf-8") == "x = 1\n"
+    assert (tmp_path / "alpha" / "x.py").read_text(encoding="utf-8-sig") == "x = 1\n"
 
 
 def test_preserved_filter_does_not_split_non_rename_lines():
