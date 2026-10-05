@@ -1128,8 +1128,9 @@ def _switch_branch_at_commit_point(git_cmd, branch, target_ref, *, pre, stash):
             if args is attempts[0][0]:
                 continue  # no local branch: only the -B form can land on it
             return _git_run(git_cmd, args)  # unresolvable: git fails before touching the tree
-        refused = _commit.arm_commit_point(git_cmd, root, resolve(target_ref) or target, pre=pre, target=target,
-                                           stash=stash)
+        # Owe what this attempt lands on: a stop before CP1 must be dischargeable at *target*
+        # (CP1 retargets the obligation before its own move).
+        refused = _commit.arm_commit_point(git_cmd, root, target, pre=pre, target=target, stash=stash)
         if refused:  # nothing moved: the caller restores the autostash and exits
             return subprocess.CompletedProcess(args, 1, "", refused)
         try:

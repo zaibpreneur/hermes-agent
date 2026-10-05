@@ -684,6 +684,22 @@ def test_a_branch_switch_whose_marker_cannot_be_written_never_starts(checkout, c
     assert _git(root, "rev-parse", "--abbrev-ref", "HEAD") == "feat"
 
 
+def test_a_branch_switch_owes_the_restart_for_the_commit_it_lands_on(checkout, commit_point):
+    """Local main (A) trails origin/main (B): CP0 lands on A, so a stop before CP1 must leave debt
+    a checkout at A can discharge, never B's (N16)."""
+    from hermes_cli.update_host_obligation import read_host_obligation
+
+    root, a, b = checkout
+    _git(root, "checkout", "-q", "-b", "feat")
+    _git(root, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-q", "--allow-empty", "-m", "parked")
+    parked = _git(root, "rev-parse", "HEAD")
+
+    result = update_cmd._switch_branch_at_commit_point(["git"], "main", "origin/main", pre=parked, stash=None)
+
+    assert result.returncode == 0 and _git(root, "rev-parse", "HEAD") == a
+    assert (read_host_obligation() or {}).get("expected_sha") == a != b
+
+
 def test_an_unmarked_rollback_that_fails_never_reports_the_install_unchanged(checkout, commit_point, monkeypatch, capsys):
     """The syntax rollback cannot refuse (the tree is already broken), but without a marker only a
     tree verified whole at pre may be reported restored (F25)."""
