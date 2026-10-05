@@ -19,6 +19,7 @@ from hermes_cli import main
 import pytest
 import subprocess
 import sys
+from pathlib import Path
 
 
 # ---------------------------------------------------------------------------
@@ -89,10 +90,105 @@ def test_pull_rolls_back_broken_critical_file_and_accepts_corrected_retry(tmp_pa
     assert subprocess.run([sys.executable, str(source)], capture_output=True, text=True, encoding="utf-8", check=True).stdout == "corrected\n"
 
 
-def test_syntax_guards_skip_a_target_that_requires_a_newer_python(tmp_path, monkeypatch):
-    """A release that bumps ``requires-python`` past this interpreter may use syntax only the new
-    Python parses; compiling it here would refuse that release forever. A target this interpreter
-    satisfies is still refused for the same file (real git object store, real worktree)."""
+def _python_bump_repo(tmp_path, broken_source: str):
+    """Commits: ``newer`` (requires-python >=3.99, ``hermes_constants.py`` = broken_source) and ``same``
+    (the same file, a requires-python this interpreter satisfies)."""
+    def git(*args):
+        return subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True, text=True, encoding="utf-8").stdout.strip()
+
+    git("init", "-b", "main")
+    git("config", "user.email", "test@example.invalid")
+    git("config", "user.name", "Test")
+    (tmp_path / "hermes_constants.py").write_text(broken_source, encoding="utf-8")
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text('[project]\nname = "x"\nrequires-python = ">=3.99"\n', encoding="utf-8")
+    git("add", ".")
+    git("commit", "-m", "requires a future python")
+    newer = git("rev-parse", "HEAD")
+    pyproject.write_text('[project]\nname = "x"\nrequires-python = ">=3.8"\n', encoding="utf-8")
+    git("commit", "-am", "same file, this python")
+    return git, newer, git("rev-parse", "HEAD")
+
+
+def test_a_python_bump_with_no_admitted_interpreter_is_still_syntax_checked(tmp_path, monkeypatch):
+    """A release that raises requires-python past this interpreter used to be held only to a
+    conflict-marker scan, so ``def broken(:`` (broken under every Python) passed preflight and the
+    post-pull guard (review N15). With no installed interpreter the target admits, this one judges,
+    and the refusal names the Python to install (real git object store, real worktree)."""
+    from hermes_cli import update_cmd_commit as commit
+
+    monkeypatch.setattr(commit, "_admitted_python", lambda spec: None)
+    git, newer, same = _python_bump_repo(tmp_path, "def broken(:\n")
+    critical = ["hermes_constants.py"]
+    refused = commit.target_syntax_error(["git"], tmp_path, newer, critical)
+    assert refused is not None and refused[0] == "hermes_constants.py"
+    assert "uv python install '>=3.99'" in refused[1]
+    assert commit.target_syntax_error(["git"], tmp_path, same, critical)[0] == "hermes_constants.py"
+
+    # The post-pull backstop judges the worktree the same way: rolled back, exit 1.
+    monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
+    git("checkout", "-q", newer)
+    with pytest.raises(SystemExit):
+        update_cmd._rollback_if_pulled_syntax_error(["git"], same)
+    assert git("rev-parse", "HEAD") == same
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("verdict", ["null", '["hermes_constants.py", "SyntaxError: judged by the target"]'])
+def test_a_python_bump_is_judged_by_an_interpreter_the_target_admits(tmp_path, monkeypatch, verdict):
+    """Newer grammar this interpreter rejects is admitted when the target's own Python accepts it,
+    and refused when that Python rejects it: its verdict, not this compile(), decides (N15)."""
+    from hermes_cli import update_cmd_commit as commit
+
+    target_python = tmp_path / "python3.99"
+    target_python.write_text(f"#!/bin/sh\ncat > /dev/null\necho '{verdict}'\n", encoding="utf-8")
+    target_python.chmod(0o755)
+    monkeypatch.setattr(commit, "_admitted_python", lambda spec: str(target_python))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git, newer, _same = _python_bump_repo(repo, "def newer_syntax(:\n")
+    judged = commit.target_syntax_error(["git"], repo, newer, ["hermes_constants.py"])
+    if verdict == "null":
+        assert judged is None
+    else:
+        assert judged == ("hermes_constants.py", f"SyntaxError: judged by the target (judged by {target_python})")
+
+
+def test_the_critical_inventory_covers_every_module_the_entry_paths_import_first():
+    """``hermes_bootstrap.py`` was absent from the inventory, so a target that broke only the
+    bootstrap passed preflight and the post-pull guard and failed at the first import (review G3).
+    Derived from the real launcher text, ``hermes_bootstrap``'s imports and the recovery closure."""
+    import ast
+
+    from hermes_cli import _launchers
+    from hermes_cli._early_recovery import RECOVERY_CLOSURE
+
+    root = Path(update_cmd.__file__).resolve().parents[1]
+
+    def files(source: str) -> set[str]:
+        names = set()
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Import):
+                names |= {alias.name for alias in node.names}
+            elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                names |= {node.module, *(f"{node.module}.{alias.name}" for alias in node.names)}
+        found = set()
+        for name in names:
+            parts = name.split(".")
+            for i in range(1, len(parts) + 1):
+                stem = "/".join(parts[:i])
+                found |= {rel for rel in (f"{stem}.py", f"{stem}/__init__.py") if (root / rel).is_file()}
+        return found
+
+    launcher = _launchers._launcher_script("hermes", root, None)
+    entry = files(launcher) | files((root / "hermes_bootstrap.py").read_text(encoding="utf-8"))
+    entry |= {"hermes_bootstrap.py", *RECOVERY_CLOSURE}
+    assert "hermes_bootstrap.py" in entry and "hermes_cli/main.py" in entry
+    assert entry <= set(update_cmd._UPDATE_CRITICAL_FILES), sorted(entry - set(update_cmd._UPDATE_CRITICAL_FILES))
+
+
+def test_a_malformed_bootstrap_is_refused_before_the_move(tmp_path):
+    """The preflight reads the real inventory from the target commit: a broken bootstrap refuses."""
     from hermes_cli import update_cmd_commit as commit
 
     def git(*args):
@@ -101,26 +197,36 @@ def test_syntax_guards_skip_a_target_that_requires_a_newer_python(tmp_path, monk
     git("init", "-b", "main")
     git("config", "user.email", "test@example.invalid")
     git("config", "user.name", "Test")
-    (tmp_path / "hermes_constants.py").write_text("def newer_syntax(:\n", encoding="utf-8")
-    pyproject = tmp_path / "pyproject.toml"
-    pyproject.write_text('[project]\nname = "x"\nrequires-python = ">=3.99"\n', encoding="utf-8")
+    (tmp_path / "hermes_bootstrap.py").write_text("def broken(:\n", encoding="utf-8")
+    (tmp_path / "hermes_constants.py").write_text("ok = 1\n", encoding="utf-8")
     git("add", ".")
-    git("commit", "-m", "requires a future python")
-    newer = git("rev-parse", "HEAD")
-    pyproject.write_text('[project]\nname = "x"\nrequires-python = ">=3.8"\n', encoding="utf-8")
-    git("commit", "-am", "same file, this python")
-    same = git("rev-parse", "HEAD")
+    git("commit", "-m", "broken bootstrap")
+    refused = commit.target_syntax_error(["git"], tmp_path, "HEAD", update_cmd._UPDATE_CRITICAL_FILES)
+    assert refused is not None and refused[0] == "hermes_bootstrap.py"
 
-    critical = ["hermes_constants.py"]
-    assert commit.target_syntax_error(["git"], tmp_path, newer, critical) is None
-    refused = commit.target_syntax_error(["git"], tmp_path, same, critical)
-    assert refused is not None and refused[0] == "hermes_constants.py"
 
-    # The post-pull backstop judges the worktree the same way (no rollback, no exit).
-    monkeypatch.setattr(main, "PROJECT_ROOT", tmp_path)
-    git("checkout", "-q", newer)
-    update_cmd._rollback_if_pulled_syntax_error(["git"], same)
-    assert git("rev-parse", "HEAD") == newer
+def test_the_preflight_reads_every_critical_file_in_one_git_spawn(tmp_path, monkeypatch):
+    """One ``git cat-file --batch`` for pyproject + the whole inventory, not a ``git show`` each."""
+    from hermes_cli import update_cmd_commit as commit
+
+    def git(*args):
+        return subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True, text=True, encoding="utf-8").stdout.strip()
+
+    git("init", "-b", "main")
+    git("config", "user.email", "test@example.invalid")
+    git("config", "user.name", "Test")
+    for rel in ("hermes_constants.py", "cli.py"):
+        (tmp_path / rel).write_text("ok = 1\n", encoding="utf-8")
+    (tmp_path / "hermes_cli").mkdir()
+    (tmp_path / "hermes_cli" / "main.py").write_text("x = (\n", encoding="utf-8")
+    git("add", ".")
+    git("commit", "-m", "c")
+    spawns = []
+    real = commit.run_git
+    monkeypatch.setattr(commit, "run_git", lambda git_cmd, args, **kw: spawns.append(args) or real(git_cmd, args, **kw))
+    refused = commit.target_syntax_error(["git"], tmp_path, "HEAD", update_cmd._UPDATE_CRITICAL_FILES)
+    assert refused is not None and refused[0] == "hermes_cli/main.py"
+    assert spawns == [["cat-file", "--batch"]]
 
 
 def test_the_tree_move_marker_records_the_absolute_git_the_repair_reruns(tmp_path, monkeypatch):

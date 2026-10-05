@@ -509,20 +509,10 @@ def _journaled_stage_and_swap(extracted: str, entries: list[str], root: Path, ta
             print("  Files appeared in the checkout while the update was downloading; committing the swap would delete them.")
             print(_STASH_HINT)
             _m().sys.exit(1)
-        # Pre-commit gate: a target whose startup modules do not compile is refused untouched. A
-        # target that requires a Python this interpreter is not may use syntax this compile() cannot
-        # judge; it is still held to ``conflict_marker``, which is broken under every Python.
-        pyproject = Path(extracted, "pyproject.toml")
-        newer_python = pyproject.is_file() and _commit.requires_other_python(pyproject.read_bytes())
-        for rel in _UPDATE_CRITICAL_FILES:
-            path = os.path.join(extracted, *rel.split("/"))
-            if os.path.isfile(path):
-                with open(path, "rb") as handle:
-                    source = handle.read()
-                if not newer_python:
-                    compile(source, rel, "exec", dont_inherit=True)
-                elif reason := _commit.conflict_marker(source):
-                    raise SyntaxError(f"{rel}: {reason}")
+        # Pre-commit gate: a target whose startup modules do not compile is refused untouched, judged
+        # under the interpreter the target admits (``startup_syntax_error``, review N15).
+        if broken := _commit.tree_syntax_error(Path(extracted), _UPDATE_CRITICAL_FILES):
+            raise SyntaxError(f"{broken[0]}: {broken[1]}")
         # The commit point: tail + fleet restart owed before the first live rename.
         _commit.arm_commit_obligations(root, target_sha or "")
         for entry in journal_entries:

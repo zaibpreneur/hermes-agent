@@ -197,7 +197,13 @@ def _map_ssl_cert_file_for_git(git_cmd) -> None:
     os.environ["GIT_SSL_CAINFO"] = bundle
 
 
+# Compiled before (preflight) and after (post-pull guard, ZIP gate) every tree move. The first rows
+# are what the launcher and ``hermes_bootstrap`` import before any application code (review G3);
+# test_update_post_pull_syntax_guard derives that set from the real entry paths and pins it here.
 _UPDATE_CRITICAL_FILES = (
+    "hermes_bootstrap.py", "hermes_cli/_parser.py", "hermes_cli/_launchers.py",
+    "hermes_cli/_early_recovery.py", "hermes_cli/update_lock.py", "hermes_cli/update_custody.py",
+    "hermes_cli/update_handoff.py", "hermes_cli/venv_sync.py", "pm/__init__.py", "pm/environments.py",
     "hermes_cli/main.py", "hermes_cli/config.py", "hermes_cli/__init__.py",
     "hermes_cli/web_server.py", "cli.py", "run_agent.py", "model_tools.py", "toolsets.py",
     "hermes_constants.py")
@@ -910,12 +916,9 @@ def _rollback_if_pulled_syntax_error(git_cmd, pre_pull_sha, *, rollback_branch=N
     file no longer compiles (a bad admin-merge past CI must not brick the CLI)."""
     pyproject = Path(_m().PROJECT_ROOT) / "pyproject.toml"
     if pyproject.is_file() and _commit.requires_other_python(pyproject.read_bytes()):
-        # A newer Python's syntax: this interpreter's compile() cannot judge it; a conflict marker
-        # is broken under every Python.
-        marked = [(rel, reason) for rel in _UPDATE_CRITICAL_FILES
-                  if (path := Path(_m().PROJECT_ROOT) / rel).is_file()
-                  and (reason := _commit.conflict_marker(path.read_bytes()))]
-        syntax_ok, failing_path, syntax_error = (not marked, *(marked[0] if marked else (None, None)))
+        # A newer Python's syntax: judged by an installed interpreter the target admits (N15).
+        broken = _commit.tree_syntax_error(_m().PROJECT_ROOT, _UPDATE_CRITICAL_FILES)
+        syntax_ok, failing_path, syntax_error = (broken is None, *(broken or (None, None)))
     else:
         syntax_ok, failing_path, syntax_error = _validate_critical_files_syntax(_m().PROJECT_ROOT)
     if syntax_ok:

@@ -355,40 +355,156 @@ def settle_failed_tree_move(root: Path) -> bool:
     return not marker.is_file()
 
 
-def requires_other_python(pyproject: bytes | str | None) -> bool:
-    """True when a target's ``requires-python`` excludes the running interpreter.
-
-    Its startup modules may then use a newer Python's syntax that this interpreter's ``compile()``
-    cannot judge (PM provisions the required Python with the new code). Unknown -> False: keep
-    checking, so a real syntax error is never waved through on a guess.
-    """
+def _requires_python_spec(pyproject: bytes | str | None) -> str | None:
+    """The target's ``requires-python`` specifier, None when absent or unreadable."""
     if not pyproject:
-        return False
-    import platform
-    import re
+        return None
     import tomllib
 
     try:
         text = pyproject.decode("utf-8") if isinstance(pyproject, bytes) else pyproject
         spec = tomllib.loads(text)["project"]["requires-python"]
-        try:
-            from packaging.specifiers import SpecifierSet
-        except ImportError:  # the lower bound is the part a Python bump moves
-            floor = re.search(r">=\s*(\d+)\.(\d+)", spec)
-            return bool(floor) and sys.version_info[:2] < (int(floor[1]), int(floor[2]))
-        return not SpecifierSet(spec).contains(platform.python_version(), prereleases=True)
-    except (KeyError, TypeError, ValueError):  # TOMLDecodeError / InvalidSpecifier are ValueErrors
-        return False
+    except (KeyError, TypeError, ValueError):  # TOMLDecodeError is a ValueError
+        return None
+    return spec if isinstance(spec, str) else None
 
 
-def conflict_marker(data: bytes) -> str | None:
-    """Why ``data`` is broken under EVERY Python (a merge-conflict marker line), else None: no
-    ``requires-python`` bump excuses it. Only git's ``<<<<<<< ``/``>>>>>>> `` lines: a bare
-    ``=======`` is also a reST heading in a docstring."""
-    for number, line in enumerate(data.splitlines(), 1):
-        if line.startswith((b"<<<<<<< ", b">>>>>>> ")):
-            return f"unresolved merge-conflict marker at line {number}"
+def _spec_admits(spec: str, version: str) -> bool:
+    import re
+
+    try:
+        from packaging.specifiers import InvalidSpecifier, SpecifierSet
+    except ImportError:  # the lower bound is the part a Python bump moves
+        floor = re.search(r">=\s*(\d+)\.(\d+)", spec)
+        found = re.match(r"(\d+)\.(\d+)", version)
+        return not floor or bool(found) and (int(found[1]), int(found[2])) >= (int(floor[1]), int(floor[2]))
+    try:
+        return SpecifierSet(spec).contains(version, prereleases=True)
+    except InvalidSpecifier:
+        return True  # unknown: keep judging with this interpreter, never wave a file through
+
+
+def requires_other_python(pyproject: bytes | str | None) -> bool:
+    """True when a target's ``requires-python`` excludes the running interpreter.
+
+    Its startup modules may then use a newer Python's syntax that this interpreter's ``compile()``
+    cannot judge: ``startup_syntax_error`` asks an installed interpreter the target admits instead.
+    Unknown -> False: keep checking, so a real syntax error is never waved through on a guess.
+    """
+    import platform
+
+    spec = _requires_python_spec(pyproject)
+    return spec is not None and not _spec_admits(spec, platform.python_version())
+
+
+_PYTHON_VERSION = "import platform; print(platform.python_version())"
+# Run by the target's interpreter: compile every startup file sent on stdin, print the first error.
+_COMPILE_ALL = (
+    "import base64, json, sys\n"
+    "verdict = None\n"
+    "for rel, data in json.load(sys.stdin).items():\n"
+    "    try:\n"
+    "        compile(base64.b64decode(data), rel, 'exec', dont_inherit=True)\n"
+    "    except (SyntaxError, ValueError) as exc:\n"
+    "        verdict = [rel, f'{type(exc).__name__}: {exc}']\n"
+    "        break\n"
+    "print(json.dumps(verdict))\n")
+
+
+def _run_python(argv: list[str], *, stdin: str = "", timeout: float = 60) -> str | None:
+    """Stdout of a read-only interpreter child (it never writes the checkout), None when it failed."""
+    from hermes_cli._subprocess_compat import windows_hide_flags
+
+    try:
+        done = subprocess.run(argv, input=stdin, capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=timeout, creationflags=windows_hide_flags())
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return done.stdout if done.returncode == 0 else None
+
+
+def _admitted_python(spec: str) -> str | None:
+    """An installed interpreter the target's ``requires-python`` admits (uv's view first, then
+    ``python3.N`` on PATH, newest first), or None when this machine has none."""
+    import shutil
+
+    candidates = []
+    if uv := shutil.which("uv"):
+        found = (_run_python([uv, "python", "find", "--no-project", spec], timeout=30) or "").strip()
+        candidates += found.splitlines()[-1:]
+    candidates += [path for minor in range(40, sys.version_info[1], -1)
+                   if (path := shutil.which(f"python3.{minor}"))][:3]
+    for python in candidates:
+        version = (_run_python([python, "-I", "-c", _PYTHON_VERSION], timeout=30) or "").strip()
+        if version and _spec_admits(spec, version):
+            return python
     return None
+
+
+def _compile_here(sources: dict[str, bytes]) -> tuple[str, str] | None:
+    for rel, data in sources.items():
+        try:
+            compile(data, rel, "exec", dont_inherit=True)
+        except (SyntaxError, ValueError) as exc:
+            return rel, f"{type(exc).__name__}: {exc}"
+    return None
+
+
+def startup_syntax_error(sources: dict[str, bytes | None], pyproject: bytes | None) -> tuple[str, str] | None:
+    """``(path, error)`` for the first startup file that does not compile, else None.
+
+    Judged by the interpreter that will run the target: this one when the target's
+    ``requires-python`` admits it, else an installed interpreter it admits (review N15: a
+    conflict-marker scan is not a syntax check). With none installed, this interpreter still
+    judges: code it parses is code a newer Python parses, and a refusal names the Python to install
+    so the release can be judged by its own interpreter. ``None`` values (absent files) are skipped.
+    """
+    import base64
+    import json
+    import platform
+
+    present = {rel: data for rel, data in sources.items() if data is not None}
+    spec = _requires_python_spec(pyproject)
+    if spec is None or _spec_admits(spec, platform.python_version()):
+        return _compile_here(present)
+    if python := _admitted_python(spec):
+        payload = json.dumps({rel: base64.b64encode(data).decode("ascii") for rel, data in present.items()})
+        out = _run_python([python, "-I", "-c", _COMPILE_ALL], stdin=payload, timeout=120)
+        try:
+            verdict = json.loads((out or "").strip().splitlines()[-1])
+        except (IndexError, ValueError):
+            verdict = False  # the target's interpreter gave no verdict: judge here (below)
+        if verdict is None:
+            return None
+        if isinstance(verdict, list) and len(verdict) == 2:
+            return str(verdict[0]), f"{verdict[1]} (judged by {python})"
+    broken = _compile_here(present)
+    if broken is None:
+        return None
+    return broken[0], (f"{broken[1]}\nJudged by Python {platform.python_version()}: the target requires Python "
+                       f"{spec} and no installed interpreter satisfies it. Install one (`uv python install "
+                       f"'{spec}'`) and re-run `hermes update` so the release is judged by its own Python.")
+
+
+def read_target_files(git_cmd, root: Path, target_ref: str, relpaths) -> dict[str, bytes | None]:
+    """``{rel: bytes}`` of each path as committed at ``target_ref`` (None: absent there or unreadable),
+    in ONE ``git cat-file --batch`` instead of one ``git show`` per file."""
+    names = list(dict.fromkeys(relpaths))
+    found: dict[str, bytes | None] = dict.fromkeys(names)
+    request = "".join(f"{target_ref}:{rel}\n" for rel in names).encode("utf-8")
+    cp = run_git(git_cmd, ["cat-file", "--batch"], cwd=str(root), input=request, capture_output=True, timeout=120)
+    out, pos = (cp.stdout or b"") if cp.returncode == 0 else b"", 0
+    for rel in names:
+        end = out.find(b"\n", pos)
+        if end < 0:
+            break
+        header, pos = out[pos:end].split(), end + 1
+        if len(header) == 3 and header[2].isdigit():  # "<oid> <type> <size>", then the bytes and "\n"
+            size = int(header[2])
+            if header[1] == b"blob":
+                found[rel] = out[pos:pos + size]
+            pos += size + 1
+    return found
 
 
 def target_syntax_error(git_cmd, root: Path, target_ref: str, relpaths) -> tuple[str, str] | None:
@@ -396,26 +512,25 @@ def target_syntax_error(git_cmd, root: Path, target_ref: str, relpaths) -> tuple
 
     Read from the object store, never written to the tree: this runs BEFORE HEAD moves, so a broken
     release is refused with the install untouched (the post-pull rollback stays as the backstop).
-    A target that requires a Python this interpreter is not (``requires_other_python``) is held only
-    to ``conflict_marker``: its syntax may be a newer Python's.
+    ``startup_syntax_error`` judges it under the interpreter the target admits. A file absent at the
+    target (or unreadable) is skipped: the post-pull guard has the last word.
     """
-    pyproject = run_git(git_cmd, ["show", f"{target_ref}:pyproject.toml"], cwd=str(root),
-                               capture_output=True, stdin=subprocess.DEVNULL, timeout=120)
-    other_python = pyproject.returncode == 0 and requires_other_python(pyproject.stdout)
+    files = read_target_files(git_cmd, root, target_ref, ["pyproject.toml", *relpaths])
+    pyproject = files.pop("pyproject.toml", None)
+    return startup_syntax_error(files, pyproject)
+
+
+def tree_syntax_error(root: Path, relpaths) -> tuple[str, str] | None:
+    """``startup_syntax_error`` for the files in the worktree at ``root`` (the post-move backstop)."""
+    root = Path(root)
+    sources: dict[str, bytes | None] = {}
     for rel in relpaths:
-        shown = run_git(git_cmd, ["show", f"{target_ref}:{rel}"], cwd=str(root), capture_output=True,
-                               stdin=subprocess.DEVNULL, timeout=120)
-        if shown.returncode != 0:
-            continue  # absent at the target (or unreadable): the post-pull guard has the last word
-        if other_python:
-            if reason := conflict_marker(shown.stdout or b""):
-                return rel, reason
-            continue
         try:
-            compile(shown.stdout, rel, "exec", dont_inherit=True)
-        except (SyntaxError, ValueError) as exc:
-            return rel, f"{type(exc).__name__}: {exc}"
-    return None
+            sources[rel] = (root / rel).read_bytes() if (root / rel).is_file() else None
+        except OSError as exc:
+            return str(rel), f"could not read: {exc}"
+    pyproject = root / "pyproject.toml"
+    return startup_syntax_error(sources, pyproject.read_bytes() if pyproject.is_file() else None)
 
 
 def head_and_branch(git_cmd, root: Path) -> tuple[str, str]:
