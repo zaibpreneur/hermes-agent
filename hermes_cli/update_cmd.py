@@ -991,6 +991,26 @@ def _rollback_if_pulled_syntax_error(git_cmd, pre_pull_sha, *, rollback_branch=N
     sys.exit(1)
 
 
+def _landed_off_target(git_cmd, target_sha: str, *, merged: bool = True) -> str | None:
+    """The HEAD a git move landed on when it is neither ``target_sha`` nor (``merged``: a custom
+    branch's merge) a commit containing it, else None: the identity the marker and debt were armed for."""
+    landed = (_git_run(git_cmd, ["rev-parse", "-q", "--verify", "HEAD"]).stdout or "").strip()
+    if landed == target_sha or (merged and landed and _git_run(
+            git_cmd, ["merge-base", "--is-ancestor", target_sha, landed]).returncode == 0):
+        return None
+    return landed or "an unreadable HEAD"
+
+
+def _refuse_unselected_head(git_cmd, target_sha: str, unmoved: str | None) -> None:
+    """``sys.exit(1)`` (the caller settles it as a failed move, its marker still on disk) when git
+    landed on a commit other than the armed one (review O2/O3). A HEAD still on ``unmoved`` is
+    ``_verify_head_after_pull``'s "code did not move" refusal."""
+    if (landed := _landed_off_target(git_cmd, target_sha)) not in (None, unmoved):
+        print(f"✗ The checkout landed on {landed[:10]}, not the selected commit {target_sha[:10]} "
+              "(a ref moved during the update).")
+        sys.exit(1)
+
+
 def _update_movement_baseline(git_cmd, pre_pull_sha, pre_sync_sha, rollback_branch, target_sha):
     """Distinguish a branch awaiting repair from an already-applied early sync."""
     if rollback_branch is not None and pre_pull_sha and target_sha:
@@ -1043,21 +1063,22 @@ def _pull_updates(
             print(f"✗ {refused}.")
             sys.exit(1)
         try:
-            # merge --ff-only the already-fetched ref instead of `git pull`, which would do a
-            # SECOND network fetch; identical in effect given the fresh tracking ref.
+            # merge --ff-only the already-fetched commit instead of `git pull`, which would do a
+            # SECOND network fetch. Every move names ``target_sha``, never the ref: a ref that moves
+            # after the arm cannot land a commit the marker and the debt do not name (review O3).
             if merge_ref != f"origin/{branch}":
                 # Keep detached local commits reachable, too. Named branches are
                 # untouched by checkout --detach; an autostash protects dirty files.
                 _park_detached_head(git_cmd, _m().PROJECT_ROOT, branch)
-                _git_run(git_cmd, ["checkout", "--detach", merge_ref], check=True)
+                _git_run(git_cmd, ["checkout", "--detach", target_sha], check=True)
             else:
-                merge_result = _git_run(git_cmd, ["merge", "--ff-only", merge_ref])
+                merge_result = _git_run(git_cmd, ["merge", "--ff-only", target_sha])
                 if merge_result.returncode != 0:
                     ancestry = _git_run(
-                        git_cmd, ["merge-base", "--is-ancestor", "HEAD", merge_ref])
+                        git_cmd, ["merge-base", "--is-ancestor", "HEAD", target_sha])
                     if ancestry.returncode == 1:
                         _reconcile_diverged_checkout(
-                            git_cmd, branch, pre_pull_sha, target_ref=merge_ref)
+                            git_cmd, branch, pre_pull_sha, target_ref=target_sha)
                     else:
                         print("✗ Fast-forward failed; refusing to reset because history divergence was not proven.")
                         detail = (merge_result.stderr or merge_result.stdout or "").strip()
@@ -1072,6 +1093,7 @@ def _pull_updates(
                                 print(f"  {ancestry_detail}")
                         print("  Resolve the Git error and re-run `hermes update`; no reset was attempted.")
                         sys.exit(1)
+            _refuse_unselected_head(git_cmd, target_sha, pre_pull_sha)  # before the marker goes
         except KeyboardInterrupt:
             raise  # Ctrl-C reached git too (same process group): the tree may be torn, keep the marker
         except BaseException:
@@ -1125,6 +1147,8 @@ def _pull_updates(
 
 #: ``args`` of the result ``_switch_branch_at_commit_point`` returns when the commit point refused.
 _ARM_REFUSED = ["arm_commit_point"]
+#: ... and when the branch ref moved between its resolution and the checkout (review O2).
+_REF_MOVED = ["ref_moved"]
 
 
 def _switch_branch_at_commit_point(git_cmd, branch, target_ref, *, pre, stash):
@@ -1137,8 +1161,11 @@ def _switch_branch_at_commit_point(git_cmd, branch, target_ref, *, pre, stash):
 
     # --no-guess: with no local *branch* git would otherwise create it from origin/<branch> and
     # rewrite the tree while this loop believed the checkout could not move.
-    attempts = [(["checkout", "--no-guess", branch], resolve(f"refs/heads/{branch}")),
-                (["checkout", "-B", branch, f"origin/{branch}"], resolve(f"origin/{branch}"))]
+    # The -B form names the resolved commit, never the ref (review O2); the local-branch form must
+    # name the branch to attach HEAD to it, so its landing is verified against the armed commit.
+    local, remote = resolve(f"refs/heads/{branch}"), resolve(f"origin/{branch}")
+    attempts = [(["checkout", "--no-guess", branch], local),
+                (["checkout", "-B", branch, remote or f"origin/{branch}"], remote)]
     result = None
     for args, target in attempts:
         if not target:
@@ -1161,6 +1188,16 @@ def _switch_branch_at_commit_point(git_cmd, branch, target_ref, *, pre, stash):
             else:
                 _commit.owe_restore_of(root, pre)
             raise
+        if result.returncode == 0 and (landed := _landed_off_target(git_cmd, target, merged=False)) is not None:
+            # The branch moved between its resolution and the checkout: the tree is whole at a commit
+            # the debt does not name. Settled like a failed move: the debt follows the landed HEAD.
+            print(f"  ✗ The branch moved to {landed[:10]} after {target[:10]} was selected.")
+            if _commit.settle_failed_tree_move(root):
+                _commit.disarm_commit_obligations()  # off the run's start: re-owed for the landed HEAD
+            else:
+                _commit.owe_restore_of(root, pre)
+            return subprocess.CompletedProcess(_REF_MOVED, 1, result.stdout, (
+                f"'{branch}' moved to {landed[:10]} during the switch; re-run `hermes update`"))
         if result.returncode == 0:
             interrupted_pull_marker(root).unlink(missing_ok=True)  # git exited 0: whole at *target*
             return result
@@ -1203,7 +1240,7 @@ def _exit_after_failed_branch_switch(git_cmd, branch, track_result, auto_stash_r
     if auto_stash_ref is not None:
         _m()._restore_stashed_changes(
             git_cmd, _m().PROJECT_ROOT, auto_stash_ref, prompt_user=False, input_fn=gw_input_fn)
-    if track_result.args == _ARM_REFUSED:
+    if track_result.args in (_ARM_REFUSED, _REF_MOVED):
         print(f"✗ {detail}.")
     else:
         print(f"✗ Branch '{branch}' does not exist locally or on origin.")

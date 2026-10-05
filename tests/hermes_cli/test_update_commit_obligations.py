@@ -194,3 +194,80 @@ def test_one_installs_disarm_never_deletes_another_installs_debt_for_the_same_sh
     _enter_run(run_b)
     commit.disarm_commit_obligations()
     assert not host_obligation_path().exists()  # the last owner puts back what the FIRST one found
+
+
+def _abc_clone(tmp_path, monkeypatch):
+    """Upstream commits A, B, C; a clone of it with PROJECT_ROOT pointed at it. Returns (clone, a, b, c)."""
+    import hermes_cli.main as hermes_main
+
+    up, clone = tmp_path / "up", tmp_path / "clone"
+    up.mkdir()
+    _git(up, "init", "-q", "-b", "main")
+    shas = []
+    for name in "ABC":
+        (up / "f").write_text(name, encoding="utf-8")
+        _git(up, "add", "-A")
+        _git(up, "commit", "-qm", name)
+        shas.append(_git(up, "rev-parse", "HEAD"))
+    _git(tmp_path, "clone", "-q", str(up), str(clone))
+    monkeypatch.setattr(hermes_main, "PROJECT_ROOT", clone)
+    monkeypatch.setattr(commit, "_owns_live_checkout", lambda _root: False)
+    monkeypatch.chdir(clone)
+    return (clone, *shas)
+
+
+def _move_ref_after_arm(monkeypatch, clone, ref, sha):
+    """The race: ``ref`` moves to ``sha`` right after the commit point armed (marker + debt)."""
+    real = commit.arm_commit_point
+
+    def arm_then_move(*args, **kwargs):
+        refused = real(*args, **kwargs)
+        _git(clone, "update-ref", ref, sha)
+        return refused
+
+    monkeypatch.setattr(commit, "arm_commit_point", arm_then_move)
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_the_pull_merges_the_armed_commit_not_a_tracking_ref_that_moved(tmp_path, monkeypatch):
+    """CP1 armed B, then origin/main moved to C before ``merge --ff-only origin/main``: HEAD landed C
+    while the debt named B and the marker was gone (review O3). The merge names the armed OID."""
+    from hermes_cli import update_cmd
+    from hermes_cli._early_recovery import interrupted_pull_marker
+    from hermes_cli.update_host_obligation import read_host_obligation
+
+    clone, a, b, c = _abc_clone(tmp_path, monkeypatch)
+    _git(clone, "reset", "-q", "--hard", a)
+    _git(clone, "update-ref", "refs/remotes/origin/main", b)
+    commit.record_run_start(["git"], clone)
+    _move_ref_after_arm(monkeypatch, clone, "refs/remotes/origin/main", c)
+    update_cmd._pull_updates(["git"], "main", None, prompt_for_restore=False, gw_input_fn=None,
+                             discard_local_changes=False, keep_stash=False)
+    assert _git(clone, "rev-parse", "HEAD") == b
+    assert (read_host_obligation() or {}).get("expected_sha") == b
+    assert not interrupted_pull_marker(clone).exists()
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_a_branch_that_moves_during_the_switch_leaves_head_and_debt_agreeing(tmp_path, monkeypatch):
+    """CP0 resolved main to A and armed A, then main moved to B before ``checkout main``: the switch
+    landed B, reported success and dropped the marker while the debt named A (review O2). It must
+    refuse, with the debt following the HEAD it landed on."""
+    from hermes_cli import update_cmd
+    from hermes_cli._early_recovery import interrupted_pull_marker
+    from hermes_cli.update_host_obligation import read_host_obligation
+
+    clone, a, b, _c = _abc_clone(tmp_path, monkeypatch)
+    _git(clone, "reset", "-q", "--hard", a)
+    _git(clone, "checkout", "-q", "-b", "feat")
+    (clone / "g").write_text("X", encoding="utf-8")
+    _git(clone, "add", "-A")
+    _git(clone, "commit", "-qm", "X")
+    x = _git(clone, "rev-parse", "HEAD")
+    commit.record_run_start(["git"], clone)
+    _move_ref_after_arm(monkeypatch, clone, "refs/heads/main", b)
+    switched = update_cmd._switch_branch_at_commit_point(["git"], "main", "origin/main", pre=x, stash=None)
+    assert switched.returncode == 1 and "moved" in switched.stderr
+    assert _git(clone, "rev-parse", "HEAD") == b
+    assert (read_host_obligation() or {}).get("expected_sha") == b
+    assert not interrupted_pull_marker(clone).exists()
