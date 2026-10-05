@@ -966,8 +966,13 @@ def _resume_killed_rollback(git, read_head, fields: dict[str, str], git_dir: Pat
     # ``target`` since is theirs (and the update's branch would stay on the broken commit).
     named = git("symbolic-ref", "-q", "HEAD")
     if "ref" not in fields or (named.stdout.strip() if named.returncode == 0 else "") != fields["ref"].strip():
+        # The marker stays: switching back lets the next launch resume. Never a reset recipe (F73):
+        # a reset --hard would wipe whatever the user changed on the branch they checked out.
+        ref = fields.get("ref", "").strip().removeprefix("refs/heads/")
+        back = (f"`git -C {root} checkout {ref}`" if ref
+                else f"`git -C {root} checkout --detach {fields.get('target', '').strip()[:10] or pre[:10]}`")
         print(f"⚠ An interrupted `hermes update` rollback to {pre[:10]} was not resumed: HEAD now names "
-              f"another branch. Run `git reset --hard {pre[:10]}` on the updated branch to finish it.",
+              f"another branch. Switch back with {back}, then launch `hermes` again to finish it.",
               file=sys.stderr)
         return None
     # A syntax rollback killed before it moved HEAD back: redo that step (HEAD and index, no file),

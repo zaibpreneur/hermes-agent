@@ -837,3 +837,18 @@ def test_the_tree_move_marker_is_durable_before_it_appears_under_its_name(checko
     assert [dst for _src, dst in replaced] == [marker]
     assert f"target={b}" in marker.read_text(encoding="utf-8")
     assert not list(marker.parent.glob(marker.name + "*.tmp"))
+
+
+def test_a_rollback_whose_branch_was_switched_away_never_advises_a_reset(tmp_path, capsys):
+    """The user checked out another branch after the rollback was killed: the restore must not
+    resume, and its advice must never be `git reset --hard` (F73: it wipes the user's work); it
+    names the way back so the next launch can finish (review C9)."""
+    root, pre, target = _broken_release(tmp_path, 2)
+    marker = _rollback_marker(root, pre, target)
+    _git(root, "checkout", "-q", "-b", "elsewhere")
+
+    assert er.restore_interrupted_pull(root) is False
+
+    err = capsys.readouterr().err
+    assert "was not resumed" in err and "reset --hard" not in err
+    assert "checkout main" in err and marker.exists()
