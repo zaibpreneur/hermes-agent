@@ -415,8 +415,8 @@ def preflight_refusal(git_cmd, root: Path, target_ref: str, critical_files) -> s
             refuse_foreign_owned_venv(root)
         except ImportError:
             pass
-        except Exception as exc:  # pm's refusal carries its own remediation text
-            return f"✗ {exc}"
+        except Exception as exc:  # health: allow BLE001 -- fail closed: any probe error refuses before the first move
+            return f"✗ {exc}"  # pm's refusal carries its own remediation text
     broken = target_syntax_error(git_cmd, root, target_ref, critical_files)
     if broken is not None:
         path, error = broken

@@ -497,7 +497,7 @@ def _download_and_swap_zip(branch: str, zip_url: str, target_sha: str | None = N
         staged = _journaled_stage_and_swap(extracted, entries, Path(project_root), target_sha)
         print(f"✓ Updated {len(staged)} items from ZIP")
         return target_sha
-    except Exception as e:
+    except Exception as e:  # health: allow BLE001 -- all-or-nothing boundary: any failure settles the journal, exits 1
         # The swap rolled itself back; a rollback that could not finish leaves the journal, which
         # this settles now (or the next launch's _early_recovery does) instead of leaking siblings.
         with suppress(Exception):
