@@ -1238,7 +1238,8 @@ def _count_failed_attempt(marker: Path) -> None:
     # Best-effort: an unwritable marker only means the limit trips later.
     with contextlib.suppress(OSError):
         attempts = _read_marker_attempts(marker) + 1
-        body = marker.read_text(encoding="utf-8-sig")
+        # Our own record: undecodable bytes must not raise UnicodeDecodeError on every launch.
+        body = marker.read_text(encoding="utf-8-sig", errors="replace")
         if any(line.startswith("pid=") for line in body.splitlines()):
             lines = [line for line in body.splitlines() if not line.startswith("attempts=")]
             body = "\n".join([*lines, f"attempts={attempts}"]) + "\n"

@@ -262,3 +262,14 @@ def test_marker_attempts_from_a_hand_edited_body_are_a_nonnegative_int(tmp_path,
     marker.write_text(body, encoding="utf-8")
     attempts = er._read_marker_attempts(marker)
     assert type(attempts) is int and attempts >= 0
+
+
+def test_a_failed_repair_counts_its_attempt_even_on_an_undecodable_marker(tmp_path):
+    """The attempt bump read the marker strictly, inside only suppress(OSError): a non-UTF-8 marker
+    raised UnicodeDecodeError out of every launch's failed repair (review C6)."""
+    marker = tmp_path / ".update-incomplete"
+    marker.write_bytes(b"pid=1\nstash=\xff\xfe\n")
+
+    er._count_failed_attempt(marker)
+
+    assert er._read_marker_attempts(marker) == 1
