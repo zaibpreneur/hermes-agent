@@ -37,7 +37,7 @@ _HOLDER = ("import sys, time\nfrom pathlib import Path\nsys.path.insert(0, sys.a
            "assert lock.acquire()\nprint('HELD', flush=True)\ntime.sleep(120)\n")
 
 
-def _killed_mid_write(tmp_path: Path, rel: str):
+def _killed_mid_write(tmp_path: Path, rel: str, committed: dict[str, str] | None = None):
     """A checkout whose update git was SIGKILLed after unlinking ``rel``, before writing it."""
     root, home = tmp_path / "checkout", tmp_path / "home"
     home.mkdir()
@@ -45,6 +45,8 @@ def _killed_mid_write(tmp_path: Path, rel: str):
         if (SOURCE / f).is_file():
             (root / f).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(SOURCE / f, root / f)
+    for f, text in (committed or {}).items():
+        (root / f).write_text(text, encoding="utf-8")
     (root / "hermes_cli/main.py").write_text("def main():\n    print('APP_REACHED')\n    return 0\n", encoding="utf-8")
     env = {"HOME": str(home), "HERMES_HOME": str(home / ".hermes"), "PATH": os.environ.get("PATH", ""),
            "LANG": "C.UTF-8", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}
@@ -202,3 +204,19 @@ def test_git_object_bytes_that_do_not_hash_to_pres_blob_never_run(tmp_path, corr
     assert (root / "hermes_bootstrap.py").exists() is not corrupt
     assert (root / ".git/hermes-update-pull").exists() is corrupt
     assert not (corrupt and (root / ".git/hermes-update-recovery").exists()), "published foreign bytes"
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("shadowed", [False, True])
+def test_a_stdlib_named_file_in_the_tree_never_runs_before_the_repair(tmp_path, shadowed):
+    """The repair is stdlib plus ``pre``'s closure only: a root ``shutil.py`` in the checkout is not
+    imported in its place, and the torn tree is still repaired (N03)."""
+    ran = tmp_path / "SHADOW_RAN"
+    shadow = {"shutil.py": f"open({str(ran)!r}, 'w').close()\nraise ImportError('shadow')\n"} if shadowed else {}
+    root, env, original, launcher = _killed_mid_write(tmp_path, "hermes_bootstrap.py", shadow)
+    launch = subprocess.run([str(launcher)], cwd=tmp_path, env=env, capture_output=True, text=True, encoding="utf-8",
+                            errors="replace", timeout=60)
+    assert not ran.exists(), launch.stderr
+    assert launch.returncode == 0 and "APP_REACHED" in launch.stdout, launch.stderr
+    assert (root / "hermes_bootstrap.py").read_bytes() == original
+    assert not (root / ".git/hermes-update-pull").exists()
