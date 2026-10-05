@@ -271,3 +271,101 @@ def test_a_branch_that_moves_during_the_switch_leaves_head_and_debt_agreeing(tmp
     assert _git(clone, "rev-parse", "HEAD") == b
     assert (read_host_obligation() or {}).get("expected_sha") == b
     assert not interrupted_pull_marker(clone).exists()
+
+
+def _repo_at_a(tmp_path, monkeypatch) -> tuple[Path, str]:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    (repo / "f").write_text("A", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "A")
+    monkeypatch.setattr(commit, "_owns_live_checkout", lambda _root: False)
+    return repo, _git(repo, "rev-parse", "HEAD")
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_a_retarget_within_one_run_keeps_the_host_records_saved_baseline(tmp_path, monkeypatch):
+    """One run arms B, then retargets to C (CP0 then the pull), and the checkout ends back on its
+    start commit A. The second arm used to overwrite the saved baseline with "absent", so the
+    disarm deleted the restart debt that stood before the run (review R1)."""
+    host = host_obligation_path()
+    host.parent.mkdir(parents=True, exist_ok=True)
+    host.write_bytes(b"PRIOR-DEBT")
+    repo, _a = _repo_at_a(tmp_path, monkeypatch)
+    commit.record_run_start(["git"], repo)
+
+    commit.arm_commit_obligations(repo, "b" * 40)
+    commit.arm_commit_obligations(repo, "c" * 40)
+    commit.disarm_commit_obligations()
+
+    assert host.read_bytes() == b"PRIOR-DEBT"
+
+
+def test_a_later_runs_failed_retarget_puts_back_the_earlier_runs_debt(root):
+    """Run 1 committed B and left its restart owed; run 2 (a new owner) armed C and failed before
+    its move. Its release must put back run 1's record byte for byte, not delete it (review R1)."""
+    host = host_obligation_path()
+    host.parent.mkdir(parents=True, exist_ok=True)
+    host.write_bytes(b"PRIOR-DEBT")
+    commit.arm_commit_obligations(root, "b" * 40)  # run 1: its move commits, nothing hands back
+    run_one_record = host.read_bytes()
+    commit.begin_update_attempt()
+
+    commit.arm_commit_obligations(root, "c" * 40)  # run 2
+    commit.disarm_commit_obligations()
+
+    assert host.read_bytes() == run_one_record
+
+
+def test_an_owner_leaving_a_shared_record_for_another_target_hands_the_others_stake_back(root, tmp_path):
+    """Installs X and Y joined one record for SHA S; X then retargets to T and fails. Y's stake
+    (and the first owner's baseline) comes back, and Y's own release then restores what stood
+    before either of them (review R1)."""
+    from hermes_cli.update_host_obligation import read_host_obligation
+
+    host = host_obligation_path()
+    host.parent.mkdir(parents=True, exist_ok=True)
+    host.write_bytes(b"PRIOR-DEBT")
+    other = tmp_path / "other-install"
+    other.mkdir()
+    commit.arm_commit_obligations(other, "a" * 40)  # install Y
+    run_y = _run_state()
+    commit.begin_update_attempt()
+    commit.arm_commit_obligations(root, "a" * 40)  # install X joins
+    commit.arm_commit_obligations(root, "d" * 40)  # X retargets
+    commit.disarm_commit_obligations()
+
+    record = read_host_obligation() or {}
+    assert record.get("expected_sha") == "a" * 40 and record.get("owners") == [run_y["_owner"]]
+    _enter_run(run_y)
+    commit.disarm_commit_obligations()
+    assert host.read_bytes() == b"PRIOR-DEBT"
+
+
+def test_a_second_update_in_one_process_never_hands_back_the_first_updates_debt(root, monkeypatch):
+    """Update 1 moved to B and left its tail and restart owed; update 2, in the same interpreter,
+    armed C and was refused before its move. It used to reuse update 1's snapshot and owner and
+    delete B's debt as its own undo (review O5). ``_cmd_update_impl`` starts a fresh attempt."""
+    from types import SimpleNamespace
+
+    from hermes_cli import update_cmd
+    from hermes_cli.venv_sync import completion_pending_path
+
+    commit.arm_commit_obligations(root, "b" * 40)  # update 1: committed, nothing handed back
+    tail, host = completion_pending_path(root), host_obligation_path()
+    owed = {tail: tail.read_bytes(), host: host.read_bytes()}
+
+    class _Entered(Exception):
+        pass
+
+    def stop(_root):
+        raise _Entered
+
+    monkeypatch.setattr(update_cmd, "git_operation_in_progress", stop)
+    with pytest.raises(_Entered):  # update 2's entry, stopped right after the attempt begins
+        update_cmd._cmd_update_impl(SimpleNamespace(), gateway_mode=False)
+    commit.arm_commit_obligations(root, "c" * 40)
+    commit.disarm_commit_obligations()
+
+    assert {path: path.read_bytes() if path.exists() else None for path in owed} == owed

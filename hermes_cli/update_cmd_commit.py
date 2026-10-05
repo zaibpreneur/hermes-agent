@@ -568,6 +568,21 @@ def checkout_untouched(git_cmd, root: Path, start: tuple[str, str] | None) -> bo
     return head_and_branch(git_cmd, root) == start
 
 
+def begin_update_attempt() -> None:
+    """A new ``hermes update`` attempt owns nothing yet: no snapshot, no stake, no run start.
+
+    The state above is per attempt, not per process: a second update in one interpreter (a
+    long-lived caller) that inherited the first one's snapshot and owner would hand back the
+    first update's committed debt as its own undo when its move is refused (review O5).
+    """
+    global _armed_snapshot, _run_start, _obligation_root, _owner
+    _owner = ""
+    _armed_snapshot = None
+    _armed_bytes.clear()
+    _run_start = None
+    _obligation_root = None
+
+
 def record_run_start(git_cmd, root: Path) -> None:
     global _run_start, _obligation_root
     _run_start = (list(git_cmd), head_and_branch(git_cmd, root))
@@ -606,9 +621,4 @@ def preflight_refusal(git_cmd, root: Path, target_ref: str, critical_files) -> s
 
 
 def reset_for_tests() -> None:
-    global _armed_snapshot, _run_start, _obligation_root, _owner
-    _owner = ""
-    _armed_snapshot = None
-    _armed_bytes.clear()
-    _run_start = None
-    _obligation_root = None
+    begin_update_attempt()

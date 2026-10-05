@@ -110,12 +110,13 @@ def write_host_obligation(
     ``owner`` (an update run's commit-point token) joins the record's ``owners``: a run that
     fails before its move hands back only its own stake (``release_host_obligation``), never
     another install's debt for the same SHA. The first owner also stores what it found there
-    (``found``), which the last owner to leave puts back.
+    (``found``), which the last owner to leave puts back; an owner retargeting to another SHA
+    keeps that baseline (``_baseline_for``).
     """
     path = host_obligation_path()
     existing = read_host_obligation()
     try:
-        found = _found_field(path) if owner and not _owners(existing or {}) else None
+        found = _baseline_for(owner, existing, path) if owner else None
     except OSError as exc:  # unreadable is not absent: a guessed ``found`` would delete it later
         logger.debug("Could not read the host update-restart obligation: %s", exc)
         return False
@@ -164,6 +165,25 @@ def write_host_obligation(
 def _owners(record: dict) -> list[str]:
     owners = record.get("owners")
     return [str(o) for o in owners] if isinstance(owners, list) else []
+
+
+def _baseline_for(owner: str, existing: Optional[dict], path: Path) -> Optional[str]:
+    """What ``owner``'s release must put back (base64; ``None`` = absent): the record as it stood
+    before ``owner``'s first stake in it (review R1).
+
+    A run re-arms with one owner as it retargets (CP0 branch, origin pull, upstream fork ff), so
+    "the record already has owners" never means "nothing was here": a new owner keeps the bytes
+    there now, other owners' stakes included; an owner already in the record carries the baseline
+    it saved then, or, when it shared the record with others, the shared record minus its own stake.
+    """
+    owners = _owners(existing or {})
+    if owner not in owners:
+        return _found_field(path)
+    others = [o for o in owners if o != owner]
+    if not others:
+        return (existing or {}).get("found")
+    shared = json.dumps({**(existing or {}), "owners": others}, indent=2, ensure_ascii=False)
+    return base64.b64encode(shared.encode("utf-8")).decode("ascii")
 
 
 def _found_field(path: Path) -> Optional[str]:
