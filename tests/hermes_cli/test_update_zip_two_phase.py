@@ -502,3 +502,40 @@ def test_a_stage_cleanup_that_cannot_finish_keeps_the_journal_for_recovery(tmp_p
     assert restore_interrupted_zip_swap(live) is False  # nothing live moved: no relaunch
     assert not list(live.glob("*.hermes-update-staging")) and not (live / ZIP_SWAP_JOURNAL).exists()
     assert (live / "keep.txt").read_text() == "live data"
+
+
+def _swap_or_recover(extracted: Path, entries: list[str], live: Path) -> None:
+    """``_download_and_swap_zip``'s wiring: a failed swap is settled from its journal right after."""
+    from hermes_cli._early_recovery import restore_interrupted_zip_swap
+
+    try:
+        update_cmd_zip._journaled_stage_and_swap(str(extracted), entries, live, None)
+    except Exception:
+        restore_interrupted_zip_swap(live)
+
+
+@_POSIX_MODES
+def test_a_stale_backup_never_stands_in_for_the_live_entry(tmp_path, monkeypatch):
+    """A leftover ``<entry>.hermes-update-old`` this swap did not make (a pre-journal crash holding a
+    read-only directory) must be removed or refuse the swap; it must never become the live entry."""
+    from hermes_cli import update_cmd_commit
+
+    monkeypatch.setattr(update_cmd_commit, "arm_commit_obligations", lambda *a, **k: None)
+    live, extracted = tmp_path / "live", tmp_path / "extracted"
+    (live / "pkg").mkdir(parents=True)
+    (live / "pkg" / "m.py").write_text("LIVE_OLD")
+    (extracted / "pkg").mkdir(parents=True)
+    (extracted / "pkg" / "m.py").write_text("NEW")
+    stale = live / "pkg.hermes-update-old" / "ro"
+    stale.mkdir(parents=True)
+    (stale / "f").write_text("stale remnant")
+    stale.chmod(0o555)
+    try:
+        _swap_or_recover(extracted, ["pkg"], live)
+    finally:
+        for path in live.rglob("*"):
+            if path.is_dir():
+                path.chmod(0o755)
+    module = live / "pkg" / "m.py"
+    assert module.is_file() and module.read_text() in ("LIVE_OLD", "NEW"), sorted(
+        str(p.relative_to(live)) for p in live.rglob("*"))

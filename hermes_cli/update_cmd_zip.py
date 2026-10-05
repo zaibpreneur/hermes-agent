@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Collection, Optional
 
 from hermes_cli._early_recovery import (
-    ZIP_SWAP_JOURNAL, restore_interrupted_zip_swap, write_zip_swap_journal, zip_swap_owner_lock)
+    ZIP_SWAP_JOURNAL, _drop_path, restore_interrupted_zip_swap, write_zip_swap_journal, zip_swap_owner_lock)
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("hermes_cli.update_cmd")
@@ -81,8 +81,12 @@ def _stage_replacement(src: str, dst: str) -> str:
     # clearing leftovers, else deleting it then failing to stage (disk exhaustion) leaves a hole.
     if not os.path.exists(dst) and os.path.exists(backup):
         os.rename(backup, dst)
+    # Fail closed: a leftover backup that survives would later be taken for this swap's own backup
+    # (rollback and journal recovery put it back as the live entry).
     for leftover in (staging, backup):
-        _remove_path(leftover)
+        _drop_path(Path(leftover))
+        if os.path.lexists(leftover):
+            raise OSError(f"could not remove the leftover {leftover}")
     (shutil.copytree if os.path.isdir(src) else shutil.copy2)(src, staging)
     return staging
 
