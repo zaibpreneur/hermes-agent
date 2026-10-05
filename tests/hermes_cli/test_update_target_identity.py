@@ -434,9 +434,13 @@ def test_update_syntax_failure_restores_pre_update_head(update_tree, monkeypatch
     unexpected_head = git(remote, 'rev-parse', 'HEAD')
     if sync_phase == 'late-other-branch':
         def switch_after_sync(*args, **kwargs):
-            result = _sync_with_upstream_if_needed(*args, **kwargs)
-            git(t.clone, 'checkout', '-qb', 'unexpected')
-            return result
+            try:  # the broken upstream target is now refused (raised) before its move (review G1)
+                return _sync_with_upstream_if_needed(*args, **kwargs)
+            finally:
+                git(t.clone, 'checkout', '-qb', 'unexpected')
+                switched.append(git(t.clone, 'rev-parse', 'HEAD'))
+
+        switched = []
 
         monkeypatch.setattr(cli_main, '_sync_with_upstream_if_needed', switch_after_sync)
     local = t.clone / '.gitignore'
@@ -453,16 +457,17 @@ def test_update_syntax_failure_restores_pre_update_head(update_tree, monkeypatch
     assert not t.requests
     output = capsys.readouterr().out
     if sync_phase == 'late-other-branch':
-        assert git(t.clone, 'rev-parse', 'unexpected') == unexpected_head
+        # The broken upstream commit never landed; the unexpected branch keeps the HEAD it was cut at.
+        assert git(t.clone, 'rev-parse', 'unexpected') == switched[0] != unexpected_head
         assert git(t.clone, 'branch', '--show-current') == 'unexpected'
-        assert (t.clone / 'hermes_cli/config.py').read_bytes() == bad.read_bytes()
+        assert not (t.clone / 'hermes_cli/config.py').exists()
         assert "checkout is on 'unexpected'" in output
         assert 'Rolling back' not in output
     else:
         # Origin's own target is refused before HEAD moves (the commit point's preflight); an
-        # upstream sync's target is still caught by the post-pull guard and rolled back.
+        # upstream sync's target is refused before ITS move, and the update rolls back (review G1).
         assert ('The update target has a syntax error' if sync_phase == 'origin'
-                else 'Pulled code has a syntax error') in output
+                else 'has a syntax error in a critical file; it was not merged') in output
         assert git(t.clone, 'rev-parse', 'HEAD') == t.base
         assert not (t.clone / 'hermes_cli' / 'config.py').exists()
     if sync_phase == 'origin' and dirty:

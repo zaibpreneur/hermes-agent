@@ -100,7 +100,7 @@ from hermes_cli.update_cmd_git import (  # noqa: F401
     _normalize_managed_eol, _park_detached_head, _portable_git_candidates, _print_fetch_failure,
     _print_parked_branch_kept_notice, _print_parked_branch_skip_warning,
     _prune_orphan_rescue_refs, _push_synced_fork, _should_skip_upstream_prompt, _sync_fork_with_upstream,
-    _sync_with_upstream_if_needed)
+    _sync_with_upstream_if_needed, UpstreamTargetBroken)
 from hermes_cli.update_cmd_maint import (  # noqa: F401
     _PRE_UPDATE_SNAPSHOT_KEEP, _PRE_UPDATE_SNAPSHOT_MAX_FILE_SIZE, _clear_stale_sqlite_sidecars,
     _checkout_version, _ensure_acp_launcher, _ensure_fhs_path_guard, _finish_dashboard_update_cleanup,
@@ -921,10 +921,16 @@ def _rollback_if_pulled_syntax_error(git_cmd, pre_pull_sha, *, rollback_branch=N
         syntax_ok, failing_path, syntax_error = (broken is None, *(broken or (None, None)))
     else:
         syntax_ok, failing_path, syntax_error = _validate_critical_files_syntax(_m().PROJECT_ROOT)
-    if syntax_ok:
-        return
+    if not syntax_ok:
+        _roll_back_broken_update(git_cmd, pre_pull_sha, failing_path, syntax_error, rollback_branch=rollback_branch)
+
+
+def _roll_back_broken_update(git_cmd, pre_pull_sha, failing_path, syntax_error, *, rollback_branch=None,
+                             header="✗ Pulled code has a syntax error in a critical file:") -> NoReturn:
+    """Restore the checkout to *pre_pull_sha* after a startup file failed the syntax check, then
+    ``sys.exit(1)``."""
     print()
-    print("✗ Pulled code has a syntax error in a critical file:")
+    print(header)
     print(f"  {failing_path}")
     # py_compile errors can be multi-line; show enough for the SyntaxError text.
     for line in str(syntax_error).splitlines()[:6] if syntax_error else ():
@@ -1009,6 +1015,10 @@ def _refuse_unselected_head(git_cmd, target_sha: str, unmoved: str | None) -> No
         print(f"✗ The checkout landed on {landed[:10]}, not the selected commit {target_sha[:10]} "
               "(a ref moved during the update).")
         sys.exit(1)
+
+
+def _upstream_broken_header(broken) -> str:
+    return f"✗ upstream/main ({broken.sha[:10]}) has a syntax error in a critical file; it was not merged:"
 
 
 def _update_movement_baseline(git_cmd, pre_pull_sha, pre_sync_sha, rollback_branch, target_sha):
@@ -1113,8 +1123,15 @@ def _pull_updates(
             _verify_head_after_pull(
                 git_cmd, branch, movement_baseline, in_place_update=in_place_update,
                 _windows_gateway_resume=_windows_gateway_resume)
-            _m()._sync_with_upstream_if_needed(
-                git_cmd, _m().PROJECT_ROOT, assume_yes=assume_yes, input_fn=gw_input_fn)
+            try:
+                _m()._sync_with_upstream_if_needed(
+                    git_cmd, _m().PROJECT_ROOT, assume_yes=assume_yes, input_fn=gw_input_fn)
+            except UpstreamTargetBroken as broken:  # refused before its move: the update rolls back
+                _verify_head_after_pull(  # never reset an unexpected branch's ref onto pre
+                    git_cmd, branch, movement_baseline, in_place_update=in_place_update,
+                    _windows_gateway_resume=_windows_gateway_resume)
+                _roll_back_broken_update(git_cmd, pre_sync_sha or pre_pull_sha, broken.path, broken.error,
+                                         rollback_branch=rollback_branch, header=_upstream_broken_header(broken))
         # Refuse an unexpected branch before syntax rollback can reset its ref.
         _verify_head_after_pull(
             git_cmd, branch, movement_baseline, in_place_update=in_place_update,
@@ -1393,8 +1410,16 @@ def _prepare_checkout_for_update(
     upstream_checked = True
     if commit_count == 0 and is_fork and branch == "main" and not release_tag:
         pre_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
-        upstream_checked = _m()._sync_with_upstream_if_needed(
-            git_cmd, _m().PROJECT_ROOT, assume_yes=assume_yes, input_fn=gw_input_fn)
+        try:
+            upstream_checked = _m()._sync_with_upstream_if_needed(
+                git_cmd, _m().PROJECT_ROOT, assume_yes=assume_yes, input_fn=gw_input_fn)
+        except UpstreamTargetBroken as broken:  # nothing moved; local edits stay parked, like a rollback
+            if auto_stash_ref is not None:
+                print(f"  ℹ️  Local changes preserved in stash (ref: {auto_stash_ref})")
+                print("  Restore manually with: git stash apply")
+                _clear_pending_autostash()
+            _roll_back_broken_update(git_cmd, pre_sync_sha, broken.path, broken.error,
+                                     header=_upstream_broken_header(broken))
         post_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
         if pre_sync_sha and post_sync_sha and pre_sync_sha != post_sync_sha:
             synced_count = _count_commits_between(

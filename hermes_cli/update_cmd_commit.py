@@ -171,6 +171,20 @@ def commit_obligations_armed() -> bool:
     return _armed_snapshot is not None
 
 
+def debt_sha_for_move(pre: str, target: str) -> str:
+    """The commit a fast-forward ``pre`` -> ``target`` arms the obligations for.
+
+    A later move of this run (the upstream sync after the origin pull) owes ``pre``: the commit the
+    earlier move already owes, which every landing of a fast-forward contains, and the fleet
+    discharge holds the gateways to the checkout's actual HEAD whenever it contains the debt. Its
+    failure then needs no retarget write, which could itself fail and leave the debt naming a commit
+    the checkout never reached (review O4). The run's first move owes its ``target``: its failure
+    hands the obligations back whole (``disarm_commit_obligations``).
+    """
+    start = _run_start[1][0] if _run_start is not None else ""
+    return pre if start and pre != start else target
+
+
 def arm_commit_point(git_cmd, root: Path, expected_sha: str, **move) -> str | None:
     """Arm the obligations, then the tree-move marker (``arm_tree_move(**move)``): no marker, no move.
 

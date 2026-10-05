@@ -12,7 +12,9 @@ import os
 import subprocess
 from pathlib import Path
 
-from hermes_cli.update_cmd_git import _sync_with_upstream_if_needed
+import pytest
+
+from hermes_cli.update_cmd_git import UpstreamTargetBroken, _sync_with_upstream_if_needed
 
 
 def _env(home: Path) -> dict:
@@ -168,3 +170,62 @@ def test_a_custody_refused_upstream_merge_after_the_pull_still_owes_the_pulled_c
     assert "process job (access denied)" in capsys.readouterr().out
     assert _git(clone, "rev-parse", "HEAD") == commits[1]
     assert (read_host_obligation() or {}).get("expected_sha") == commits[1]
+
+
+def test_a_failed_upstream_sync_whose_retarget_write_fails_still_owes_the_pulled_commit(tmp_path, monkeypatch):
+    """After the origin pull c0 -> c1, the fork ff to c2 armed the debt for c2, failed, and its
+    retarget back to c1 hit a writer that now refuses: the debt stayed c2 with HEAD on c1 (review
+    O4). The later move owes c1 from the start (every landing of the ff contains it), so a failed
+    retarget changes nothing."""
+    from hermes_cli import update_cmd_commit, update_cmd_fleet, update_custody
+    from hermes_cli.update_host_obligation import read_host_obligation
+
+    clone, commits = _fork_behind_upstream(tmp_path, monkeypatch)
+    update_cmd_commit.reset_for_tests()
+    _git(clone, "reset", "-q", "--hard", commits[0])
+    update_cmd_commit.record_run_start(["git"], clone)
+    update_cmd_commit.arm_commit_obligations(clone, commits[1])
+    _git(clone, "reset", "-q", "--hard", commits[1])  # the committed origin pull
+    real_write, real_git, writes = update_cmd_fleet._write_fleet_restart_pending_marker, update_custody.run_git, []
+
+    def writer_then_refuses(**kw):
+        writes.append(kw.get("expected_sha"))
+        return real_write(**kw) if len(writes) == 1 else False  # the store turns unwritable
+
+    def merge_fails(git_cmd, args, *rest, **kw):
+        if args[:1] == ["merge"]:
+            raise subprocess.CalledProcessError(128, args, stderr="fatal: Unable to create index.lock")
+        return real_git(git_cmd, args, *rest, **kw)
+
+    monkeypatch.setattr(update_cmd_fleet, "_write_fleet_restart_pending_marker", writer_then_refuses)
+    monkeypatch.setattr(update_custody, "run_git", merge_fails)
+    try:
+        assert _sync_with_upstream_if_needed(["git"], clone, assume_yes=True) is False
+    finally:
+        update_cmd_commit.reset_for_tests()
+    assert _git(clone, "rev-parse", "HEAD") == commits[1]
+    assert commits[2] not in writes
+    assert (read_host_obligation() or {}).get("expected_sha") == commits[1]
+
+
+def test_a_broken_upstream_target_is_refused_before_the_second_move(tmp_path, monkeypatch, capsys):
+    """The fork ff dropped its marker on git's exit 0 and only the caller's later syntax guard
+    judged the result, so a kill in between left a broken c2 with no recovery record (review G1).
+    The upstream target is compiled before its move, like the origin target's preflight."""
+    from hermes_cli import update_cmd_commit
+    from hermes_cli._early_recovery import interrupted_pull_marker
+
+    clone, commits = _fork_behind_upstream(tmp_path, monkeypatch)
+    upstream = tmp_path / "upstream"
+    (upstream / "hermes_constants.py").write_text("def broken(:\n", encoding="utf-8")
+    _git(upstream, "add", "hermes_constants.py")
+    _git(upstream, "commit", "-qm", "broken c3")
+    update_cmd_commit.reset_for_tests()
+    try:
+        with pytest.raises(UpstreamTargetBroken) as refused:
+            _sync_with_upstream_if_needed(["git"], clone, assume_yes=True)
+    finally:
+        update_cmd_commit.reset_for_tests()
+    assert refused.value.path == "hermes_constants.py"
+    assert _git(clone, "rev-parse", "HEAD") == commits[1]
+    assert not interrupted_pull_marker(clone).exists()
