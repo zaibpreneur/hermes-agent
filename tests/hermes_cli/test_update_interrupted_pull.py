@@ -734,3 +734,41 @@ def test_a_rollback_never_rewinds_a_branch_checked_out_at_its_target_since(tmp_p
 
     assert _git(root, "rev-parse", "feature") == target
     assert er.interrupted_pull_marker(root).exists()
+
+def _killed_move(tmp_path: Path, change) -> tuple[Path, str, str]:
+    """A checkout back on ``pre`` (one module) with a dead updater's marker for ``target`` = ``change(pre)``."""
+    root = tmp_path / "install"
+    root.mkdir()
+    _git(root, "init", "-q", "-b", "main")
+    _git(root, "config", "user.email", "t@example.invalid")
+    _git(root, "config", "user.name", "t")
+    (root / "core.py").write_text("OLD = 1\n", encoding="utf-8", newline="")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-qm", "pre")
+    pre = _git(root, "rev-parse", "HEAD")
+    change(root)
+    _git(root, "add", "-A")
+    _git(root, "commit", "-qm", "target")
+    target = _git(root, "rev-parse", "HEAD")
+    _git(root, "reset", "-q", "--hard", pre)
+    er.interrupted_pull_marker(root).write_text(f"pid=0\npre={pre}\ntarget={target}\nstash=\n", encoding="utf-8")
+    return root, pre, target
+
+
+def test_a_users_file_at_a_path_the_update_adds_is_kept_aside_never_deleted(tmp_path):
+    """The update adds files; after the kill the user creates their own at two of those paths (a first
+    line that starts git's blob, a ``touch``). Git's whole file goes; theirs leave the tree, bytes intact."""
+    def adds(root: Path) -> None:
+        for name in ("full.py", "started.py", "touched.py"):
+            (root / name).write_text(f"{name} = 'new content'\n", encoding="utf-8", newline="")
+
+    root, pre, _target = _killed_move(tmp_path, adds)
+    (root / "full.py").write_text("full.py = 'new content'\n", encoding="utf-8", newline="")  # git's own write
+    (root / "started.py").write_bytes(b"started")
+    (root / "touched.py").write_bytes(b"")
+    assert er.restore_interrupted_pull(root) is True
+    assert _git(root, "rev-parse", "HEAD") == pre and not er.interrupted_pull_marker(root).exists()
+    assert not (root / "full.py").exists()
+    assert (root / "started.py.hermes-update-kept").read_bytes() == b"started"
+    assert (root / "touched.py.hermes-update-kept").read_bytes() == b""
+    assert not (root / "started.py").exists() and not (root / "touched.py").exists()

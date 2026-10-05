@@ -378,13 +378,15 @@ def _hash_worktree(git, paths: list[str]) -> dict[str, str]:
     return blobs
 
 
-def _paths_git_wrote(git, root: Path, pre: str, target: str) -> tuple[list[str], list[str], set[str]] | None:
-    """Paths the killed git already touched on the way to ``target``: (restore from HEAD, delete as added,
-    directories git may have created for its added files).
+def _paths_git_wrote(git, root: Path, pre: str, target: str) -> tuple[list[str], list[str], set[str], set[str]] | None:
+    """Paths the killed git already touched on the way to ``target``: (restore from HEAD, remove as added,
+    directories git may have created for its added files, the added ones to keep aside, not delete).
 
     Git rewrites a file as unlink, create, write, so a kill leaves it missing, empty or cut short:
     all of those count as git's, like the full new blob. Content that matches neither side and is not
-    the start of a new blob is the user's own edit (e.g. a re-applied stash) and is left alone.
+    the start of a new blob is the user's own edit (e.g. a re-applied stash) and is left alone. An
+    added path holding less than a whole new blob may equally be the user's own file created there
+    after the kill (a ``touch``, a first line): it leaves the tree, but renamed aside, never deleted.
     ``None``: git no longer knows ``target``.
     """
     if git("rev-parse", "-q", "--verify", f"{target}^{{commit}}").returncode != 0:
@@ -403,7 +405,7 @@ def _paths_git_wrote(git, root: Path, pre: str, target: str) -> tuple[list[str],
             entry = entries.setdefault(path, (old_mode, None if status == "A" else old_blob, []))
             entry[2].append((new_mode, None if status == "D" else new_blob))
     worktree_blob = _hash_worktree(git, [path for path in entries if (root / path).is_file()])
-    restore, added = [], []
+    restore, added, kept = [], [], set()
     for path, (old_mode, old_blob, new) in entries.items():
         file, blobs = root / path, {blob for _mode, blob in new if blob}
         if path not in worktree_blob:
@@ -423,11 +425,13 @@ def _paths_git_wrote(git, root: Path, pre: str, target: str) -> tuple[list[str],
                 written = written or shown.stdout.startswith(content)
         if written:
             (added if old_blob is None else restore).append(path)
+            if old_blob is None and worktree_blob.get(path) not in blobs:  # a whole blob is in git's objects
+                kept.add(path)
     new_dirs = {str(parent) for path, (_m, old_blob, _n) in entries.items() if old_blob is None
                 for parent in PurePosixPath(path).parents if parent.parts}
     if new_dirs:
         new_dirs -= set(git("ls-tree", "-r", "-d", "--name-only", "-z", pre).stdout.split("\0"))
-    return restore, added, new_dirs
+    return restore, added, new_dirs, kept
 
 
 # Launches that start together after a killed update (a restarting gateway or Desktop backend next to
@@ -1036,7 +1040,7 @@ def _restore_holding_claim(root: Path, marker: Path, *, after_failure: bool = Fa
         marker.unlink()
         print(f"⚠ Ignoring a stale interrupted-update marker: commit {target[:10]} is gone.", file=sys.stderr)
         return False
-    restore, added, new_dirs = written
+    restore, added, new_dirs, kept = written
     if (restore or added) and foreign_lock:
         print("⚠ Another git holds the index, so the files the update already wrote cannot be put back "
               "now; the next launch restores them.", file=sys.stderr)
@@ -1045,7 +1049,7 @@ def _restore_holding_claim(root: Path, marker: Path, *, after_failure: bool = Fa
         print(("⚠ git stopped partway through writing the new code — " if after_failure else
                "⚠ A previous `hermes update` was killed while git was writing the new code — ")
               + f"restoring the checkout to {pre[:10]}...", file=sys.stderr)
-        failed = _put_back_paths(git, root, restore, added)
+        failed = _put_back_paths(git, root, restore, added, kept)
         if failed:
             # No manual recipe: a reset would also wipe the edits this restore keeps, and the
             # marker stays so the next launch retries.
@@ -1126,8 +1130,9 @@ def _rollback_verified(git, git_dir: Path, pre: str, owned: set[str] | None = No
     return status.returncode == 0 and not (changed if owned is None else changed & owned)
 
 
-def _put_back_paths(git, root: Path, restore: list[str], added: list[str]) -> subprocess.CompletedProcess | None:
-    """Return ``restore`` to HEAD and drop ``added``; the failed git run, or None."""
+def _put_back_paths(git, root: Path, restore: list[str], added: list[str],
+                    kept: set[str]) -> subprocess.CompletedProcess | None:
+    """Return ``restore`` to HEAD and drop ``added``, renaming those in ``kept`` aside; the failed git run, or None."""
     if restore:
         run = git("restore", "--source=HEAD", "--staged", "--worktree", "--pathspec-from-file=-",
                   "--pathspec-file-nul", stdin="\0".join(restore))
@@ -1137,10 +1142,22 @@ def _put_back_paths(git, root: Path, restore: list[str], added: list[str]) -> su
         run = git("rm", "-q", "--cached", "--ignore-unmatch", "--pathspec-from-file=-",
                   "--pathspec-file-nul", stdin="\0".join(added))
         for rel in added:
-            (root / rel).unlink(missing_ok=True)
+            if rel in kept:
+                print(f"  Kept {rel} as {_keep_aside(root / rel).name}: it may be your own file.", file=sys.stderr)
+            else:
+                (root / rel).unlink(missing_ok=True)
         if run.returncode:
             return run
     return None
+
+
+def _keep_aside(file: Path) -> Path:
+    """Rename ``file`` to a free ``<name>.hermes-update-kept[-N]`` beside it (never importable, never clobbered)."""
+    n = 1
+    while os.path.lexists(aside := file.with_name(f"{file.name}.hermes-update-kept" + (f"-{n}" if n > 1 else ""))):
+        n += 1
+    os.rename(file, aside)
+    return aside
 
 
 def relaunch_after_restore() -> None:
