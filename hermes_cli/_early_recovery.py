@@ -937,18 +937,58 @@ def _checkout_custody(root: Path):
         update_lock._release_checkout()
 
 
-def _restore_holding_claim(root: Path, marker: Path, *, after_failure: bool = False) -> bool:
-    global _merge_advice_shown
-    git_dir = marker.parent
-    fields = dict(line.partition("=")[::2] for line in marker.read_text(encoding="utf-8-sig").splitlines())
+def _claim_owner_alive(fields: dict[str, str], marker: Path) -> bool:
+    """The updater that wrote ``marker`` is still running and the marker is fresh: hands off."""
     try:
         owner = int(fields.get("pid", ""))
     except ValueError:
         owner = -1
     # Our own pid is never the owner: this runs at startup, and containers hand a retry the
     # killed updater's pid.
-    if (owner != os.getpid() and _pid_is_running(owner)
-            and time.time() - marker.stat().st_mtime < _INTERRUPTED_PULL_MAX_AGE_SECONDS):
+    return (owner != os.getpid() and _pid_is_running(owner)
+            and time.time() - marker.stat().st_mtime < _INTERRUPTED_PULL_MAX_AGE_SECONDS)
+
+
+def _resume_killed_rollback(git, read_head, fields: dict[str, str], git_dir: Path, root: Path,
+                            pre: str, rollback: str, *, after_failure: bool) -> str | None:
+    """Redo a killed syntax rollback's HEAD move to ``pre``; the new HEAD, or None (marker kept)."""
+    # Only the ref the rollback left HEAD on may be rewound: a branch the user checked out at
+    # ``target`` since is theirs (and the update's branch would stay on the broken commit).
+    named = git("symbolic-ref", "-q", "HEAD")
+    if "ref" not in fields or (named.stdout.strip() if named.returncode == 0 else "") != fields["ref"].strip():
+        print(f"⚠ An interrupted `hermes update` rollback to {pre[:10]} was not resumed: HEAD now names "
+              f"another branch. Run `git reset --hard {pre[:10]}` on the updated branch to finish it.",
+              file=sys.stderr)
+        return None
+    # A syntax rollback killed before it moved HEAD back: redo that step (HEAD and index, no file),
+    # so the restore lands on ``pre`` (the code the update started from), not the broken tree.
+    # Every step is checked, and the killed step's ``index.lock`` goes first, only once its git is
+    # proven gone: until HEAD is on ``pre`` this marker is the rollback's only record.
+    reason = _redo_rollback_head(git, git_dir, root, pre, rollback, after_failure=after_failure)
+    if reason is not None:
+        print(f"⚠ An interrupted `hermes update` rollback to {pre[:10]} cannot resume yet ({reason}); "
+              "the next launch retries.", file=sys.stderr)
+        return None
+    return read_head()
+
+
+def _advise_killed_merge(git_dir: Path, root: Path, target: str, stash: str) -> None:
+    """Once per process, tell the user to abort the killed updater's own unfinished merge."""
+    global _merge_advice_shown
+    merge_head = git_dir / "MERGE_HEAD"
+    if (not _merge_advice_shown and merge_head.is_file()
+            and merge_head.read_text(encoding="utf-8-sig").strip() == target):
+        # The killed updater's own merge: its conflict markers may sit in startup modules.
+        _merge_advice_shown = True
+        print(f"⚠ A killed `hermes update` left its merge unfinished. Run `git -C {root} merge --abort`, "
+              "then launch again." + (f" Your local changes are in its stash ({stash})." if stash else ""),
+              file=sys.stderr)
+
+
+def _restore_holding_claim(root: Path, marker: Path, *, after_failure: bool = False) -> bool:
+    git_dir = marker.parent
+    fields = dict(line.partition("=")[::2] for line in marker.read_text(encoding="utf-8-sig").splitlines())
+    if _claim_owner_alive(fields, marker):
         return False
     pre, target = fields.get("pre", "").strip(), fields.get("target", "").strip()
     stash = fields.get("stash", "").strip()
@@ -1000,38 +1040,15 @@ def _restore_holding_claim(root: Path, marker: Path, *, after_failure: bool = Fa
     if head is None:
         return False
     if rollback and pre and target and head == target:
-        # Only the ref the rollback left HEAD on may be rewound: a branch the user checked out at
-        # ``target`` since is theirs (and the update's branch would stay on the broken commit).
-        named = git("symbolic-ref", "-q", "HEAD")
-        if "ref" not in fields or (named.stdout.strip() if named.returncode == 0 else "") != fields["ref"].strip():
-            print(f"⚠ An interrupted `hermes update` rollback to {pre[:10]} was not resumed: HEAD now names "
-                  f"another branch. Run `git reset --hard {pre[:10]}` on the updated branch to finish it.",
-                  file=sys.stderr)
-            return False
-        # A syntax rollback killed before it moved HEAD back: redo that step (HEAD and index, no file),
-        # so the restore below lands on ``pre`` (the code the update started from), not the broken tree.
-        # Every step is checked, and the killed step's ``index.lock`` goes first, only once its git is
-        # proven gone: until HEAD is on ``pre`` this marker is the rollback's only record.
-        reason = _redo_rollback_head(git, git_dir, root, pre, rollback, after_failure=after_failure or known_foreign)
-        if reason is not None:
-            print(f"⚠ An interrupted `hermes update` rollback to {pre[:10]} cannot resume yet ({reason}); "
-                  "the next launch retries.", file=sys.stderr)
-            return False
-        head = read_head()
+        head = _resume_killed_rollback(git, read_head, fields, git_dir, root, pre, rollback,
+                                       after_failure=after_failure or known_foreign)
         if head is None:
             return False
     if not pre or not target or head != pre:
         marker.unlink()  # git finished (HEAD moved) or the marker is unusable
         return False
     if any((git_dir / name).exists() for name in _GIT_OPERATION_IN_PROGRESS):
-        merge_head = git_dir / "MERGE_HEAD"
-        if (not _merge_advice_shown and merge_head.is_file()
-                and merge_head.read_text(encoding="utf-8-sig").strip() == target):
-            # The killed updater's own merge: its conflict markers may sit in startup modules.
-            _merge_advice_shown = True
-            print(f"⚠ A killed `hermes update` left its merge unfinished. Run `git -C {root} merge --abort`, "
-                  "then launch again." + (f" Your local changes are in its stash ({stash})." if stash else ""),
-                  file=sys.stderr)
+        _advise_killed_merge(git_dir, root, target, stash)
         return False
     # A killed claim holder's own git child can still be writing; scanning under it reads half a tree.
     # After a git that EXITED (``after_failure``) no git of ours is left: a lock now is another git's
