@@ -92,15 +92,16 @@ def test_desktop_build_lock_is_keyed_by_checkout(tmp_path):
     other = tmp_path / "hermes-agent-2"
     other.mkdir()
     first = DesktopBuildLock(tmp_path)
-    second = DesktopBuildLock(other)
+    probe = ("import sys\nfrom pathlib import Path\nfrom hermes_cli.desktop_build_lock import DesktopBuildLock\n"
+             "raise SystemExit(0 if DesktopBuildLock(Path(sys.argv[1])).acquire() else 23)\n")
 
     assert first.acquire() is True
     try:
-        assert second.acquire() is True
+        result = subprocess.run([sys.executable, "-c", probe, str(other)], check=False, timeout=60)
     finally:
         first.release()
-    second.release()
-    assert first.path != second.path
+    assert result.returncode == 0
+    assert first.path != DesktopBuildLock(other).path
 
 
 def test_gui_reports_missing_source_before_constructing_build_lock(tmp_path, monkeypatch, capsys):
@@ -319,3 +320,51 @@ def test_the_updates_own_desktop_build_joins_its_checkout_lock(tmp_path):
     finally:
         update.release()
     assert update_lock._HELD is None
+
+
+_CHECKOUT_CONTENDER = (
+    "import sys\n"
+    "from pathlib import Path\n"
+    "from hermes_cli.update_lock import UpdateLock\n"
+    "lock = UpdateLock(install_root=Path(sys.argv[1]), checkout_first=False)\n"
+    "raise SystemExit(0 if lock.acquire_checkout(Path(sys.argv[1])) else 23)\n"
+)
+
+
+@pytest.mark.parametrize("build_in", [
+    "another-checkout",
+    pytest.param("symlinked-alias", marks=pytest.mark.platforms("posix")),  # dir links need admin on Windows
+])
+def test_a_held_checkout_lock_admits_a_build_only_for_its_own_checkout(tmp_path, build_in):
+    """Q2: a process holding checkout A's lock joins it for a build of A under any spelling (an
+    independent updater of A stays refused), but never treats it as custody of another checkout B:
+    that build is refused before it takes B's desktop build lock, so B's updater is never admitted
+    alongside an unlocked build."""
+    from hermes_cli import update_lock
+
+    a, b = tmp_path / "checkout-a", tmp_path / "checkout-b"
+    for root in (a, b):
+        root.mkdir()
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+    outer = update_lock.UpdateLock(install_root=a, checkout_first=False)
+    assert outer.acquire_checkout(a)
+    try:
+        if build_in == "symlinked-alias":
+            (tmp_path / "alias").symlink_to(a, target_is_directory=True)
+            build = DesktopBuildLock(tmp_path / "alias")
+            assert build.acquire() is True
+            contended = a
+        else:
+            build = DesktopBuildLock(b)
+            with pytest.raises(OSError, match="another checkout"):
+                build.acquire()
+            assert _desktop_lock_free(b), "a refused build kept the desktop build lock"
+            contended = b
+        updater = subprocess.run([sys.executable, "-c", _CHECKOUT_CONTENDER, str(contended)],
+                                 check=False, timeout=60)
+        build.release()
+        assert update_lock.checkout_lock_held(a), "the build released the update's own hold"
+    finally:
+        outer.release()
+    # A's own build: the independent updater is refused. B's: no build was admitted, so it may run.
+    assert updater.returncode == (23 if build_in == "symlinked-alias" else 0)

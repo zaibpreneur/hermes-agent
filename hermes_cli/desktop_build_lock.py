@@ -64,11 +64,15 @@ class DesktopBuildLock:
 
         from hermes_cli import update_lock
 
-        held = update_lock._HELD
-        if held is not None and held["path"] != str(update_lock.checkout_lock_path(self.project_root)):
-            # This process is an update already holding a checkout lock under another spelling
-            # of the path: it builds inside that custody. A second acquire would wait on its
-            # own lock (and a process records only one hold).
+        held, wanted = update_lock._HELD, update_lock.checkout_lock_path(self.project_root)
+        if held is not None and held["path"] != str(wanted):
+            # This process holds a checkout lock under another path. Another spelling of this
+            # checkout's lock file (a symlinked install root) is this update's own custody: build
+            # inside it, since a second acquire would wait on its own lock. Any other checkout's
+            # lock proves nothing about this one (review Q2), and a process records one hold only.
+            if not (wanted.exists() and os.path.samefile(held["path"], wanted)):
+                raise OSError(f"this process holds the update lock of another checkout ({held['path']}), "
+                              f"so it cannot also lock {self.project_root} for its build")
             return True
         lock = update_lock.UpdateLock(install_root=self.project_root, checkout_first=False)
         announced = False
