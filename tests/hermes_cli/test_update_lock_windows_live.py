@@ -345,13 +345,15 @@ def test_a_refused_job_join_never_runs_the_command(tmp_path):
 
 
 
-def test_a_command_that_would_start_outside_the_job_never_runs(tmp_path):
-    """F54: a launcher interpreter that joins while what it starts escapes the job (a Store
-    Python alias) must not run the command. Control: a job with SILENT_BREAKAWAY_OK, which the
-    launcher joins but whose children start outside it."""
+def _escaping_job_launch(tmp_path: Path, *, process_limit: int = 0):
+    """Run the real ``_JOIN_JOB`` launcher in a job with SILENT_BREAKAWAY_OK: the launcher joins,
+    but the command it starts lands outside the job, as under Store Python (a packaged
+    interpreter's desktop-app breakaway through a job that permits breakaway, F54/F80).
+    ``process_limit`` caps the job's active processes so the command cannot be added to it.
+    Returns the launcher's result and the number of processes the job ever held."""
     import ctypes
 
-    from hermes_cli.update_custody import _CUSTODY_UNAVAILABLE, _JOIN_JOB, _REFUSED_EXIT
+    from hermes_cli.update_custody import _JOIN_JOB
 
     class _Basic(ctypes.Structure):  # JOBOBJECT_BASIC_LIMIT_INFORMATION
         _fields_ = [("user_limits", ctypes.c_int64 * 2), ("LimitFlags", ctypes.c_uint32),
@@ -361,12 +363,19 @@ def test_a_command_that_would_start_outside_the_job_never_runs(tmp_path):
     class _Extended(ctypes.Structure):  # JOBOBJECT_EXTENDED_LIMIT_INFORMATION: the breakaway flags need it
         _fields_ = [("basic", _Basic), ("io", ctypes.c_uint64 * 6), ("memory", ctypes.c_size_t * 4)]
 
+    class _Accounting(ctypes.Structure):  # JOBOBJECT_BASIC_ACCOUNTING_INFORMATION
+        _fields_ = [("times", ctypes.c_int64 * 4), ("faults", ctypes.c_uint32), ("total", ctypes.c_uint32),
+                    ("active", ctypes.c_uint32), ("terminated", ctypes.c_uint32)]
+
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.CreateJobObjectW.restype = ctypes.c_void_p
     kernel32.SetInformationJobObject.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_ulong]
+    kernel32.QueryInformationJobObject.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_ulong,
+                                                   ctypes.c_void_p]
     job = kernel32.CreateJobObjectW(None, None)
     limits = _Extended()
-    limits.basic.LimitFlags = 0x1000  # JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK
+    limits.basic.LimitFlags = 0x1000 | (0x8 if process_limit else 0)  # SILENT_BREAKAWAY_OK | ACTIVE_PROCESS
+    limits.basic.ActiveProcessLimit = process_limit
     assert kernel32.SetInformationJobObject(job, 9, ctypes.byref(limits), ctypes.sizeof(limits)), \
         ctypes.get_last_error()
     os.set_handle_inheritable(job, True)
@@ -377,6 +386,27 @@ def test_a_command_that_would_start_outside_the_job_never_runs(tmp_path):
     out = subprocess.run([sys.executable, "-I", "-S", str(launcher), str(job), str(tmp_path / "report.txt"),
                           sys.executable, "-c", "print('built')"], startupinfo=info, capture_output=True,
                          text=True, encoding="utf-8", errors="replace", timeout=60)
+    usage = _Accounting()
+    assert kernel32.QueryInformationJobObject(job, 1, ctypes.byref(usage), ctypes.sizeof(usage), None), \
+        ctypes.get_last_error()
+    return out, usage.total
+
+
+def test_a_command_that_starts_outside_the_job_is_put_in_it_and_runs(tmp_path):
+    """F80: Store Python's launcher starts the managed node outside the update job; refusing it
+    failed every Node build of a native Store-Python update. The suspended command is assigned to
+    the job and runs: the build completes and the job held both the launcher and the command."""
+    out, total = _escaping_job_launch(tmp_path)
+    assert out.returncode == 0 and "built" in out.stdout, out
+    assert total >= 2, "the command ran outside the update job"
+
+
+def test_a_command_the_job_will_not_take_never_runs(tmp_path):
+    """F54 kept: a command that starts outside the job and that Windows will not add to it (here
+    the job's one-process limit, held by the launcher) is never run."""
+    from hermes_cli.update_custody import _CUSTODY_UNAVAILABLE, _REFUSED_EXIT
+
+    out, _total = _escaping_job_launch(tmp_path, process_limit=1)
     assert out.returncode == _REFUSED_EXIT, out
     assert "built" not in out.stdout and _CUSTODY_UNAVAILABLE in out.stderr, out
 

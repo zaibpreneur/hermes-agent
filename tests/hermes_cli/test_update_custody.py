@@ -631,10 +631,12 @@ class _FakeWinCall:
         return self.answer(*args) if callable(self.answer) else self.answer
 
 
-def _run_join_launcher(monkeypatch, *, stray_polls: int):
+def _run_join_launcher(monkeypatch, *, stray_polls: int, escaped: bool = False, rebind: int = 1):
     """Execute the real ``_JOIN_JOB`` launcher source against a recording kernel32/ntdll and a
     fake leader process. The command's job reports ``stray_polls`` live processes (a build
-    grandchild still writing) before its tree is empty. Returns the ordered events."""
+    grandchild still writing) before its tree is empty. ``escaped``: the suspended command
+    starts outside the update job (Store Python's breakaway), and assigning it there answers
+    ``rebind``. Returns the ordered events."""
     import ctypes
     import types
 
@@ -648,11 +650,19 @@ def _run_join_launcher(monkeypatch, *, stray_polls: int):
         live["left"] -= 1
         return 1
 
+    placed = {"update job": not escaped}
+
+    def assign(job, proc):
+        if tuple(getattr(a, "value", a) for a in (job, proc)) != (11, 33):
+            return 1
+        placed["update job"] = bool(rebind)
+        return rebind
+
     def in_job(proc, job, inside):
-        inside._obj.value = 1
+        inside._obj.value = int(placed["update job"])
         return 1
 
-    kernel32 = {"AssignProcessToJobObject": 1, "GetCurrentProcess": 7, "CloseHandle": 1, "CreateJobObjectW": 22,
+    kernel32 = {"AssignProcessToJobObject": assign, "GetCurrentProcess": 7, "CloseHandle": 1, "CreateJobObjectW": 22,
                 "SetInformationJobObject": 1, "TerminateJobObject": 1, "QueryInformationJobObject": query,
                 "IsProcessInJob": in_job}
     dlls = {"kernel32": types.SimpleNamespace(**{n: _FakeWinCall(n, events, a) for n, a in kernel32.items()}),
@@ -701,6 +711,28 @@ def test_the_windows_build_launcher_reaps_the_command_tree_before_it_returns(mon
     assert len(polls) == 3 and polls[0] > _index(events, "TerminateJobObject", tree), \
         "the launcher returned while a build descendant was still alive"
     assert events[-1] == ("exit", 3), events
+
+
+def test_a_build_command_that_starts_outside_the_update_job_is_put_in_it_before_it_runs(monkeypatch, tmp_path):
+    """F80: under Store Python the suspended node starts outside the update job (desktop-app
+    breakaway through a job that permits breakaway); refusing it made every Node build of the
+    update fail. It is assigned to the update job while suspended and runs once it is in."""
+    monkeypatch.chdir(tmp_path)  # a refusal writes its report file (argv[2]) relative to here
+    events = _run_join_launcher(monkeypatch, stray_polls=0, escaped=True)
+    assert _index(events, "AssignProcessToJobObject", 11, 33) < _index(events, "NtResumeProcess"), \
+        "the command ran before it was in the update job"
+    assert events[-1] == ("exit", 3), events
+
+
+def test_a_build_command_the_update_job_will_not_take_never_runs(monkeypatch, tmp_path):
+    """F54 kept: a suspended command outside the job that Windows also refuses to assign to it
+    is killed before its first instruction and the launcher refuses."""
+    from hermes_cli.update_custody import _REFUSED_EXIT
+
+    monkeypatch.chdir(tmp_path)
+    events = _run_join_launcher(monkeypatch, stray_polls=0, escaped=True, rebind=0)
+    assert not any(e[0] == "NtResumeProcess" for e in events) and ("kill",) in events, events
+    assert events[-1] == ("exit", _REFUSED_EXIT), events
 
 
 def test_the_windows_build_launcher_returns_at_once_when_nothing_was_left(monkeypatch):

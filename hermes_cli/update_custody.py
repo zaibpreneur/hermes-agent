@@ -520,13 +520,17 @@ _JOIN_JOB = (
     "limits.basic.flags = 0x2000\n"
     "if not tree or not k.SetInformationJobObject(tree, 9, ctypes.byref(limits), ctypes.sizeof(limits)):\n"
     "    refuse('could not create the job for the command tree: %d' % ctypes.get_last_error())\n"
-    # Verify, never assume the topology: a redirecting interpreter (a Store Python alias) can
-    # join while what it starts lands outside the job. Start the command suspended and run it
-    # only once Windows says it is in the job (F54).
+    # Verify, never assume the topology: a packaged interpreter (Store Python) joins, but starts a
+    # program outside its package with desktop-app breakaway, so the command leaves every job
+    # that permits breakaway, as the update job does (restarted gateways break away). Start the
+    # command suspended; if Windows says it is outside the job, put it in explicitly (F80), and
+    # run it only once it is in (F54): a command the job will not take is refused, never run.
     "k.IsProcessInJob.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]\n"
     "p = subprocess.Popen(sys.argv[3:], stdin=subprocess.DEVNULL, creationflags=0x4)\n"
-    "inside = ctypes.c_int(0)\n"
-    "if not k.IsProcessInJob(ctypes.c_void_p(int(p._handle)), h, ctypes.byref(inside)) or not inside.value:\n"
+    "def in_job():\n"
+    "    inside = ctypes.c_int(0)\n"
+    "    return k.IsProcessInJob(ctypes.c_void_p(int(p._handle)), h, ctypes.byref(inside)) and inside.value\n"
+    "if not in_job() and not (k.AssignProcessToJobObject(h, ctypes.c_void_p(int(p._handle))) and in_job()):\n"
     "    p.kill()\n"
     "    p.wait()\n"
     "    refuse('the command would start outside the update job')\n"
