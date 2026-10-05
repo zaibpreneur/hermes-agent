@@ -209,3 +209,31 @@ def test_zip_journal_writer_never_writes_through_a_preexisting_temp(tmp_path, li
     assert secret.read_text(encoding="utf-8") == "API_KEY=keep\n"
     journal = root / er.ZIP_SWAP_JOURNAL
     assert not journal.is_symlink() and '"phase": "staging"' in journal.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("body", ["", "{not json", '{"phase": "swap", "entries": [["a.py", true]]}',
+                                  '{"phase": "swapping", "entries": [["../a.py", true]]}', "read-error"])
+def test_an_unparsed_zip_journal_keeps_itself_and_every_backup(tmp_path, monkeypatch, body):
+    """A mid-swap tree (a.py new with its backup, b.py old with its staging copy) whose journal cannot
+    be read or understood is never settled by guesswork: the journal and every sibling stay."""
+    root = tmp_path / "install"
+    root.mkdir()
+    for name, text in {"a.py": "NEW_A", "a.py.hermes-update-old": "OLD_A", "b.py": "OLD_B",
+                       "b.py.hermes-update-staging": "NEW_B"}.items():
+        (root / name).write_text(text, encoding="utf-8")
+    journal = root / er.ZIP_SWAP_JOURNAL
+    journal.write_text('{"phase": "swapping", "entries": [["a.py", true], ["b.py", true]]}'
+                       if body == "read-error" else body, encoding="utf-8")
+    if body == "read-error":  # one transient read failure (AV scan, sharing violation)
+        real = Path.read_text
+
+        def flaky(self, *args, **kwargs):
+            if self == journal:
+                raise PermissionError(13, "in use")
+            return real(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", flaky)
+    assert er.restore_interrupted_zip_swap(root) is False
+    assert journal.is_file()
+    assert {p.name: p.read_text(encoding="utf-8") for p in root.iterdir() if p != journal and p.suffix != ".lock"} == {
+        "a.py": "NEW_A", "a.py.hermes-update-old": "OLD_A", "b.py": "OLD_B", "b.py.hermes-update-staging": "NEW_B"}

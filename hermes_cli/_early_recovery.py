@@ -718,6 +718,25 @@ def _drop_path(path: Path) -> None:
         path.unlink()
 
 
+def _parse_zip_swap_journal(raw: str) -> tuple[str, list[tuple[str, bool]]] | None:
+    """``(phase, [(entry name, existed)])`` from a journal this code wrote, else None."""
+    import json
+
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(data, dict) or data.get("phase") not in ("staging", "swapping", "committed"):
+        return None
+    entries = data.get("entries")
+    if not isinstance(entries, list):
+        return None
+    if not all(isinstance(e, list) and len(e) == 2 and isinstance(e[0], str) and isinstance(e[1], bool)
+               and e[0] not in ("", ".", "..") and "/" not in e[0] and "\\" not in e[0] for e in entries):
+        return None
+    return data["phase"], [(name, existed) for name, existed in entries]
+
+
 def restore_interrupted_zip_swap(project_root: Path | None = None) -> bool:
     """Finish or roll back a ZIP swap whose owner died; True when the tree changed (relaunch).
 
@@ -736,18 +755,23 @@ def restore_interrupted_zip_swap(project_root: Path | None = None) -> bool:
             print(f"⚠ An interrupted ZIP update cannot be settled: {owned.reason}.", file=sys.stderr)
         if not owned or not journal.is_file():
             return False
-        import json
-
         try:
-            data = json.loads(journal.read_text(encoding="utf-8-sig"))
-            phase, entries = data["phase"], [(str(n), bool(e)) for n, e in data["entries"]]
-        except (OSError, ValueError, KeyError, TypeError):
-            phase, entries = "staging", []  # unreadable: never guess which live entry to move
+            raw = journal.read_text(encoding="utf-8-sig")
+        except OSError as exc:  # transient (AV, sharing violation): the journal is still the record
+            print(f"⚠ Could not read the interrupted ZIP update's journal ({exc}); the next launch retries.",
+                  file=sys.stderr)
+            return False
+        parsed = _parse_zip_swap_journal(raw)
+        if parsed is None:
+            # Never guess which live entry to move, and never retire the only record of a mixed tree.
+            print(f"⚠ The interrupted ZIP update's journal {journal} is unreadable or from another version; "
+                  "it and every `*.hermes-update-old` backup were kept. Put back what each backup replaced "
+                  "(or reinstall), then delete the journal.", file=sys.stderr)
+            return False
+        phase, entries = parsed
         changed = False
         failed = False
         for name, existed in reversed(entries):
-            if not name or "/" in name or "\\" in name or name in (".", ".."):
-                continue
             dst = root / name
             staging, old = Path(f"{dst}{_ZIP_STAGING_SUFFIX}"), Path(f"{dst}{_ZIP_OLD_SUFFIX}")
             try:
