@@ -77,7 +77,15 @@ test('a result whose started_at differs from the parked run is discarded; a matc
   write(home, { ok: false, exit_code: 1, message: 'old run', branch: 'main', started_at: 100, finished_at })
   assert.equal(readAndConsumeHandoffResult(home, { expectedStartedAt: 200 }), null)
 
-  write(home, { ok: true, exit_code: 0, message: '', branch: 'main', started_at: 200, finished_at, warnings: ['gateway restart'] })
+  write(home, {
+    ok: true,
+    exit_code: 0,
+    message: '',
+    branch: 'main',
+    started_at: 200,
+    finished_at,
+    warnings: ['gateway restart']
+  })
   assert.deepEqual(readAndConsumeHandoffResult(home, { expectedStartedAt: 200 })?.warnings, ['gateway restart'])
 })
 

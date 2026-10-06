@@ -270,7 +270,14 @@ async function refreshVerdict(
 
   const errors = verdict.kind === 'error' ? (previous?.errors ?? 0) + 1 : 0
 
-  return { ...previous, verdict, at: now(), generation, errors, answered: previous?.answered || verdict.kind !== 'error' }
+  return {
+    ...previous,
+    verdict,
+    at: now(),
+    generation,
+    errors,
+    answered: previous?.answered || verdict.kind !== 'error'
+  }
 }
 
 /** The helper never answered for this body and has used its retries: proceed as main did for a dead marker. */
@@ -347,7 +354,9 @@ export function liveMarkerProbe({
       if (await failedAfterV1Start(hermesHome, inspection.marker)) {
         if (!finishedLogged) {
           finishedLogged = true
-          log?.('[updates] latest update receipt records a failure after this v1 marker started; not parking the boot on it')
+          log?.(
+            '[updates] latest update receipt records a failure after this v1 marker started; not parking the boot on it'
+          )
         }
 
         return false

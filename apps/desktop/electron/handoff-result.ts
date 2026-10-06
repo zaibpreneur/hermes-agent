@@ -76,7 +76,9 @@ export function readAndConsumeHandoffResult(
   try {
     parsed = JSON.parse(raw)
   } catch (error) {
-    log(`[updates] hand-off result is not valid JSON (${(error as Error).message}); kept as ${path.basename(file)}.corrupt`)
+    log(
+      `[updates] hand-off result is not valid JSON (${(error as Error).message}); kept as ${path.basename(file)}.corrupt`
+    )
 
     try {
       fs.renameSync(file, `${file}.corrupt`)

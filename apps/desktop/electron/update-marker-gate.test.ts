@@ -206,7 +206,10 @@ describe.skipIf(process.platform === 'win32')('gate over a dead marker (R6)', ()
       clock += HELD_REPROBE_MS
     }
 
-    assert.ok(states.every(s => s.verdict === 'error' && !s.blocking), 'retries are not a hold: no blocked screen')
+    assert.ok(
+      states.every(s => s.verdict === 'error' && !s.blocking),
+      'retries are not a hold: no blocked screen'
+    )
     assert.equal(await probe(), false, 'retries used up: proceed as for any dead marker')
     assert.equal(helperCalls(home).length, HELPER_ERROR_ATTEMPTS)
     assert.equal(await gate(root, home, () => clock)(), false, 'a later wait (pool backend) proceeds at once')
