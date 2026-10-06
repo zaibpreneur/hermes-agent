@@ -83,7 +83,8 @@ def _arm_fleet_obligation(root: Path) -> None:
 def _head_sha(root: Path) -> str:
     """HEAD of ``root``, or ``''``. Git may be off PATH (only PM's store copy) or broken here, so a
     failed ``rev-parse`` falls back to reading the ref files git itself would read."""
-    from hermes_cli._early_recovery import _git_executable
+    from hermes_cli._early_recovery import _git_dir, _git_executable
+    from hermes_cli.update_lock import _git_common_dir
 
     try:
         head = subprocess.run([_git_executable(), "-C", str(root), "rev-parse", "HEAD"], capture_output=True,
@@ -93,12 +94,8 @@ def _head_sha(root: Path) -> str:
     except (OSError, subprocess.SubprocessError):
         pass  # no runnable git: the ref files below are the whole of the evidence
     try:
-        git_dir = root / ".git"
-        if git_dir.is_file():  # a linked worktree / submodule: ``gitdir: <path>``
-            git_dir = root / git_dir.read_text(encoding="utf-8-sig").strip().removeprefix("gitdir:").strip()
-        # Branch refs live in the common dir a linked worktree's ``commondir`` names.
-        common = git_dir / (git_dir / "commondir").read_text(encoding="utf-8-sig").strip() \
-            if (git_dir / "commondir").is_file() else git_dir
+        git_dir = _git_dir(root)  # a linked worktree's own dir holds HEAD; its branch refs, the common dir
+        common = _git_common_dir(root) or git_dir
         head = (git_dir / "HEAD").read_text(encoding="utf-8-sig").strip()
         if head.startswith("ref:"):
             ref = head.removeprefix("ref:").strip()
