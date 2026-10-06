@@ -632,9 +632,9 @@ def test_a_refusal_whose_holder_exits_before_the_probe_retries_the_lock(tmp_path
 def commit_point():
     from hermes_cli import update_cmd_commit as commit
 
-    commit.reset_for_tests()
+    commit.begin_update_attempt()
     yield commit
-    commit.reset_for_tests()
+    commit.begin_update_attempt()
 
 
 def _unmovable(root: Path, a: str) -> None:
@@ -652,7 +652,10 @@ def test_a_pull_whose_marker_cannot_be_written_never_moves_the_tree(checkout, co
         _pull(root)
 
     _unmovable(root, a)
-    assert not commit_point.commit_obligations_armed()
+    from hermes_cli.update_host_obligation import read_host_obligation
+    from hermes_cli.venv_sync import completion_pending_path
+
+    assert read_host_obligation() is None and not completion_pending_path(root).exists(), "the refused move left a debt"
 
 
 def test_a_pull_whose_target_does_not_resolve_never_moves_the_tree(checkout, commit_point, monkeypatch):

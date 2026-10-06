@@ -103,12 +103,12 @@ def test_an_upstream_sync_whose_marker_cannot_be_written_never_moves_the_tree(tm
     from hermes_cli._early_recovery import interrupted_pull_marker
 
     clone, commits = _fork_behind_upstream(tmp_path, monkeypatch)
-    update_cmd_commit.reset_for_tests()
+    update_cmd_commit.begin_update_attempt()
     interrupted_pull_marker(clone).mkdir()
     try:
         assert _sync_with_upstream_if_needed(["git"], clone, assume_yes=True) is False
     finally:
-        update_cmd_commit.reset_for_tests()
+        update_cmd_commit.begin_update_attempt()
     assert _git(clone, "rev-parse", "HEAD") == commits[1]
     assert _git(clone, "status", "--porcelain", "--untracked-files=no") == ""
 
@@ -118,9 +118,10 @@ def test_a_failed_upstream_sync_after_the_pull_owes_the_restart_for_the_pulled_c
     c1 (dischargeable at HEAD), not the c2 the checkout never reached (F23)."""
     from hermes_cli import update_cmd_commit, update_custody
     from hermes_cli.update_host_obligation import read_host_obligation
+    from hermes_cli.venv_sync import completion_pending_path
 
     clone, commits = _fork_behind_upstream(tmp_path, monkeypatch)
-    update_cmd_commit.reset_for_tests()
+    update_cmd_commit.begin_update_attempt()
     _git(clone, "reset", "-q", "--hard", commits[0])
     update_cmd_commit.record_run_start(["git"], clone)
     update_cmd_commit.arm_commit_obligations(clone, commits[1])
@@ -135,11 +136,11 @@ def test_a_failed_upstream_sync_after_the_pull_owes_the_restart_for_the_pulled_c
     monkeypatch.setattr(update_custody, "run_git", merge_fails)
     try:
         assert _sync_with_upstream_if_needed(["git"], clone, assume_yes=True) is False
-        assert update_cmd_commit.commit_obligations_armed()
     finally:
-        update_cmd_commit.reset_for_tests()
+        update_cmd_commit.begin_update_attempt()
     assert _git(clone, "rev-parse", "HEAD") == commits[1]
     assert (read_host_obligation() or {}).get("expected_sha") == commits[1]
+    assert completion_pending_path(clone).is_file()
 
 
 def test_a_custody_refused_upstream_merge_after_the_pull_still_owes_the_pulled_commit(tmp_path, monkeypatch, capsys):
@@ -150,7 +151,7 @@ def test_a_custody_refused_upstream_merge_after_the_pull_still_owes_the_pulled_c
     from hermes_cli.update_host_obligation import read_host_obligation
 
     clone, commits = _fork_behind_upstream(tmp_path, monkeypatch)
-    update_cmd_commit.reset_for_tests()
+    update_cmd_commit.begin_update_attempt()
     _git(clone, "reset", "-q", "--hard", commits[0])
     update_cmd_commit.record_run_start(["git"], clone)
     update_cmd_commit.arm_commit_obligations(clone, commits[1])
@@ -166,7 +167,7 @@ def test_a_custody_refused_upstream_merge_after_the_pull_still_owes_the_pulled_c
     try:
         assert _sync_with_upstream_if_needed(["git"], clone, assume_yes=True) is False
     finally:
-        update_cmd_commit.reset_for_tests()
+        update_cmd_commit.begin_update_attempt()
     assert "process job (access denied)" in capsys.readouterr().out
     assert _git(clone, "rev-parse", "HEAD") == commits[1]
     assert (read_host_obligation() or {}).get("expected_sha") == commits[1]
@@ -181,7 +182,7 @@ def test_a_failed_upstream_sync_whose_retarget_write_fails_still_owes_the_pulled
     from hermes_cli.update_host_obligation import read_host_obligation
 
     clone, commits = _fork_behind_upstream(tmp_path, monkeypatch)
-    update_cmd_commit.reset_for_tests()
+    update_cmd_commit.begin_update_attempt()
     _git(clone, "reset", "-q", "--hard", commits[0])
     update_cmd_commit.record_run_start(["git"], clone)
     update_cmd_commit.arm_commit_obligations(clone, commits[1])
@@ -202,7 +203,7 @@ def test_a_failed_upstream_sync_whose_retarget_write_fails_still_owes_the_pulled
     try:
         assert _sync_with_upstream_if_needed(["git"], clone, assume_yes=True) is False
     finally:
-        update_cmd_commit.reset_for_tests()
+        update_cmd_commit.begin_update_attempt()
     assert _git(clone, "rev-parse", "HEAD") == commits[1]
     assert commits[2] not in writes
     assert (read_host_obligation() or {}).get("expected_sha") == commits[1]
@@ -220,12 +221,12 @@ def test_a_broken_upstream_target_is_refused_before_the_second_move(tmp_path, mo
     (upstream / "hermes_constants.py").write_text("def broken(:\n", encoding="utf-8")
     _git(upstream, "add", "hermes_constants.py")
     _git(upstream, "commit", "-qm", "broken c3")
-    update_cmd_commit.reset_for_tests()
+    update_cmd_commit.begin_update_attempt()
     try:
         with pytest.raises(UpstreamTargetBroken) as refused:
             _sync_with_upstream_if_needed(["git"], clone, assume_yes=True)
     finally:
-        update_cmd_commit.reset_for_tests()
+        update_cmd_commit.begin_update_attempt()
     assert refused.value.path == "hermes_constants.py"
     assert _git(clone, "rev-parse", "HEAD") == commits[1]
     assert not interrupted_pull_marker(clone).exists()

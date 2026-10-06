@@ -641,6 +641,8 @@ def test_a_journal_that_cannot_be_dropped_after_the_commit_never_fails_the_updat
     """The swap committed: an AV scan holding the journal must not turn it into a reported failure
     that disarms the new tree's completion obligations (F19)."""
     from hermes_cli import update_cmd_commit
+    from hermes_cli.update_host_obligation import read_host_obligation
+    from hermes_cli.venv_sync import completion_pending_path
 
     live, extracted = tmp_path / "live", tmp_path / "extracted"
     _live_tree(live, {"payload": "old"})
@@ -652,14 +654,15 @@ def test_a_journal_that_cannot_be_dropped_after_the_commit_never_fails_the_updat
             raise PermissionError(13, "being used by another process", str(self))
         return real(self, *args, **kwargs)
 
-    update_cmd_commit.reset_for_tests()
+    update_cmd_commit.begin_update_attempt()
     monkeypatch.setattr(Path, "unlink", held)
     try:
         update_cmd_zip._journaled_stage_and_swap(str(extracted), ["payload"], live, "b" * 40)
-        assert update_cmd_commit.commit_obligations_armed()
     finally:
-        update_cmd_commit.reset_for_tests()
+        update_cmd_commit.begin_update_attempt()
     assert (live / "payload" / "version.txt").read_text(encoding="utf-8-sig") == "new"
+    assert completion_pending_path(live).is_file()
+    assert (read_host_obligation() or {}).get("expected_sha") == "b" * 40
 
 
 _KILLED_BACKUP_COPY = r'''

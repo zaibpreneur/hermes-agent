@@ -161,10 +161,6 @@ def _owe_for(root: Path, sha: str) -> None:
               "run `hermes gateway restart` once the update is done.", file=sys.stderr)
 
 
-def commit_obligations_armed() -> bool:
-    return _armed_snapshot is not None
-
-
 def debt_sha_for_move(pre: str, target: str) -> str:
     """The commit a fast-forward ``pre`` -> ``target`` arms the obligations for.
 
@@ -609,7 +605,3 @@ def preflight_refusal(git_cmd, root: Path, target_ref: str, critical_files) -> s
         return (f"✗ The update target has a syntax error in a critical file:\n  {path}\n    "
                 + "\n    ".join(error.splitlines()[:6]))
     return None
-
-
-def reset_for_tests() -> None:
-    begin_update_attempt()

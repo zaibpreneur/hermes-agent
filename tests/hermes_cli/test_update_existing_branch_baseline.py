@@ -285,13 +285,13 @@ def test_a_refused_branch_switch_prints_the_refusal_not_a_missing_branch(checkou
     from hermes_cli._early_recovery import interrupted_pull_marker
 
     root, old, _tip = checkout
-    update_cmd_commit.reset_for_tests()
+    update_cmd_commit.begin_update_attempt()
     interrupted_pull_marker(root).mkdir()
     try:
         with pytest.raises(SystemExit):
             prepare(root)
     finally:
-        update_cmd_commit.reset_for_tests()
+        update_cmd_commit.begin_update_attempt()
 
     out = capsys.readouterr().out
     assert "could not arm the update" in out and "does not exist" not in out

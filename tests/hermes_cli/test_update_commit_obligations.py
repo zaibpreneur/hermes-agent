@@ -22,9 +22,9 @@ from hermes_cli.update_host_obligation import host_obligation_path
 def _fresh_commit_point(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     (tmp_path / "home").mkdir()
-    commit.reset_for_tests()
+    commit.begin_update_attempt()
     yield
-    commit.reset_for_tests()
+    commit.begin_update_attempt()
 
 
 @pytest.fixture
@@ -183,7 +183,7 @@ def test_one_installs_disarm_never_deletes_another_installs_debt_for_the_same_sh
     other.mkdir()
     commit.arm_commit_obligations(root, "a" * 40)  # install A
     run_a = _run_state()
-    commit.reset_for_tests()
+    commit.begin_update_attempt()
     commit.arm_commit_obligations(other, "a" * 40)  # install B, same pulled SHA
     run_b = _run_state()
 
