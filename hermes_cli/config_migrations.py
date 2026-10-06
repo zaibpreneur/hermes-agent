@@ -683,6 +683,30 @@ def _migrate_to_49(results: Dict[str, Any], quiet: bool) -> None:
             print("  ✓ Cleared TERMINAL_VERCEL_RUNTIME from .env (was the old default; the image is used instead)")
 
 
+_RETIRED_TIRITH_KEYS = ("tirith_enabled", "tirith_path", "tirith_timeout", "tirith_fail_open")
+
+
+def _migrate_to_50(results: Dict[str, Any], quiet: bool) -> None:
+    # 49 → 50: the bundled tirith scanner moved out of core into an opt-in plugin. Its keys are read
+    # by nothing now, so they are dropped. The plugin is NOT enabled for anyone: an operator who had
+    # opted into stricter scanning gets a pointer to install it.
+    config = read_raw_config()
+    security = config.get("security")
+    if not isinstance(security, dict):
+        return
+    present = [key for key in _RETIRED_TIRITH_KEYS if key in security]
+    if not present:
+        return
+    opted_in = security.get("tirith_fail_open") is False or (
+        "tirith_path" in security and security.get("tirith_enabled") is not False)
+    for key in present:
+        del security[key]
+    message = "  ✓ Removed security.tirith_* — the tirith scanner is no longer bundled with Hermes."
+    if opted_in:
+        message += " To keep scanning commands with it, install the tirith plugin: hermes plugins install tirith"
+    _commit(config, results, quiet, "removed security.tirith_* (scanner moved to a plugin)", message)
+
+
 MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
     (12, _migrate_to_12),
     (13, _migrate_to_13),
@@ -814,6 +838,8 @@ MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
     (48, _migrate_to_48),
     # 48 → 49: the seeded Vercel runtime pin is dropped so fresh sandboxes use the managed image (see _migrate_to_49).
     (49, _migrate_to_49),
+    # 49 → 50: security.tirith_* dropped; the scanner is an opt-in plugin now (see _migrate_to_50).
+    (50, _migrate_to_50),
 )
 
 #: Steps triggered by a legacy key or identifier (a renamed or retired key, a removed plugin or
@@ -825,7 +851,7 @@ MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
 #: out: it clears OPENAI_MODEL from .env, a generic name Hermes never reads but the user's tools may.
 #: v41 is left out too: it rewrites profile SOUL.md on a heading match, an artifact whose
 #: provenance the config stamp says nothing about.
-LEGACY_KEY_STEPS = frozenset({12, 14, 16, 17, 29, 33, 38, 39, 42, 43, 46})
+LEGACY_KEY_STEPS = frozenset({12, 14, 16, 17, 29, 33, 38, 39, 42, 43, 46, 50})
 
 
 def run_migrations(
