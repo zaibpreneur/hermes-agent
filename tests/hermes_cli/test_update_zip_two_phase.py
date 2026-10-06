@@ -662,20 +662,45 @@ def test_a_journal_that_cannot_be_dropped_after_the_commit_never_fails_the_updat
     assert (live / "payload" / "version.txt").read_text(encoding="utf-8-sig") == "new"
 
 
-def test_a_backup_copy_killed_before_its_rename_is_cleared_by_the_recovery(tmp_path):
-    """On a file system without hardlinks ``_file_backup`` copies to ``<entry>.hermes-update-old.tmp``
-    first. A kill inside that copy left the temp behind: recovery dropped only staging and the backup,
-    so every later ZIP update refused on "uncommitted changes" (review C4)."""
-    from hermes_cli._early_recovery_zip import (
-        ZIP_SWAP_JOURNAL, restore_interrupted_zip_swap, write_zip_swap_journal, zip_entry_identity)
+_KILLED_BACKUP_COPY = r'''
+import os, shutil, sys
+from pathlib import Path
+from hermes_cli import update_cmd_commit, update_cmd_zip
+live, extracted = Path(sys.argv[1]), Path(sys.argv[2])
+update_cmd_commit.arm_commit_obligations = lambda *a, **k: None
+update_cmd_zip._hardlink_backup = lambda path, backup: False  # FAT32/exFAT/SMB: no hardlinks
+real = shutil.copyfileobj
+def killed_inside_the_backup_copy(source, out, length=0):
+    if source.name == str(live / "a.py"):
+        out.write(source.read(2))
+        out.flush()
+        os._exit(9)  # a SIGKILL: no handler runs, the half-written temp stays
+    return real(source, out, length)
+shutil.copyfileobj = killed_inside_the_backup_copy
+update_cmd_zip._journaled_stage_and_swap(str(extracted), ["a.py"], live, None)
+'''
 
-    live = tmp_path / "live"
+
+def test_a_backup_copy_killed_before_its_rename_is_cleared_by_the_recovery(tmp_path):
+    """On a file system without hardlinks ``_file_backup`` copies to ``<entry>.hermes-update-old.<gen>.tmp``
+    first. The real swap is killed inside that copy: the temp it journaled on creation is its own and
+    goes, or every later ZIP update refuses on "uncommitted changes" (review C4)."""
+    import subprocess
+    import sys
+
+    from hermes_cli._early_recovery_zip import ZIP_SWAP_JOURNAL, restore_interrupted_zip_swap
+
+    live, extracted = tmp_path / "live", tmp_path / "extracted"
     live.mkdir()
+    extracted.mkdir()
     (live / "a.py").write_text("old\n", encoding="utf-8")
-    (live / "a.py.hermes-update-staging").write_text("new\n", encoding="utf-8")
-    (live / "a.py.hermes-update-old.0123456789ab.tmp").write_text("ol", encoding="utf-8")  # the killed copy
-    write_zip_swap_journal(live, "swapping", [["a.py", True, zip_entry_identity(live / "a.py.hermes-update-staging"),
-                                              zip_entry_identity(live / "a.py")]], "0123456789ab")
+    (extracted / "a.py").write_text("new\n", encoding="utf-8")
+    repo = os.path.realpath(Path(update_cmd.__file__).parent.parent)
+    killed = subprocess.run([sys.executable, "-c", _KILLED_BACKUP_COPY, str(live), str(extracted)], cwd=repo,
+                            env={**os.environ, "PYTHONPATH": repo}, capture_output=True, text=True, timeout=120)
+    temps = list(live.glob("a.py.hermes-update-old.*.tmp"))
+    assert killed.returncode == 9 and [p.read_bytes() for p in temps] == [b"ol"], (
+        f"harness: not killed inside the backup copy: {killed.returncode} {killed.stderr[-2000:]}")
 
     restore_interrupted_zip_swap(live)
 
@@ -684,11 +709,12 @@ def test_a_backup_copy_killed_before_its_rename_is_cleared_by_the_recovery(tmp_p
     assert (live / "a.py").read_text(encoding="utf-8") == "old\n"
 
 
-def test_a_file_at_the_backup_temp_name_that_is_not_the_killed_copy_is_kept(tmp_path):
-    """The run's tag names the temp but proves nothing about its bytes: a swap killed before its
-    backup copy existed leaves the name free, and a file there afterwards is not Hermes'. Recovery
-    deletes only a prefix of the live file (what a killed copy of it is) and keeps anything else
-    aside, still retiring the journal (review F78)."""
+@pytest.mark.parametrize("content", ["USER FILE", "old", "old\n", ""])
+def test_a_file_at_the_backup_temp_name_that_is_not_the_killed_copy_is_kept(tmp_path, content):
+    """The run's tag names the temp but proves nothing, and neither do its bytes: a swap killed before
+    its backup copy existed leaves the name free, and a file there afterwards is not Hermes', even an
+    empty one, a prefix or a full copy of the live file. Only the identity the swap journaled when it
+    created the temp may delete it; anything else is kept aside, the journal still retiring (F78-R)."""
     from hermes_cli._early_recovery_zip import (
         ZIP_SWAP_JOURNAL, restore_interrupted_zip_swap, write_zip_swap_journal, zip_entry_identity)
 
@@ -698,12 +724,12 @@ def test_a_file_at_the_backup_temp_name_that_is_not_the_killed_copy_is_kept(tmp_
     (live / "a.py.hermes-update-staging").write_text("new\n", encoding="utf-8")
     write_zip_swap_journal(live, "swapping", [["a.py", True, zip_entry_identity(live / "a.py.hermes-update-staging"),
                                               zip_entry_identity(live / "a.py")]], "0123456789ab")
-    (live / "a.py.hermes-update-old.0123456789ab.tmp").write_text("USER FILE", encoding="utf-8")
+    (live / "a.py.hermes-update-old.0123456789ab.tmp").write_text(content, encoding="utf-8")
 
     restore_interrupted_zip_swap(live)
 
     kept = [p for p in live.iterdir() if ".hermes-update-kept" in p.name]
-    assert [p.read_text(encoding="utf-8") for p in kept] == ["USER FILE"], sorted(p.name for p in live.iterdir())
+    assert [p.read_text(encoding="utf-8") for p in kept] == [content], sorted(p.name for p in live.iterdir())
     assert not (live / ZIP_SWAP_JOURNAL).exists()
     assert (live / "a.py").read_text(encoding="utf-8") == "old\n"
 

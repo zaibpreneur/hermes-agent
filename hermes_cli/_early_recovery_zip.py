@@ -83,22 +83,24 @@ def zip_swap_owner_lock(root: Path, *, wait: float = 0.0):
         os.close(fd)
 
 
-def write_zip_swap_journal(root: Path, phase: str, entries: list, gen: str) -> None:
+def write_zip_swap_journal(root: Path, phase: str, entries: list, gen: str, temps: dict | None = None) -> None:
     """Publish the swap journal: ``entries`` are ``[name, existed, staged_id, live_id]`` (ids from
-    ``zip_entry_identity``, "" while unknown); ``gen`` is the run's random tag (its backup temps)."""
+    ``zip_entry_identity``, "" while unknown); ``gen`` is the run's random tag (its backup temps);
+    ``temps`` maps each backup temp the swap created (its file name) to its ``filling`` identity."""
     import json
 
-    write_durable_text(Path(root) / ZIP_SWAP_JOURNAL,
-                       json.dumps({"pid": os.getpid(), "gen": gen, "phase": phase, "entries": entries}))
+    write_durable_text(Path(root) / ZIP_SWAP_JOURNAL, json.dumps(
+        {"pid": os.getpid(), "gen": gen, "phase": phase, "entries": entries, "temps": temps or {}}))
 
 
-def zip_entry_identity(path) -> str:
+def zip_entry_identity(path, *, filling: bool = False) -> str:
     """The entry's own identity (lstat, never its target); "" when absent or unidentifiable.
 
     The ZIP journal's provenance: recovery deletes only an entry whose identity it recorded when the
     swap made it (a staging copy, or the live entry its backup links/renames), never a lookalike. A
     non-directory adds size and mtime: a file deleted and recreated often gets the same inode back.
-    A directory is ``dev:ino:type`` only: a staged tree's own mtime moves while it is being filled."""
+    A directory, or a file still being written (``filling``), is ``dev:ino:type`` only: its own size
+    and mtime move while it is being filled."""
     try:
         st = os.lstat(path)
     except OSError:
@@ -106,7 +108,7 @@ def zip_entry_identity(path) -> str:
     if not st.st_ino:
         return ""
     base = f"{st.st_dev}:{st.st_ino}:{stat.S_IFMT(st.st_mode):o}"
-    return base if stat.S_ISDIR(st.st_mode) else f"{base}:{st.st_size}:{st.st_mtime_ns}"
+    return base if filling or stat.S_ISDIR(st.st_mode) else f"{base}:{st.st_size}:{st.st_mtime_ns}"
 
 
 def _drop_path(path: Path) -> None:
@@ -138,8 +140,9 @@ def _drop_path(path: Path) -> None:
         path.unlink()
 
 
-def _parse_zip_swap_journal(raw: str) -> tuple[str, str, list[tuple[str, bool, str, str]]] | None:
-    """``(phase, gen, [(entry name, existed, staged_id, live_id)])`` from a journal this code wrote, else None."""
+def _parse_zip_swap_journal(raw: str) -> tuple[str, str, list[tuple[str, bool, str, str]], dict[str, str]] | None:
+    """``(phase, gen, [(entry name, existed, staged_id, live_id)], temps)`` from a journal this code wrote,
+    else None. A journal without ``temps`` (an older writer's) vouches for no backup temp."""
     import json
 
     try:
@@ -155,7 +158,10 @@ def _parse_zip_swap_journal(raw: str) -> tuple[str, str, list[tuple[str, bool, s
                and isinstance(e[1], bool) and e[0] not in ("", ".", "..") and "/" not in e[0] and "\\" not in e[0]
                for e in entries):
         return None
-    return data["phase"], gen, [(name, existed, staged, live) for name, existed, staged, live in entries]
+    temps = data.get("temps", {})
+    if not isinstance(temps, dict) or not all(isinstance(v, str) for v in temps.values()):
+        return None
+    return data["phase"], gen, [(name, existed, staged, live) for name, existed, staged, live in entries], temps
 
 
 def _discard_unless_owned(path: Path, identity: str, kept: list[Path]) -> None:
@@ -169,7 +175,8 @@ def _discard_unless_owned(path: Path, identity: str, kept: list[Path]) -> None:
         kept.append(_keep_aside(path))
 
 
-def _settle_zip_entry(root: Path, phase: str, gen: str, entry: tuple[str, bool, str, str], kept: list[Path]) -> bool:
+def _settle_zip_entry(root: Path, phase: str, gen: str, entry: tuple[str, bool, str, str], temps: dict[str, str],
+                      kept: list[Path]) -> bool:
     """Finish or roll back one journaled entry; True when the live tree changed.
 
     Presence is the ENTRY's (lexists/lstat), never its target's: a dangling symlink backup is the only
@@ -201,16 +208,22 @@ def _settle_zip_entry(root: Path, phase: str, gen: str, entry: tuple[str, bool, 
     for leftover, identity in ((staging, staged_id), (old, live_id)):
         _discard_unless_owned(leftover, identity, kept)
     # ``<old>.<gen>.tmp``: a backup copy of the live file killed before its rename (no-hardlink file
-    # systems). The tag names it but proves nothing about the bytes (F78): only a prefix of the live
-    # file is that copy; anything else at the name is kept aside.
+    # systems). Neither the tag nor the bytes prove a file there is that copy (F78/F78-R): only the
+    # identity the swap journaled the moment it created the temp does. A file system that hands a
+    # recreated name its old inode (FAT, where this copy runs) would let that record vouch for a
+    # later file too, so the bytes must also be what a killed copy is: a prefix of the live file.
     tmp = Path(f"{old}.{gen}.tmp")
-    if here(tmp):
-        regular = [p.is_file() and not p.is_symlink() for p in (tmp, dst)]
-        if all(regular) and dst.read_bytes().startswith(tmp.read_bytes()):
-            _drop_path(tmp)
-        else:
-            kept.append(_keep_aside(tmp))
+    if _is_killed_backup_copy(tmp, dst, temps.get(tmp.name, "")):
+        _drop_path(tmp)
+    elif here(tmp):
+        kept.append(_keep_aside(tmp))
     return changed
+
+
+def _is_killed_backup_copy(tmp: Path, dst: Path, identity: str) -> bool:
+    """The identity matches the regular file the swap recorded (type included), so the bytes are readable."""
+    return (bool(identity) and zip_entry_identity(tmp, filling=True) == identity
+            and dst.is_file() and not dst.is_symlink() and dst.read_bytes().startswith(tmp.read_bytes()))
 
 
 def restore_interrupted_zip_swap(project_root: Path | None = None) -> bool:
@@ -246,13 +259,13 @@ def restore_interrupted_zip_swap(project_root: Path | None = None) -> bool:
                   "it and every `*.hermes-update-old` backup were kept. Put back what each backup replaced "
                   "(or reinstall), then delete the journal.", file=sys.stderr)
             return False
-        phase, gen, entries = parsed
+        phase, gen, entries, temps = parsed
         changed = False
         failed = False
         kept: list[Path] = []
         for entry in reversed(entries):
             try:
-                changed = _settle_zip_entry(root, phase, gen, entry, kept) or changed
+                changed = _settle_zip_entry(root, phase, gen, entry, temps, kept) or changed
             except OSError as exc:
                 failed = True
                 print(f"⚠ Could not settle {entry[0]} after an interrupted ZIP update: {exc}", file=sys.stderr)

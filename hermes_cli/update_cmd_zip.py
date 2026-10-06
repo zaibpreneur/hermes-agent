@@ -117,14 +117,17 @@ def _stage_replacement(src: str, dst: str, on_created=None) -> str:
     return staging
 
 
-def _copy_file_exclusive(src: str, dst: str, *, sync: bool = False) -> None:
+def _copy_file_exclusive(src: str, dst: str, *, sync: bool = False, on_created=None) -> None:
     """``copy2`` that only ever creates ``dst``: O_CREAT|O_EXCL (+O_NOFOLLOW) fails on any entry there
     (symlink, hardlink, file) instead of writing through it, and the bytes and mode go through the held
-    fd. Times are copied only where that can be done without following ``dst``."""
+    fd. Times are copied only where that can be done without following ``dst``. ``on_created(dst)``
+    runs once ``dst`` exists, before a byte is written, so a journal can record what this run made."""
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
     st = os.stat(src)
     fd = os.open(dst, flags, 0o600)
     try:
+        if on_created is not None:
+            on_created(dst)
         with os.fdopen(fd, "wb") as out, open(src, "rb") as source:
             shutil.copyfileobj(source, out, 1 << 20)
             out.flush()
@@ -160,15 +163,16 @@ def _hardlink_backup(path: str, backup: str) -> bool:
     return True
 
 
-def _file_backup(path: str, backup: str, tag: str = "") -> None:
+def _file_backup(path: str, backup: str, tag: str = "", on_temp=None) -> None:
     """Back up the regular file ``path`` as a complete ``backup`` while ``path`` stays in place: a hardlink,
     or where links are unsupported (FAT32/exFAT/SMB) a synced copy landed whole by ``os.replace``. The
-    copy's temp carries the journal's random ``tag``: recovery deletes only its own run's temp."""
+    copy's temp carries the journal's random ``tag``, and ``on_temp(temp)`` journals it as it comes into
+    existence: recovery deletes a temp only on that record (F78-R)."""
     if _hardlink_backup(path, backup):
         return
     tmp = f"{backup}.{tag or os.urandom(6).hex()}.tmp"
     try:
-        _copy_file_exclusive(path, tmp, sync=True)  # never through a planted <backup>.tmp link (Z2)
+        _copy_file_exclusive(path, tmp, sync=True, on_created=on_temp)  # never through a planted link (Z2)
         os.replace(tmp, backup)
     except OSError:
         with suppress(OSError):
@@ -176,7 +180,7 @@ def _file_backup(path: str, backup: str, tag: str = "") -> None:
         raise
 
 
-def _commit_staged_replacements(staged, *, on_committed=None, tag: str = "") -> None:
+def _commit_staged_replacements(staged, *, on_committed=None, tag: str = "", on_temp=None) -> None:
     """Phase 2: swap every staged entry into place, rolling back all on failure.
 
     Per-entry safety wasn't enough: a partway failure over ~90 entries left a mixed-version tree (every
@@ -201,7 +205,7 @@ def _commit_staged_replacements(staged, *, on_committed=None, tag: str = "") -> 
             if os.path.lexists(backup):  # appeared since staging set leftovers aside: not ours to replace (F78)
                 raise FileExistsError(f"{backup} appeared during the update; it was left in place")
             if os.path.isfile(dst) and not os.path.islink(dst):
-                _file_backup(dst, backup, tag)
+                _file_backup(dst, backup, tag, on_temp)
                 swapped.append((dst, backup))
                 os.replace(staging, dst)
                 continue
@@ -515,8 +519,17 @@ def _journaled_stage_and_swap(extracted: str, entries: list[str], root: Path, ta
         for entry in journal_entries:
             entry[3] = zip_entry_identity(root / entry[0])
         write_zip_swap_journal(root, "swapping", journal_entries, gen)
+        temps: dict[str, str] = {}
+
+        def record_temp(tmp: str) -> None:  # a backup copy's temp, journaled before its first byte
+            temps[os.path.basename(tmp)] = zip_entry_identity(tmp, filling=True)
+            write_zip_swap_journal(root, "swapping", journal_entries, gen, temps)
+
+        # Committed: every temp already became its backup, so the record drops them (a backup the
+        # cleanup then frees must never leave an inode that vouches for a later file at a temp name).
         _commit_staged_replacements(
-            staged, on_committed=lambda: write_zip_swap_journal(root, "committed", journal_entries, gen), tag=gen)
+            staged, on_committed=lambda: write_zip_swap_journal(root, "committed", journal_entries, gen), tag=gen,
+            on_temp=record_temp)
         # Committed: the new tree is whole. A journal that cannot go now (AV/indexer holding it) says
         # "committed", which the next launch's recovery settles by keeping the new tree. It stays, too,
         # while a backup (or backup temp) the best-effort cleanup could not remove is still on disk:
