@@ -281,6 +281,24 @@ def test_a_completion_never_erases_the_unkeyed_debt_an_older_install_armed(tmp_p
     assert not host_obligation.host_obligation_present()
 
 
+@pytest.mark.platforms("posix")  # Windows opens no directory handle; NTFS journals the rename
+def test_every_host_record_write_makes_its_rename_durable(tmp_path, monkeypatch):
+    """Arm and restore share one writer, and both fsync the state dir after the rename: a power loss
+    after the arm returned must not roll the directory back to "nothing owed"."""
+    import stat
+
+    monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "gateway-locks"))
+    events, real_fsync, real_replace = [], os.fsync, os.replace
+    monkeypatch.setattr(os, "fsync", lambda fd: events.append(
+        "dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file") or real_fsync(fd))
+    monkeypatch.setattr(os, "replace", lambda src, dst: events.append("rename") or real_replace(src, dst))
+
+    assert host_obligation.write_host_obligation(expected_sha=SHA)
+    host_obligation.replace_bytes(host_obligation.host_obligation_path(), b"{}")
+
+    assert events == ["file", "rename", "dir"] * 2
+
+
 def test_unreadable_host_record_is_never_discharged_by_the_legacy_marker(two_profiles, no_live_fleet, monkeypatch, tmp_path):
     """A record whose terms are UNKNOWN cannot be settled by another record's terms.
 

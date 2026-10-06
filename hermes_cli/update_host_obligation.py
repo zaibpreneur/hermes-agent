@@ -67,19 +67,8 @@ def _owed_path() -> Path:
 
 
 def _write_record(path: Path, record: dict) -> None:
-    """``utils.atomic_json_write(path, record, mode=0o600)`` in stdlib only (see above): the temp
-    file is 0600 from ``mkstemp``, fsynced, then renamed over the record."""
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.stem}_", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(record, handle, indent=2, ensure_ascii=False)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp)
-        raise
+    """``utils.atomic_json_write(path, record, mode=0o600)`` in stdlib only (see above)."""
+    replace_bytes(path, json.dumps(record, indent=2, ensure_ascii=False).encode("utf-8"))
 
 
 def read_host_obligation() -> Optional[dict]:
@@ -289,9 +278,9 @@ def _release_locked(path: Path, owner: str) -> None:
 
 
 def replace_bytes(path: Path, data: bytes) -> None:
-    """Put ``data`` back at ``path``: a fresh ``mkstemp`` file (never through a planted alias),
-    fsynced, then renamed over the record."""
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.stem}_", suffix=".restore")
+    """``data`` at ``path`` as one durable record: a fresh 0600 ``mkstemp`` file (never written
+    through a planted alias), fsynced, renamed over ``path``, then the rename itself made durable."""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.stem}_", suffix=".tmp")
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(data)
@@ -302,6 +291,12 @@ def replace_bytes(path: Path, data: bytes) -> None:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
+    if os.name != "nt":  # Windows opens no directory handle; NTFS journals the rename itself
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
 
 
 def clear_host_obligation() -> None:
