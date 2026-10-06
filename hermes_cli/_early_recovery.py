@@ -817,7 +817,7 @@ def _claim_owner_alive(fields: dict[str, str], marker: Path) -> bool:
             and time.time() - marker.stat().st_mtime < _INTERRUPTED_PULL_MAX_AGE_SECONDS)
 
 
-def _resume_killed_rollback(git, read_head, fields: dict[str, str], git_dir: Path, root: Path,
+def _resume_killed_rollback(git, fields: dict[str, str], git_dir: Path, root: Path,
                             pre: str, rollback: str, *, after_failure: bool) -> str | None:
     """Redo a killed syntax rollback's HEAD move to ``pre``; the new HEAD, or None (marker kept)."""
     # Only the ref the rollback left HEAD on may be rewound: a branch the user checked out at
@@ -842,7 +842,7 @@ def _resume_killed_rollback(git, read_head, fields: dict[str, str], git_dir: Pat
         print(f"⚠ An interrupted `hermes update` rollback to {pre[:10]} cannot resume yet ({reason}); "
               "the next launch retries.", file=sys.stderr)
         return None
-    return read_head()
+    return _read_head(git)
 
 
 def _advise_killed_merge(git_dir: Path, root: Path, target: str, stash: str) -> None:
@@ -858,15 +858,9 @@ def _advise_killed_merge(git_dir: Path, root: Path, target: str, stash: str) -> 
               file=sys.stderr)
 
 
-def _restore_holding_claim(root: Path, marker: Path, *, after_failure: bool = False) -> bool:
-    git_dir = marker.parent
-    fields = dict(line.partition("=")[::2] for line in marker.read_text(encoding="utf-8-sig").splitlines())
-    if _claim_owner_alive(fields, marker):
-        return False
-    pre, target = fields.get("pre", "").strip(), fields.get("target", "").strip()
-    stash = fields.get("stash", "").strip()
-
-    executable = _git_executable(fields.get("git", "").strip())
+def _custody_git(root: Path, recorded: str):
+    """The restore's ``git(*args)``: the binary the updater recorded, every run under custody (``run_git``)."""
+    executable = _git_executable(recorded)
     try:
         from hermes_cli.update_custody import run_git
     except Exception as exc:  # noqa: BLE001 - never start an uncontained repair writer
@@ -883,9 +877,17 @@ def _restore_holding_claim(root: Path, marker: Path, *, after_failure: bool = Fa
                       **({"text": True, "encoding": "utf-8", "errors": "replace"} if text else {}))
         return run_git(base, list(args), **kwargs)
 
-    # A killed git's index.lock goes first, before any git runs (an unresolvable or failing git
-    # would otherwise strand it, and it refuses every later git command). Proven-dead only; after a
-    # git that EXITED (``after_failure``) a lock now is another git's, never ours to drop.
+    return git
+
+
+def _judge_index_lock(fields: dict[str, str], marker: Path, root: Path, *,
+                      after_failure: bool) -> tuple[bool, bool, bool]:
+    """``(foreign_lock, known_foreign, index_free)`` for the git dir's ``index.lock``, before any git runs.
+
+    A killed git's lock goes first (an unresolvable or failing git would otherwise strand it, and it
+    refuses every later git command). Proven-dead only; after a git that EXITED (``after_failure``) a
+    lock now is another git's, never ours to drop."""
+    git_dir = marker.parent
     lock = git_dir / "index.lock"
     foreign_lock = after_failure and lock.exists()
     if foreign_lock and _lock_predates_move(fields, lock):
@@ -898,25 +900,52 @@ def _restore_holding_claim(root: Path, marker: Path, *, after_failure: bool = Fa
     known_foreign = bool(fields.get("foreign_lock", "").strip()) and \
         fields["foreign_lock"].strip() == _lock_identity(lock)
     index_free = foreign_lock or (not known_foreign and _release_dead_index_lock(git_dir, root))
+    return foreign_lock, known_foreign, index_free
 
+
+def _read_head(git) -> str | None:
+    # Only a full object name is an answer: an empty or garbled one keeps the marker (m5).
+    head = git("rev-parse", "HEAD")
+    oid = head.stdout.strip() if head.returncode == 0 else ""
+    if _OID.fullmatch(oid):
+        return oid
+    detail = head.stderr.strip() or f"git printed {oid!r}, exit {head.returncode}"
+    print(f"⚠ Could not read HEAD to repair an interrupted `hermes update` ({detail}); "
+          "the next launch retries.", file=sys.stderr)
+    return None
+
+
+def _retire_unattributable(git, git_dir: Path, root: Path, marker: Path, pre: str, target: str) -> None:
+    """``target`` is gone (a gc or re-clone): nothing left to compare the tree against.
+
+    Unattributable bytes are not proof of a whole tree: only a clean tracked tree at ``pre`` retires
+    the record, rollback or not (review G2)."""
+    if not _rollback_verified(git, git_dir, pre):
+        print(f"⚠ An interrupted `hermes update` left tracked files that differ from {pre[:10]} and commit "
+              f"{target[:10]} is gone; the marker was kept. Inspect `git -C {root} status`, then "
+              f"`git -C {root} checkout {pre[:10]} -- <file>` for each file the update wrote.", file=sys.stderr)
+        return
+    marker.unlink()
+    print(f"⚠ Ignoring a stale interrupted-update marker: commit {target[:10]} is gone.", file=sys.stderr)
+
+
+def _restore_holding_claim(root: Path, marker: Path, *, after_failure: bool = False) -> bool:
+    git_dir = marker.parent
+    fields = dict(line.partition("=")[::2] for line in marker.read_text(encoding="utf-8-sig").splitlines())
+    if _claim_owner_alive(fields, marker):
+        return False
+    pre, target = fields.get("pre", "").strip(), fields.get("target", "").strip()
+    stash = fields.get("stash", "").strip()
+    git = _custody_git(root, fields.get("git", "").strip())
+    foreign_lock, known_foreign, index_free = _judge_index_lock(fields, marker, root, after_failure=after_failure)
     rollback = fields.get("rollback", "").strip()
     rollback = rollback if rollback in ("branch", "detach") else ""
-    def read_head() -> str | None:
-        # Only a full object name is an answer: an empty or garbled one keeps the marker (m5).
-        head = git("rev-parse", "HEAD")
-        oid = head.stdout.strip() if head.returncode == 0 else ""
-        if _OID.fullmatch(oid):
-            return oid
-        detail = head.stderr.strip() or f"git printed {oid!r}, exit {head.returncode}"
-        print(f"⚠ Could not read HEAD to repair an interrupted `hermes update` ({detail}); "
-              "the next launch retries.", file=sys.stderr)
-        return None
 
-    head = read_head()
+    head = _read_head(git)
     if head is None:
         return False
     if rollback and pre and target and head == target:
-        head = _resume_killed_rollback(git, read_head, fields, git_dir, root, pre, rollback,
+        head = _resume_killed_rollback(git, fields, git_dir, root, pre, rollback,
                                        after_failure=after_failure or known_foreign)
         if head is None:
             return False
@@ -934,17 +963,16 @@ def _restore_holding_claim(root: Path, marker: Path, *, after_failure: bool = Fa
               "the next launch finishes the restore.", file=sys.stderr)
         return False
     written = _paths_git_wrote(git, root, pre, target)
-    if written is None:  # after a gc or re-clone: nothing left to compare against
-        # Unattributable bytes are not proof of a whole tree: only a clean tracked tree at ``pre``
-        # retires the record, rollback or not (review G2).
-        if not _rollback_verified(git, git_dir, pre):
-            print(f"⚠ An interrupted `hermes update` left tracked files that differ from {pre[:10]} and commit "
-                  f"{target[:10]} is gone; the marker was kept. Inspect `git -C {root} status`, then "
-                  f"`git -C {root} checkout {pre[:10]} -- <file>` for each file the update wrote.", file=sys.stderr)
-            return False
-        marker.unlink()
-        print(f"⚠ Ignoring a stale interrupted-update marker: commit {target[:10]} is gone.", file=sys.stderr)
+    if written is None:
+        _retire_unattributable(git, git_dir, root, marker, pre, target)
         return False
+    return _put_back_written(git, root, marker, written, pre, stash, rollback,
+                             foreign_lock=foreign_lock, after_failure=after_failure)
+
+
+def _put_back_written(git, root: Path, marker: Path, written, pre: str, stash: str, rollback: str, *,
+                      foreign_lock: bool, after_failure: bool) -> bool:
+    """Return every path git wrote (``_paths_git_wrote``) to ``pre`` and retire the marker once verified."""
     restore, added, new_dirs, kept = written
     if (restore or added) and foreign_lock:
         print("⚠ Another git holds the index, so the files the update already wrote cannot be put back "
@@ -965,7 +993,7 @@ def _restore_holding_claim(root: Path, marker: Path, *, after_failure: bool = Fa
     for rel in sorted(new_dirs, key=lambda d: d.count("/"), reverse=True):
         with contextlib.suppress(OSError):
             (root / rel).rmdir()  # only when empty: an untracked file inside keeps it
-    if rollback and not _rollback_verified(git, git_dir, pre, owned=set(restore)):
+    if rollback and not _rollback_verified(git, marker.parent, pre, owned=set(restore)):
         # Only HEAD on ``pre`` with every path the update wrote back at ``pre`` is a finished rollback;
         # anything less keeps its only record. Other tracked edits (made after the kill, or autocrlf /
         # filemode noise) are not the rollback's to judge, and no reset is advised: it would wipe them.
