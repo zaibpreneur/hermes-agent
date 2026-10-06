@@ -255,6 +255,32 @@ def test_one_installs_completed_restart_never_erases_another_installs_debt(tmp_p
     assert run("install-b", "print(host_obligation_present())") == "False"
 
 
+@pytest.mark.parametrize("a_sha", ["a" * 40, "b" * 40])
+def test_a_completion_never_erases_the_unkeyed_debt_an_older_install_armed(tmp_path, monkeypatch, a_sha):
+    """Install A still runs a release that writes the unkeyed record; install B (this release) armed
+    its own keyed record. B's completed restart judged only B's record, so A's debt must survive it,
+    whether the SHAs differ or match. With no record of its own, B honours the unkeyed one and its
+    discharge clears it: an upgrade's own interrupted debt never sticks (review S3 residual)."""
+    lock_dir = tmp_path / "gateway-locks"
+    monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(lock_dir))
+    legacy = lock_dir / host_obligation.HOST_OBLIGATION_NAME
+
+    def a_arms() -> None:  # the older release's writer: unkeyed name, no owners, no mutex
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        legacy.write_text(json.dumps({"version": 1, "pid": 1, "expected_sha": a_sha}), encoding="utf-8")
+
+    assert host_obligation.write_host_obligation(expected_sha="b" * 40, owner="run-b")
+    a_arms()
+    host_obligation.mark_host_restart_completed("b" * 40)
+    host_obligation.clear_host_obligation()
+
+    assert json.loads(legacy.read_text(encoding="utf-8"))["expected_sha"] == a_sha
+    assert (host_obligation.read_host_obligation() or {}).get("expected_sha") == a_sha
+
+    host_obligation.clear_host_obligation()  # B now owns no record: the unkeyed one is what it judged
+    assert not host_obligation.host_obligation_present()
+
+
 def test_unreadable_host_record_is_never_discharged_by_the_legacy_marker(two_profiles, no_live_fleet, monkeypatch, tmp_path):
     """A record whose terms are UNKNOWN cannot be settled by another record's terms.
 

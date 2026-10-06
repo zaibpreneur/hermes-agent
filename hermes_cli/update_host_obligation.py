@@ -35,8 +35,8 @@ from typing import Any, Callable, Iterable, Optional
 logger = logging.getLogger("hermes_cli.update_cmd")
 
 #: The record before it carried an install key, beside ``host-gateway.json`` / ``host-serve.json``.
-#: Still read, and cleared on discharge, so a debt an older release armed survives the upgrade; it
-#: names no install, so it keeps its old meaning: owed by whichever install reads it.
+#: Still read, and cleared by a discharge that judged it, so a debt an older release armed survives
+#: the upgrade; it names no install, so it keeps its old meaning: owed by whichever install reads it.
 HOST_OBLIGATION_NAME = "host-update-restart.json"
 
 _RECORD_VERSION = 1
@@ -305,13 +305,18 @@ def replace_bytes(path: Path, data: bytes) -> None:
 
 
 def clear_host_obligation() -> None:
-    """Discharge this install's obligation (and an older release's unkeyed one). Never raises."""
-    path = host_obligation_path()
-    for owed in (path, path.with_name(HOST_OBLIGATION_NAME)):
-        try:
-            owed.unlink(missing_ok=True)
-        except OSError as exc:
-            logger.debug("Could not clear host update-restart obligation: %s", exc)
+    """Discharge the record this install's readers judged (``_owed_path``). Never raises.
+
+    That is this install's own record whenever it has one. An older release's unkeyed record names
+    no install: while this install has its own record, the unkeyed one may be another
+    installation's standing debt that nothing here judged, so it stays (review S3 residual). It goes
+    only when it was the record judged (this install armed none): it keeps its old meaning, owed by
+    whichever install reads it, and an upgrade's own interrupted debt must stay dischargeable.
+    """
+    try:
+        _owed_path().unlink(missing_ok=True)
+    except OSError as exc:
+        logger.debug("Could not clear host update-restart obligation: %s", exc)
 
 
 def obligation_fields() -> Optional[dict[str, str]]:
