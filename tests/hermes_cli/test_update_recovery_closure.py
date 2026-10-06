@@ -220,3 +220,30 @@ def test_a_stdlib_named_file_in_the_tree_never_runs_before_the_repair(tmp_path, 
     assert launch.returncode == 0 and "APP_REACHED" in launch.stdout, launch.stderr
     assert (root / "hermes_bootstrap.py").read_bytes() == original
     assert not (root / ".git/hermes-update-pull").exists()
+
+
+def test_the_closure_is_pres_committed_bytes_read_in_one_cat_file_spawn(tmp_path, monkeypatch):
+    """The published repair is ``pre``'s committed bytes, not the working tree's, read with one
+    ``git cat-file --batch`` (the preflight's batched reader), not a ``cat-file`` per file."""
+    from hermes_cli import update_cmd_commit as commit
+    from hermes_cli._early_recovery import RECOVERY_CLOSURE
+
+    root = tmp_path / "checkout"
+    for rel in RECOVERY_CLOSURE:
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_bytes(f"# {rel} at pre\n".encode())
+    env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}
+    for args in (("init", "-q", "-b", "main"), ("add", "-A"),
+                 ("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "pre")):
+        subprocess.run(["git", "-C", str(root), *args], env=env, check=True)
+    pre = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
+    (root / RECOVERY_CLOSURE[0]).write_bytes(b"# a working-tree edit, never published\n")
+    spawns = []
+    real = commit.run_git
+    monkeypatch.setattr(commit, "run_git", lambda git_cmd, args, **kw: spawns.append(args[0]) or real(git_cmd, args, **kw))
+
+    closure = commit.publish_recovery_closure(["git"], root, pre)
+
+    for rel in RECOVERY_CLOSURE:
+        assert (closure / rel).read_bytes() == f"# {rel} at pre\n".encode()
+    assert spawns == ["ls-tree", "cat-file"]

@@ -248,12 +248,11 @@ def publish_recovery_closure(git_cmd, root: Path, pre: str) -> Path:
         if meta.split()[1:2] == ["blob"]:
             ids[rel] = meta.split()[2]
     blobs = {RECOVERY_CLOSURE_INIT: b""}
+    shown = read_target_files(git_cmd, root, pre, RECOVERY_CLOSURE)  # one spawn, not a cat-file per file
     for rel in RECOVERY_CLOSURE:
-        shown = run_git(git_cmd, ["cat-file", "blob", ids.get(rel, "")], cwd=str(root), capture_output=True,
-                        stdin=subprocess.DEVNULL, timeout=120) if rel in ids else None
-        if shown is None or shown.returncode != 0 or blob_id(shown.stdout or b"", pre) != ids[rel]:
+        if rel not in ids or shown[rel] is None or blob_id(shown[rel], pre) != ids[rel]:
             raise OSError(f"{rel} is not in {pre[:10]}")
-        blobs[rel] = shown.stdout
+        blobs[rel] = shown[rel]
     manifest = "".join(f"{blob_id(data, pre)} {rel}\n" for rel, data in blobs.items()).encode("utf-8")
     staging = dest.with_name(f".{pre}.{os.getpid()}.staging")
     shutil.rmtree(staging, ignore_errors=True)
