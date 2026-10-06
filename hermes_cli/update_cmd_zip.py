@@ -14,9 +14,9 @@ import sys
 from pathlib import Path
 from typing import Collection, Optional
 
-from hermes_cli._early_recovery import (
-    ZIP_SWAP_JOURNAL, _keep_aside, restore_interrupted_zip_swap, write_zip_swap_journal, zip_entry_identity,
-    zip_swap_owner_lock)
+from hermes_cli._early_recovery import _keep_aside
+from hermes_cli._early_recovery_zip import (
+    ZIP_SWAP_JOURNAL, restore_interrupted_zip_swap, write_zip_swap_journal, zip_entry_identity, zip_swap_owner_lock)
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("hermes_cli.update_cmd")
