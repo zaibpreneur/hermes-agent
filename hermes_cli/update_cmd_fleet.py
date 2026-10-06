@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from hermes_cli.update_cmd_common import _best_effort
+from hermes_cli.update_host_obligation import PROFILE_MARKER_NAME
 from hermes_cli.update_inventory import _gateway_service_matches_profile
 
 # Log-record parity with the origin module.
@@ -26,7 +27,7 @@ logger = logging.getLogger("hermes_cli.update_cmd")
 # after a pull advanced HEAD; cleared only when the restart completes or nothing ran.
 # The existing ``.update-incomplete`` / ``.lazy-refresh-incomplete`` markers gate dependency/venv repair;
 # this one is the fleet-restart obligation after a git pull that advanced HEAD (#95294).
-_FLEET_RESTART_PENDING_NAME = "fleet_restart_pending"
+_FLEET_RESTART_PENDING_NAME = PROFILE_MARKER_NAME
 
 _FRESH_RESTART_SUPERVISORS = frozenset({"systemd", "launchd", "service", "s6"})
 
@@ -60,39 +61,12 @@ def _fleet_restart_pending_marker_path() -> Path:
     return get_hermes_home() / _FLEET_RESTART_PENDING_NAME
 
 
-def _write_legacy_fleet_restart_pending_marker(
-    *, expected_sha: str = "", runtimes: list[dict] | None = None
-) -> bool:
-    """Arm the LEGACY per-``HERMES_HOME`` marker. True when written. Never raises.
-
-    Fallback only: ``$HERMES_HOME`` is writable by construction (the updater already writes its
-    receipts there), so it still carries the obligation when the host state dir cannot.
-    """
-    path = _fleet_restart_pending_marker_path()
-    try:
-        lines = [f"started={_time.time()}", f"pid={os.getpid()}"]
-        if expected_sha:
-            lines.append(f"expected_sha={expected_sha}")
-        if runtimes is not None:
-            lines.append("inventory=" + json.dumps({"version": 1, "runtimes": runtimes}))
-        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        return True
-    except OSError as exc:
-        logger.debug("Could not write legacy fleet-restart-pending marker: %s", exc)
-        return False
-
-
 def _write_fleet_restart_pending_marker(*, expected_sha: str = "", runtimes: list[dict] | None = None, owner: str = "") -> bool:
     """Arm the HOST pull→restart obligation. Never raises; False when no store every profile reads took it.
 
-    An unwritable host state dir (``HERMES_GATEWAY_LOCK_DIR`` on a read-only mount, a container
-    UID that does not own ``$HOME``) must never disarm the obligation: an update interrupted
-    after this point would then leave stale code running with no warning and no catch-up restart
-    (#117275). The legacy per-home marker — which every reader here still honours — carries it
-    instead, and a host that can write neither says so out loud. That marker is visible to the
-    invoking profile only, so it settles the debt only on an install with no other profile: with
-    one, the other profiles would read "nothing owed", so the marker is still left for this
-    profile but the arm returns False and the commit point refuses to move (review S2).
+    An unwritable host state dir falls back to this profile's per-home marker, which settles the
+    debt only on an install proven to have no other profile; otherwise the arm returns False and
+    the commit point refuses to move (``update_host_obligation.arm_host_obligation``, review S2).
     """
     if runtimes == []:
         # An explicit empty inventory owes no restart (e.g. Desktop-hosted `serve` with no
@@ -100,31 +74,12 @@ def _write_fleet_restart_pending_marker(*, expected_sha: str = "", runtimes: lis
         # a no-gateway host would then fail every later ``hermes update`` (#115311).
         return True
     from hermes_cli.update_cmd import _m
-    from hermes_cli.update_host_obligation import host_obligation_path, write_host_obligation
+    from hermes_cli.update_host_obligation import arm_host_obligation
     if _m()._pytest_owns_live_checkout(_fleet_restart_pending_marker_path().parent):
         logger.debug("Skipping fleet-restart-pending obligation under pytest (live checkout)")
         return True
-    if write_host_obligation(
-            expected_sha=expected_sha, runtimes=runtimes, profile=_current_profile_name(), owner=owner):
-        return True
-    from hermes_cli.profiles import list_profile_names
-    others = len(list_profile_names()) > 1
-    if _write_legacy_fleet_restart_pending_marker(expected_sha=expected_sha, runtimes=runtimes) and not others:
-        logger.warning(
-            "Host update-restart obligation (%s) is unwritable; armed the per-home marker %s instead.",
-            host_obligation_path(), _fleet_restart_pending_marker_path())
-        return True
-    logger.error(
-        "Could not arm the update-restart obligation in %s%s; an interrupted update will not warn.",
-        host_obligation_path(),
-        " (this profile's marker hides it from the other profiles)" if others
-        else f" or {_fleet_restart_pending_marker_path()}")
-    print(
-        "  ⚠ Could not record the pending gateway-restart obligation (state dir not writable) — "
-        "restart gateways with `hermes gateway restart` if this update is interrupted.",
-        file=sys.stderr,
-    )
-    return False
+    return arm_host_obligation(_fleet_restart_pending_marker_path(), expected_sha=expected_sha, runtimes=runtimes,
+                               profile=_current_profile_name(), owner=owner)
 
 
 def _current_profile_name() -> str:

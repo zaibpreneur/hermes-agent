@@ -603,6 +603,33 @@ def test_the_takeover_breadcrumb_is_written_temp_fsync_rename(tmp_path, monkeypa
     assert f"expected_sha={'a' * 40}" in crumb.read_text(encoding="utf-8")
 
 
+@pytest.mark.skipif(getattr(os, "geteuid", lambda: 1)() == 0, reason="root ignores directory permissions")
+def test_a_takeover_debt_another_profile_cannot_see_is_never_silent(tmp_path, monkeypatch, capsys):
+    """The takeover arms after the historical updater already moved the tree, through the same
+    fallback as the commit point: with the host record unwritable on a two-profile install, the
+    arming profile's marker hides the debt from the other one, so the takeover must say so (it
+    cannot refuse a move that already happened) (kshitijk4poor P2, review S2)."""
+    from hermes_cli import _update_takeover
+
+    homes = {name: tmp_path / "profiles" / name for name in ("coder", "writer")}
+    for home in homes.values():
+        home.mkdir(parents=True)
+        (home / "config.yaml").write_text("{}\n", encoding="utf-8")
+    lock_dir = tmp_path / "gateway-locks"
+    lock_dir.mkdir()
+    monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(lock_dir))
+    monkeypatch.setenv("HERMES_HOME", str(homes["coder"]))
+    monkeypatch.setattr(_update_takeover, "_head_sha", lambda _root: "a" * 40)
+    lock_dir.chmod(0o500)
+    try:
+        _update_takeover._arm_fleet_obligation(tmp_path)
+    finally:
+        lock_dir.chmod(0o700)
+
+    assert (homes["coder"] / "fleet_restart_pending").is_file()
+    assert "hermes gateway restart" in capsys.readouterr().err
+
+
 def test_a_historical_updater_arms_the_host_record_under_the_current_mutex(tmp_path, monkeypatch):
     """An N-1 updater imported ``update_lock`` before its pull, then lazily imports the pulled
     ``update_host_obligation``: the arm must still write the record, under the same sidecar lock

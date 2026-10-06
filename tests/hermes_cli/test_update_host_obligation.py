@@ -299,6 +299,30 @@ def test_every_host_record_write_makes_its_rename_durable(tmp_path, monkeypatch)
     assert events == ["file", "rename", "dir"] * 2
 
 
+@pytest.mark.skipif(getattr(os, "geteuid", lambda: 1)() == 0, reason="root ignores directory permissions")
+@pytest.mark.parametrize("unreadable", ["roster", "profile"])
+def test_an_unreadable_profile_roster_never_admits_a_private_restart_marker(
+        two_profiles, no_live_fleet, monkeypatch, tmp_path, unreadable):
+    """Host record unwritable AND the profile roster (or one profile's identity) unreadable: that is
+    an UNKNOWN inventory, not a single-profile install. The default profile's marker would hide the
+    debt from the profile nobody could read, so the arm refuses (review S2 residual)."""
+    (two_profiles["writer"] / "config.yaml").write_text("{}\n", encoding="utf-8")  # the one named profile
+    _enter(monkeypatch, tmp_path)  # the default profile arms
+    lock_dir = tmp_path / "gateway-locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    blind = tmp_path / "profiles" if unreadable == "roster" else two_profiles["writer"]
+    lock_dir.chmod(0o500)
+    blind.chmod(0o300 if unreadable == "roster" else 0o000)  # roster: traversable, not listable
+    try:
+        armed = fleet._write_fleet_restart_pending_marker(expected_sha=SHA)
+    finally:
+        blind.chmod(0o700)
+        lock_dir.chmod(0o700)
+
+    assert armed is False
+    assert fleet._fleet_restart_pending_marker_path().is_file(), "the arming profile still keeps its marker"
+
+
 def test_unreadable_host_record_is_never_discharged_by_the_legacy_marker(two_profiles, no_live_fleet, monkeypatch, tmp_path):
     """A record whose terms are UNKNOWN cannot be settled by another record's terms.
 

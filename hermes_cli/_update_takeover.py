@@ -70,25 +70,14 @@ def _arm_fleet_obligation(root: Path) -> None:
     ``main`` would report any exception here as a failed update."""
     # This runs in the HISTORICAL interpreter, before PM syncs the new dependencies: only stdlib-only
     # modules here (``update_cmd_fleet``'s writer imports ``update_cmd`` -> config -> ruamel, which a
-    # release older than ruamel does not have).
-    from hermes_cli.update_host_obligation import write_host_obligation
+    # release older than ruamel does not have). Same arm and per-home fallback as the commit point's;
+    # its False (a debt other profiles cannot see) is already said out loud, and the tree has moved.
+    from hermes_cli.update_host_obligation import PROFILE_MARKER_NAME, arm_host_obligation
+    from hermes_constants import get_hermes_home
 
     # A git-less archive root has no SHA: an SHA-less record still owes the restart; its readers hold
     # the fleet to the checkout instead of a named pull.
-    sha = _head_sha(root)
-    if write_host_obligation(expected_sha=sha):
-        return
-    # Same fallback as ``update_cmd_fleet._write_fleet_restart_pending_marker``: the per-home
-    # breadcrumb every reader still honours.
-    from hermes_cli._early_recovery import write_durable_text
-    from hermes_constants import get_hermes_home
-
-    lines = [f"started={time.time()}", f"pid={os.getpid()}"] + ([f"expected_sha={sha}"] if sha else [])
-    try:
-        write_durable_text(get_hermes_home() / "fleet_restart_pending", "\n".join(lines) + "\n")
-    except OSError as exc:
-        print(f"Warning: could not record the owed gateway restart ({exc}); run `hermes update` again "
-              "to restart the gateway onto the new code.", file=sys.stderr)
+    arm_host_obligation(get_hermes_home() / PROFILE_MARKER_NAME, expected_sha=_head_sha(root))
 
 
 def _head_sha(root: Path) -> str:

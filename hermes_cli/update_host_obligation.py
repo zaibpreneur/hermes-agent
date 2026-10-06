@@ -27,6 +27,8 @@ import hashlib
 import json
 import logging
 import os
+import stat
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -38,6 +40,9 @@ logger = logging.getLogger("hermes_cli.update_cmd")
 #: Still read, and cleared by a discharge that judged it, so a debt an older release armed survives
 #: the upgrade; it names no install, so it keeps its old meaning: owed by whichever install reads it.
 HOST_OBLIGATION_NAME = "host-update-restart.json"
+
+#: The per-``HERMES_HOME`` breadcrumb an unwritable host record falls back to; every reader honours it.
+PROFILE_MARKER_NAME = "fleet_restart_pending"
 
 _RECORD_VERSION = 1
 
@@ -123,6 +128,79 @@ def write_host_obligation(
     except OSError as exc:  # the mutex busy or unopenable: the caller falls back to the per-home marker
         logger.debug("Could not lock the host update-restart obligation: %s", exc)
         return False
+
+
+def arm_host_obligation(
+    marker: Path, *, expected_sha: str = "", runtimes: Optional[list] = None, profile: str = "", owner: str = ""
+) -> bool:
+    """Arm the host record, else ``marker`` (the arming profile's per-home breadcrumb). Never raises.
+
+    The one fallback for every arm (``hermes update``'s commit point, a historical updater's
+    takeover). An unwritable host state dir (``HERMES_GATEWAY_LOCK_DIR`` on a read-only mount, a
+    container UID that does not own ``$HOME``) must never disarm the obligation (#117275), but the
+    marker is visible to the arming profile only: it settles the debt only on an install PROVEN to
+    have no other profile, and an unreadable profile roster proves nothing (review S2 residual).
+    Otherwise the marker is still left for this profile, the gap is said out loud, and the result
+    is False: the commit point refuses to move; a takeover, whose tree already moved, keeps the warning.
+    """
+    if write_host_obligation(expected_sha=expected_sha, runtimes=runtimes, profile=profile, owner=owner):
+        return True
+    lines = [f"started={time.time()}", f"pid={os.getpid()}"] + ([f"expected_sha={expected_sha}"] if expected_sha else [])
+    if runtimes is not None:
+        lines.append("inventory=" + json.dumps({"version": 1, "runtimes": runtimes}))
+    hidden = ""
+    try:
+        replace_bytes(marker, ("\n".join(lines) + "\n").encode("utf-8"))
+    except OSError as exc:
+        hidden = f" or {marker} ({exc})"
+    if not hidden:
+        try:
+            if _named_profiles_exist():
+                hidden = f" ({marker} hides it from the other profiles)"
+        except OSError as exc:
+            hidden = f" ({marker} may hide it from other profiles: the profile list is unreadable: {exc})"
+    if not hidden:
+        logger.warning("Host update-restart obligation (%s) is unwritable; armed the per-home marker %s instead.",
+                       host_obligation_path(), marker)
+        return True
+    logger.error("Could not arm the update-restart obligation in %s%s; an interrupted update will not warn.",
+                 host_obligation_path(), hidden)
+    # ASCII: a historical updater's takeover may print through a legacy console code page.
+    print("  Warning: could not record the pending gateway-restart obligation where every profile sees it "
+          "(state dir not writable) - restart gateways with `hermes gateway restart` if this update is "
+          "interrupted.", file=sys.stderr)
+    return False
+
+
+def _named_profiles_exist() -> bool:
+    """True when the install has a live named profile beside ``default``, read from a COMPLETE roster.
+
+    ``profiles.list_profile_names`` suppresses enumeration errors and reads an unreadable roster as
+    "default only"; here any error listing the roster or reading an entry's identity raises instead.
+    Same identity rule as ``hermes_constants.named_profile_is_live`` (stdlib only: see above).
+    """
+    from hermes_constants import _PROFILE_IDENTITY_MARKERS, PROFILE_ID_RE, get_default_hermes_root, profile_tombstone_path
+
+    try:
+        entries = list((get_default_hermes_root() / "profiles").iterdir())
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    for home in entries:
+        if home.name == "default" or not PROFILE_ID_RE.match(home.name) or not stat.S_ISDIR(_mode(home, os.stat)):
+            continue
+        identity = any((mode := _mode(home / name, os.lstat)) and not stat.S_ISDIR(mode)
+                       for name in _PROFILE_IDENTITY_MARKERS)
+        if identity and not _mode(profile_tombstone_path(home), os.lstat):
+            return True
+    return False
+
+
+def _mode(path: Path, probe: Callable[[Path], os.stat_result]) -> int:
+    """``probe(path).st_mode``; 0 when absent. Any other error raises: unreadable is unknown, not absent."""
+    try:
+        return probe(path).st_mode
+    except (FileNotFoundError, NotADirectoryError):
+        return 0
 
 
 def _write_locked(path: Path, *, expected_sha: str, runtimes: Optional[list], profile: str, owner: str) -> bool:
