@@ -909,3 +909,48 @@ def test_a_suffix_path_that_appears_after_the_preflight_is_never_deleted(tmp_pat
     kept = [p.name for p in live.iterdir() if p.is_file() and p.read_bytes() == b"USER NOTE"]
     assert len(kept) == 1, sorted(p.name for p in live.iterdir())
     assert not (live / ZIP_SWAP_JOURNAL).exists()
+
+
+def test_a_stage_journals_each_directory_before_its_fill_and_not_every_file(tmp_path, monkeypatch):
+    """The staging journal is an fsync'd rewrite, ~9 ms on ext4: one per entry was ~1 s of a 123-entry
+    stage (review K132361). A directory's id is still on disk before copytree fills it, and a kill
+    right after staging still leaves every copy provably the update's: recovery drops them all."""
+    import json
+
+    from hermes_cli import update_cmd_commit
+    from hermes_cli._early_recovery_zip import ZIP_SWAP_JOURNAL, restore_interrupted_zip_swap
+
+    live, extracted = tmp_path / "live", tmp_path / "extracted"
+    _live_tree(live, {"agent": "old", "tools": "old"})
+    _live_tree(extracted, {"agent": "new", "tools": "new"})
+    entries = ["a.py", "agent", "b.py", "c.py", "tools", "d.py", "e.py"]
+    for name in (e for e in entries if e.endswith(".py")):
+        (extracted / name).write_text(f"new {name}", encoding="utf-8")
+    durable_before_fill, staging_writes = set(), []
+    real = update_cmd_zip.write_zip_swap_journal
+
+    def journal(root, phase, *args, **kwargs):
+        real(root, phase, *args, **kwargs)
+        staging_writes.append(phase == "staging")
+        for name, _existed, staged_id, _live in json.loads((root / ZIP_SWAP_JOURNAL).read_text("utf-8"))["entries"]:
+            staging = root / f"{name}.hermes-update-staging"
+            if staged_id and staging.is_dir() and not any(staging.iterdir()):
+                durable_before_fill.add(name)
+
+    class Killed(BaseException):
+        pass
+
+    def killed(*_args, **_kwargs):
+        raise Killed  # the process dies after staging, before the swapping record
+
+    monkeypatch.setattr(update_cmd_zip, "write_zip_swap_journal", journal)
+    monkeypatch.setattr(update_cmd_commit, "tree_syntax_error", killed)
+    with pytest.raises(Killed):
+        update_cmd_zip._journaled_stage_and_swap(str(extracted), entries, live, None)
+
+    assert durable_before_fill == {"agent", "tools"}
+    assert sum(staging_writes) == 4, "the opening record, one per directory, one for the last entry"
+    restore_interrupted_zip_swap(live)
+    assert sorted(p.name for p in live.iterdir() if not p.name.startswith(".")) == ["agent", "tools"]
+    assert (live / "agent" / "version.txt").read_text() == "old"
+    assert not (live / ZIP_SWAP_JOURNAL).exists()

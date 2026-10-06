@@ -488,8 +488,13 @@ def _journaled_stage_and_swap(extracted: str, entries: list[str], root: Path, ta
         write_zip_swap_journal(root, "staging", journal_entries, gen)
 
         def record_staged(index: int, staging: str) -> None:
+            # A directory's id must be durable before copytree fills it: a kill mid-fill then leaves a
+            # partial tree recovery can prove is its own and delete. A file is already copied when this
+            # runs, so its id rides the next directory's write (or the last entry's) instead of one
+            # fsync'd rewrite per file (~9 ms each on ext4: ~1 s of a 123-entry stage, review K132361).
             journal_entries[index][2] = zip_entry_identity(staging)
-            write_zip_swap_journal(root, "staging", journal_entries, gen)
+            if index == len(entries) - 1 or os.path.isdir(os.path.join(extracted, entries[index])):
+                write_zip_swap_journal(root, "staging", journal_entries, gen)
 
         try:
             staged = _stage_entries(extracted, entries, str(root), record_staged)
