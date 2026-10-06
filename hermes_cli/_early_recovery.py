@@ -872,9 +872,16 @@ def _settle_zip_entry(root: Path, phase: str, gen: str, entry: tuple[str, bool, 
         changed = True
     for leftover, identity in ((staging, staged_id), (old, live_id)):
         _discard_unless_owned(leftover, identity, kept)
-    # ``<old>.<gen>.tmp``: a backup copy killed before its rename (no-hardlink file systems); the run's
-    # unpredictable tag is its provenance.
-    _drop_path(Path(f"{old}.{gen}.tmp"))
+    # ``<old>.<gen>.tmp``: a backup copy of the live file killed before its rename (no-hardlink file
+    # systems). The tag names it but proves nothing about the bytes (F78): only a prefix of the live
+    # file is that copy; anything else at the name is kept aside.
+    tmp = Path(f"{old}.{gen}.tmp")
+    if here(tmp):
+        regular = [p.is_file() and not p.is_symlink() for p in (tmp, dst)]
+        if all(regular) and dst.read_bytes().startswith(tmp.read_bytes()):
+            _drop_path(tmp)
+        else:
+            kept.append(_keep_aside(tmp))
     return changed
 
 

@@ -684,6 +684,30 @@ def test_a_backup_copy_killed_before_its_rename_is_cleared_by_the_recovery(tmp_p
     assert (live / "a.py").read_text(encoding="utf-8") == "old\n"
 
 
+def test_a_file_at_the_backup_temp_name_that_is_not_the_killed_copy_is_kept(tmp_path):
+    """The run's tag names the temp but proves nothing about its bytes: a swap killed before its
+    backup copy existed leaves the name free, and a file there afterwards is not Hermes'. Recovery
+    deletes only a prefix of the live file (what a killed copy of it is) and keeps anything else
+    aside, still retiring the journal (review F78)."""
+    from hermes_cli._early_recovery import (
+        ZIP_SWAP_JOURNAL, restore_interrupted_zip_swap, write_zip_swap_journal, zip_entry_identity)
+
+    live = tmp_path / "live"
+    live.mkdir()
+    (live / "a.py").write_text("old\n", encoding="utf-8")
+    (live / "a.py.hermes-update-staging").write_text("new\n", encoding="utf-8")
+    write_zip_swap_journal(live, "swapping", [["a.py", True, zip_entry_identity(live / "a.py.hermes-update-staging"),
+                                              zip_entry_identity(live / "a.py")]], "0123456789ab")
+    (live / "a.py.hermes-update-old.0123456789ab.tmp").write_text("USER FILE", encoding="utf-8")
+
+    restore_interrupted_zip_swap(live)
+
+    kept = [p for p in live.iterdir() if ".hermes-update-kept" in p.name]
+    assert [p.read_text(encoding="utf-8") for p in kept] == ["USER FILE"], sorted(p.name for p in live.iterdir())
+    assert not (live / ZIP_SWAP_JOURNAL).exists()
+    assert (live / "a.py").read_text(encoding="utf-8") == "old\n"
+
+
 def _swap_killed(tmp_path, monkeypatch, *, live: dict, new: dict, install_first: bool) -> Path:
     """Run the real journaled stage+swap and kill it inside the swap: nothing renamed yet, or only the
     first staged entry renamed into place. The journal the real writer left is what recovery reads."""
