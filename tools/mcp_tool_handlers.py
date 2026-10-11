@@ -22,7 +22,8 @@ from tools.mcp_tool_content import (
     _render_mcp_dropped_block_notice, _render_mcp_resource_block, _strip_reserved_meta_keys,
     _truncate_mcp_text_result)
 from tools.mcp_tool_errors import (
-    _auth_error_detail, _is_auth_error, _is_session_expired_error, _mcp_call_failed_message)
+    _auth_error_detail, _is_auth_error, _is_session_expired_error, _is_session_superseded_error,
+    _mcp_call_failed_message)
 
 logger = logging.getLogger("tools.mcp_tool")
 _MISSING = object()
@@ -213,6 +214,27 @@ def _handle_auth_error_and_retry(server_name: str, exc: BaseException, retry_cal
             return result
     return _strike(server_name, _NEEDS_REAUTH_MSG.format(s=server_name, detail=_auth_error_detail(exc)),
                    needs_reauth=True, server=server_name)
+
+
+def _handle_session_superseded_and_retry(server_name: str, exc: BaseException, retry_call, op_description: str):
+    """Re-initialize + one retry when the server refused the call at its session gate because another client on
+    the same credential took the session (``slot_superseded``) or it was hung up (``session_closed``); None to
+    fall through. The refusal precedes dispatch, so unlike :func:`_handle_session_expired_and_retry` a
+    write-capable tool is retried too — nothing ran. Without this the client kept the dead session id and every
+    later call failed the same way until a restart."""
+    if not _is_session_superseded_error(exc):
+        return None
+    srv = _lookup_reconnectable_server(server_name, require_loop=True)
+    if srv is None:
+        return None
+    logger.info("MCP server '%s': %s was refused before dispatch (%s); re-initializing and retrying once.",
+                server_name, op_description, exc)
+    if not _loop._signal_reconnect_and_wait(server_name, srv, op_description=op_description, timeout=15):
+        logger.warning("MCP server '%s': re-initialize did not ready within 15s after a superseded session; "
+                       "falling through to error response.", server_name)
+        return None
+    _core._reset_server_error(server_name)  # session state, not server health: no breaker strike
+    return _retry_once(server_name, retry_call, op_description, "session re-initialize")
 
 
 def _handle_session_expired_and_retry(server_name: str, exc: BaseException, retry_call, op_description: str,
@@ -601,7 +623,8 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float, *,
         session_expired = partial(_handle_session_expired_and_retry, call_may_have_side_effects=not read_only)
         text = _dispatch(
             server_name, server, op, _call, tool_timeout,
-            (_handle_stdio_child_exited_and_retry, _handle_auth_error_and_retry, session_expired),
+            (_handle_stdio_child_exited_and_retry, _handle_auth_error_and_retry, _handle_session_superseded_and_retry,
+             session_expired),
             _on_failure, record_outcome=True)
         # Off the MCP loop on purpose: image prep is CPU work (bounded vision pool) that must not stall other servers' I/O.
         return _mcp_result_with_native_images(text, image_paths) if native_images and not _result_is_error(text) else text
@@ -627,7 +650,7 @@ def _make_utility_handler(op: str, log_label: str, rpc, render, required: Option
                 return json.dumps(render(result, server_name), ensure_ascii=False)
             return _dispatch(
                 server_name, server, op, _call, tool_timeout,
-                (_handle_auth_error_and_retry, _handle_session_expired_and_retry),
+                (_handle_auth_error_and_retry, _handle_session_superseded_and_retry, _handle_session_expired_and_retry),
                 lambda exc: logger.error("MCP %s/%s failed: %s", server_name, log_label, exc))
         return _handler
     return _factory

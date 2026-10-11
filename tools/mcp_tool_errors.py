@@ -534,3 +534,27 @@ def _is_session_expired_error(exc: BaseException) -> bool:
         msg = str(current).lower()
         found = found or isinstance(current, transport_error_types) or any(m in msg for m in _SESSION_EXPIRED_MARKERS)
     return found
+
+
+# A server that refused the request at its session gate, BEFORE dispatching it, because another client on the
+# same credential took this session over (or hung it up), and that asks for a fresh ``initialize``. LatticeRun
+# answers HTTP 409 / JSON-RPC -32003 with ``data.reason`` ``slot_superseded`` or ``session_closed``. ``cause:
+# cap`` is excluded: the account is full, nothing was displaced, and a new initialize would be refused as well.
+_SESSION_SUPERSEDED_REASONS = frozenset({"slot_superseded", "session_closed"})
+_SESSION_SUPERSEDED_PREFIXES = ("slot_superseded:", "session_closed:")
+_SESSION_CAP_MARKER = "nothing was displaced"
+
+
+def _is_session_superseded_error(exc: BaseException) -> bool:
+    """True if ``exc`` is a pre-dispatch refusal that a re-``initialize`` fixes (see above). Structured
+    ``error.data`` wins; the message prefix covers proxies that keep the text but drop ``data``."""
+    for current in _iter_exception_nodes(exc):
+        if isinstance(current, InterruptedError):
+            return False
+        data = getattr(getattr(current, "error", None), "data", None)
+        if isinstance(data, dict) and data.get("reason") in _SESSION_SUPERSEDED_REASONS:
+            return data.get("cause") != "cap"
+        msg = str(current).strip().lower()
+        if msg.startswith(_SESSION_SUPERSEDED_PREFIXES) and _SESSION_CAP_MARKER not in msg:
+            return True
+    return False
