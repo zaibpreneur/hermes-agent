@@ -242,7 +242,7 @@ def adopt_legacy_session(authority, actor, row):
     from gateway.session_policy import build_policy, bind_launch_key
     from gateway.session_local_recovery import restore_local_session
     from hermes_state_local import commit_local_session
-    from hermes_cli.active_sessions import active_session_liveness_guard, ActiveSessionRegistryError
+    from hermes_cli.active_sessions import active_session_holders_guard, ActiveSessionRegistryError
 
     request_id = 'legacy:' + row['id']
     sid = row['id']
@@ -307,10 +307,26 @@ def adopt_legacy_session(authority, actor, row):
                'legacy_session_id': row['id'], 'lineage': [row['id']]}
     try:
         # Same lock order as old Bot Chat: mailbox (if any), liveness, SQLite.
-        with active_session_liveness_guard(row['id'], registry_home=Path(authority.db.db_path).parent) as active:
-            if active:
-                raise RuntimeStoreError('runtime_coordination_required')
+        with active_session_holders_guard(row['id'], registry_home=Path(authority.db.db_path).parent) as holders:
+            if holders:
+                raise session_writer_held(holders[0])
             commit_local_session(authority.db, epoch=authority.epoch, receipt=receipt)
     except ActiveSessionRegistryError as exc:
-        raise RuntimeStoreError('runtime_coordination_required') from exc
+        raise session_registry_unprovable() from exc
     return restore_local_session(authority, sid)
+
+
+def session_writer_held(entry):
+    """The refusal for a live lease on the session, naming its holder (``session_holder_facts``)."""
+    from hermes_cli.active_sessions import session_holder_facts
+    exc = RuntimeStoreError('runtime_coordination_required', field='session_writer',
+                            detail='another session writer holds this session')
+    exc.holder = session_holder_facts(entry)
+    return exc
+
+
+def session_registry_unprovable():
+    """The refusal when the active-session registry cannot prove who holds the session: still
+    closed, but no writer was found, so there is no session to wait for. Retry later."""
+    return RuntimeStoreError('runtime_coordination_required', field='session_registry',
+                             detail='session coordination is unavailable; no writer could be ruled out')

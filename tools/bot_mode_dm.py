@@ -447,14 +447,63 @@ class LiveTargetHeldError(LiveTargetUnavailableError):
     """The owner refused because another session writer holds the Bot Chat, and settled this
     delivery id as never sent (``bot_relay.settle``): every later attempt under the id gets that
     disposition, so this is a definite no-send too. A refusal without that settlement stays the
-    ambiguous outcome."""
+    ambiguous outcome.
 
-    resend = "after that session closes"
+    ``refusal`` is the owner's ``error.data`` when this attempt received it. Only a holder the
+    owner named (a live session, by surface and age) earns "after that ... closes"; anything
+    else (an older owner, a replayed settlement) can only say "later"."""
+
+    def __init__(self, refusal: dict | None = None):
+        refusal = refusal or {}
+        surface = refusal.get("holder_surface")
+        self.holder = _holder_name(surface) if isinstance(surface, str) and surface else None
+        age = refusal.get("holder_age")
+        opened = f", opened {age} ago" if self.holder and isinstance(age, str) and age else ""
+        super().__init__(f"Bot Chat is held by another session writer (an open {self.holder}{opened})"
+                         if self.holder else "Bot Chat was refused while another session writer held it")
+
+    @property
+    def resend(self) -> str:
+        return f"after that {self.holder} closes" if self.holder else "later"
 
     @property
     def reason(self) -> str:
         from tools.bot_failure_reasons import HELD_NOT_SENT
         return HELD_NOT_SENT
+
+
+class LiveTargetCoordinationUnavailableError(LiveTargetHeldError):
+    """The same settled no-send when the owner could not read its active-session registry, so it
+    could not rule out another writer: closed, but no session holds the chat, so there is nothing
+    to wait for but a retry."""
+
+    resend = "later"
+
+    def __init__(self):
+        self.holder = None
+        LiveTargetUnavailableError.__init__(
+            self, "Bot Chat's session coordination is unavailable, so Hermes could not rule out "
+                  "another session writer")
+
+    @property
+    def reason(self) -> str:
+        from hermes_cli.active_sessions import SESSION_COORDINATION_UNAVAILABLE
+        return SESSION_COORDINATION_UNAVAILABLE
+
+
+# ``surface`` values of the active-session registry (``hermes_cli/active_sessions.py``) as a user names them.
+_HOLDER_SURFACES = {"desktop": "Desktop chat", "cli": "CLI session", "tui": "TUI session",
+                    "dashboard": "dashboard chat"}
+
+
+def _holder_name(surface: str) -> str:
+    return _HOLDER_SURFACES.get(surface.strip().lower(), f"{surface} session")
+
+
+def _held_error(refusal: dict | None) -> LiveTargetHeldError:
+    if (refusal or {}).get("field") == "session_registry":
+        return LiveTargetCoordinationUnavailableError()
+    return LiveTargetHeldError(refusal)
 
 
 def _unavailable_payload(dm_file: str, exc: LiveTargetUnavailableError) -> str:
@@ -519,6 +568,7 @@ def _admit_live_dm(profile_home: Path | None, dm_file: str, author: Optional[dic
             pinned_now = True
     home = intent["owner"]["profile_home"]
     record = read_delivery_result(home, intent["delivery_id"])
+    refusal = None
     if record is None or intent["owner"].get("canonical"):
         from hermes_cli.gateway_client import GatewayRPCError
         from tools.bot_failure_reasons import HELD_NOT_SENT
@@ -530,6 +580,7 @@ def _admit_live_dm(profile_home: Path | None, dm_file: str, author: Optional[dic
         except GatewayRPCError as exc:
             if str(exc) != HELD_NOT_SENT or exc.data.get("admitted") is not False:
                 raise
+            refusal = exc.data
             # Nothing was admitted while that refusal held the owner's lock, but a same-id attempt
             # may have admitted since: only the owner's settle decides, under that same lock.
             record = settle_held_delivery(home, intent["owner"], intent["message"], **identity)
@@ -542,7 +593,7 @@ def _admit_live_dm(profile_home: Path | None, dm_file: str, author: Optional[dic
             raise LiveTargetUnavailableError(f"live authority dial failed before admission ({exc})") from exc
     if _held_disposition(record):
         # The callers remove the intent and payload (``_settled_no_send``).
-        raise LiveTargetHeldError("Bot Chat is held by another session writer")
+        raise _held_error(refusal)
     return record
 
 
