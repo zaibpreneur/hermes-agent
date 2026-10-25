@@ -352,8 +352,6 @@ def test_strict_registry_rejects_structurally_invalid_entries(tmp_path, monkeypa
     invalid_entries = (
         {key: value for key, value in base.items() if key != "lease_id"},
         {**base, "lease_id": ""},
-        {key: value for key, value in base.items() if key != "session_id"},
-        {**base, "session_id": "  "},
         {**base, "pid": 0},
         {**base, "pid": 1.5},
         {**base, "surface": 1},
@@ -369,6 +367,15 @@ def test_strict_registry_rejects_structurally_invalid_entries(tmp_path, monkeypa
         with pytest.raises(active_sessions.ActiveSessionRegistryError):
             with active_sessions.active_session_liveness_guard("session-1"):
                 pass
+        assert state_path.read_text(encoding="utf-8") == original
+
+    # An entry with no session id cannot be session-1's: the guard answers and leaves it in place.
+    for entry in ({key: value for key, value in base.items() if key != "session_id"},
+                  {**base, "session_id": "  "}):
+        active_sessions._write_entries(state_path, [entry])
+        original = state_path.read_text(encoding="utf-8")
+        with active_sessions.active_session_liveness_guard("session-1") as held:
+            assert held is False
         assert state_path.read_text(encoding="utf-8") == original
 
 
