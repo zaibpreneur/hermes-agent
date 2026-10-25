@@ -6,6 +6,8 @@ What it may not do is refuse for something unrelated to the target:
 - a registry entry the strict schema rejects, for ANOTHER session, refused every DM until it was
   deleted by hand; the target's own unprovable entry still refuses, as "coordination unavailable",
   never as a held chat and never as an unknown outcome ("Do not resend");
+- one leftover pre-authority mailbox ticket whose session is held refused every new DM; it now
+  waits for a later pass while the new DM is admitted;
 - the held refusal now names its holder (surface and age, never a pid or a path), and "safe to
   resend after ... closes" is said only of a named live session.
 
@@ -201,6 +203,33 @@ async def test_the_bot_chats_own_unprovable_entry_refuses_as_coordination_unavai
     _assert_coordination_unavailable(on_legacy_ticket)
     assert on_adoption['error'] == on_legacy_ticket['error']
     assert _admissions(owner) == ['bot:' + bound['delivery_id']]
+
+
+@pytest.mark.asyncio
+async def test_a_held_legacy_ticket_waits_without_refusing_a_new_dm(owner):
+    """Bound chat, a live foreign lease on its id and one leftover legacy ticket: the new DM is
+    admitted and runs; the ticket stays queued, neither admitted under the writer nor refused."""
+    from tools.bot_live_delivery import read_delivery_result
+    bound = await _send(owner, 'bind')
+    _assert_admitted(bound)
+    await async_wait_until(lambda: owner.executed == ['bind'], what='the binding DM ran')
+    cli = _lease(owner, 'cli', CHAT)
+    ticket = _legacy_ticket(owner)
+
+    sent = await _send(owner, 'new DM')
+    _assert_admitted(sent)
+    await async_wait_until(lambda: owner.executed == ['bind', 'new DM'], what='the new DM ran')
+    record = json.loads(ticket.read_text())
+    assert record['status'] == 'queued' and not record.get('admission_id') and not record.get('refused'), record
+    assert 'bot:' + LEGACY_KEY not in _admissions(owner)
+
+    # Once the writer is gone the ticket is admitted on the next pass, after the DMs already queued.
+    cli.release()
+    later = await _send(owner, 'after the writer')
+    _assert_admitted(later)
+    await async_wait_until(lambda: owner.executed == ['bind', 'new DM', 'old queued DM', 'after the writer'],
+                           what='the legacy ticket ran before the later DM')
+    assert read_delivery_result(owner.home, LEGACY_KEY).get('admission_id')
 
 
 @pytest.mark.asyncio

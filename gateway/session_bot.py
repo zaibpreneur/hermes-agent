@@ -612,6 +612,9 @@ def relay_operation(connection, operation, params):
 async def _migrate(authority, actor, home, root):
     # FIFO: a legacy ticket queued after an unresolved legacy pin waits for that pin's requeue. An
     # owner-state refusal below raises out of the pass, so nothing after the refused ticket runs.
+    # A ticket whose session another writer still holds ends the pass instead: it and every later
+    # ticket stay queued for a later pass, and the delivery that ran this pass is not refused for
+    # a writer on a ticket it never knew about (a new DM is admitted through the canonical FIFO).
     from gateway.session_local_migration import session_registry_unprovable
     from hermes_cli.active_sessions import ActiveSessionRegistryError, active_session_liveness_guard
     root, records, barrier = await _scan_owner_receipts(authority, home)
@@ -634,7 +637,9 @@ async def _migrate(authority, actor, home, root):
         except ActiveSessionRegistryError as exc:
             raise session_registry_unprovable() from exc
         if active:
-            raise RuntimeStoreError('runtime_coordination_required')
+            logger.info('Bot Chat legacy ticket %s waits: another session writer holds %s',
+                        record['delivery_id'], owner['session_id'])
+            return
         if record['status'] == 'claimed':
             record.update(status='ambiguous', reason='unknown_execution')
             await write_receipt(home, record, expect='claimed')
