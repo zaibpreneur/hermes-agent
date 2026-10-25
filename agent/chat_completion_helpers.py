@@ -73,6 +73,7 @@ _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
 # outer retry loop (up to ~3 attempts x backoff, well under 60s) so an outage doesn't
 # double traffic every attempt, while later turns re-arm automatically.
 _STREAM_5XX_PROBE_WINDOW_S = 60.0
+_STREAM_AUTH_PROBE_WINDOW_S = 60.0
 
 
 def _context_thread_target(callback):
@@ -3651,6 +3652,8 @@ class _StreamingCall(StreamingWaitMonitor):
             logger.exception("Streaming failed before delivery: %s", e)
             if self._unmask_server_error_with_nonstreaming(e):
                 return False
+            if self._retry_auth_error_with_nonstreaming(e):
+                return False
         # Propagate to the main retry loop (credential rotation, fallback, backoff).
         self.result["error"] = e
         return False
@@ -3721,6 +3724,68 @@ class _StreamingCall(StreamingWaitMonitor):
         except Exception as replay_err:
             # A response we cannot replay must not escape into _call()'s except block.
             logger.exception("Non-streaming unmask probe response could not be replayed: %s", replay_err)
+            return False
+        self.result["response"] = replayed
+        return True
+
+    def _retry_auth_error_with_nonstreaming(self, e: Exception) -> bool:
+        """One non-streaming retry when a 401/403 killed the stream before any delta.
+
+        An OpenAI-compatible aggregator can reject a STREAMING request with
+        ``401 Invalid 'Authorization' header or token`` while the identical
+        non-streaming request with the same key succeeds seconds later: observed as
+        same-second bursts, every one of them ``Streaming failed before delivery``,
+        with each key answering 200 on a 1-token non-streaming probe. Auth is
+        classified non-retryable (correct for a dead key), so without this the turn
+        aborts and a queued gateway delivery is lost.
+
+        Gating mirrors the 5xx unmask probe, deliberately:
+        - only before any delta, only on 401/403, only on the chat-completions wire;
+        - one probe per window, timestamped on the AGENT (outer retries build fresh
+          _StreamingCall instances, so an instance flag would re-probe every attempt);
+        - a probe that fails propagates the ORIGINAL auth error, so a genuinely dead
+          key still fails fast and is classified exactly as before;
+        - a probe that succeeds delivers for this turn WITHOUT latching streaming off.
+        """
+        if getattr(self.agent, "_interrupt_requested", False):
+            return False
+        if _streams_llamacpp(self.agent):
+            return False
+        if self.deltas_were_sent["yes"]:
+            return False
+        if getattr(self.agent, "api_mode", "") not in ("", "chat_completions"):
+            return False  # replay handles chat-completions shapes only
+        if _extract_status_code(e) not in (401, 403):
+            return False
+        now = time.monotonic()
+        last_probe = getattr(self.agent, "_stream_auth_probe_ts", None)
+        if last_probe is not None and now - last_probe < _STREAM_AUTH_PROBE_WINDOW_S:
+            return False  # one probe per window
+        self.agent._stream_auth_probe_ts = now
+        probe_kwargs = {k: v for k, v in self.api_kwargs.items() if k not in ("stream", "stream_options")}
+        stale_timeout = self._stream_stale_timeout
+        self._stream_stale_timeout = float("inf")  # no chunks arrive during the probe
+        try:
+            probe = interruptible_api_call(self.agent, probe_kwargs)
+        except (KeyboardInterrupt, InterruptedError):
+            raise  # the outer handler routes user interrupts; never swallow them
+        except Exception as probe_err:
+            logger.info("Non-streaming auth retry failed too (%s); keeping the original auth error",
+                        _extract_status_code(probe_err) or type(probe_err).__name__)
+            return False
+        finally:
+            self._stream_stale_timeout = stale_timeout
+        logger.info("Streaming auth failure re-issued non-streaming successfully for %s/%s "
+                    "(not latched: the rejection may be transient).",
+                    self.agent.provider or "unknown", self.agent.model or "unknown")
+        self._quiet(self.agent._buffer_status,
+                    "⚠  Streaming was rejected by the provider; the non-streaming retry succeeded.")
+        try:
+            # The failed attempt already emitted its terminal on_stream_end(finished=False),
+            # so the recovered delivery opens and closes its OWN stream pair.
+            replayed = _with_stream_emitters(self.agent, lambda: self._replay_final_response(probe))
+        except Exception as replay_err:
+            logger.exception("Non-streaming auth retry response could not be replayed: %s", replay_err)
             return False
         self.result["response"] = replayed
         return True

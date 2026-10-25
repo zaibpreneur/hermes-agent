@@ -46,6 +46,8 @@ class TurnRetryState:
     affordable_402_clamp_attempted: bool = False
     # Persistent 401/403 already escalated to the fallback chain once this attempt.
     auth_failover_attempted: bool = False
+    # A transient 401 from the last provider standing already got its one extra attempt.
+    transient_auth_retry_attempted: bool = False
     # Post-exhaustion auto-recovery cycles spent on this API call (agent.auto_recovery_cycles caps it).
     auto_recovery_cycles_used: int = 0
 
