@@ -20,6 +20,7 @@ Gating invariants (deliberately the same as the 5xx unmask probe):
 from types import SimpleNamespace
 
 from agent import chat_completion_helpers as h
+from agent.chat_completion_helpers_nonstream_probe import retry_auth_error
 
 
 def _make_call(api_kwargs, *, deltas_sent=False, api_mode="chat_completions", auth_probe_ts=None):
@@ -110,14 +111,14 @@ def test_probe_failing_again_propagates_the_ORIGINAL_auth_error(monkeypatch):
 
 
 def test_the_retry_refuses_after_partial_delivery(monkeypatch):
-    """Calls the method directly: the handler resets the delta flag when nothing VISIBLE
-    was delivered (so a retry there is correct), which means the method's own gate is the
+    """Calls the probe directly: the handler resets the delta flag when nothing VISIBLE
+    was delivered (so a retry there is correct), which means the probe's own gate is the
     one to test here."""
     call = _make_call({"model": "m", "messages": []}, deltas_sent=True)
     called = []
     monkeypatch.setattr(h, "interruptible_api_call", lambda agent, kwargs: called.append(1) or _ok_response())
 
-    assert call._retry_auth_error_with_nonstreaming(_StreamErr(401)) is False
+    assert retry_auth_error(call, _StreamErr(401)) is False
     assert called == []
 
 

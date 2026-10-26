@@ -1246,7 +1246,6 @@ def _apply_display_config(agent, _agent_cfg, platform):
             _model_section.get("streaming"),
         )
     agent._stream_5xx_probe_ts = None  # monotonic time of the last streaming-5xx unmask probe
-    agent._stream_auth_probe_ts = None  # monotonic time of the last streaming-401 non-stream retry
 
     try:
         agent._tool_guardrails = ToolCallGuardrailController(

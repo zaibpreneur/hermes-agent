@@ -119,14 +119,14 @@ class TestNoNonStreamingFallbackForLlamacpp:
                                _stream_stale_timeout=900.0, result={"error": None, "response": None})
 
     def test_server_error_probe_skipped(self):
-        from agent.chat_completion_helpers import _StreamingCall
+        from agent.chat_completion_helpers_nonstream_probe import unmask_server_error
 
         agent = SimpleNamespace(_interrupt_requested=False, provider="llamacpp", base_url="http://127.0.0.1:18434/v1",
                                 api_mode="chat_completions", _stream_5xx_probe_ts=None)
         err = RuntimeError("boom")
         err.status_code = 500
         with patch("agent.chat_completion_helpers.interruptible_api_call") as probe:
-            assert _StreamingCall._unmask_server_error_with_nonstreaming(self._call(agent), err) is False
+            assert unmask_server_error(self._call(agent), err) is False
         probe.assert_not_called()
 
     def test_streaming_never_disabled(self):
