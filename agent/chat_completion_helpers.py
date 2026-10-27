@@ -69,11 +69,6 @@ _PROVIDER_STREAM_ERROR_TEXT_LIMIT = 4096
 # billing reasons keep their own longer cooldown.
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
 
-# Streaming 5xx unmask probe: one non-streaming re-issue per this window. Covers the
-# outer retry loop (up to ~3 attempts x backoff, well under 60s) so an outage doesn't
-# double traffic every attempt, while later turns re-arm automatically.
-_STREAM_5XX_PROBE_WINDOW_S = 60.0
-
 
 def _context_thread_target(callback):
     """Bind a no-argument thread target to the caller's ContextVars."""
@@ -3649,81 +3644,12 @@ class _StreamingCall(StreamingWaitMonitor):
         else:
             self._maybe_disable_streaming(e)
             logger.exception("Streaming failed before delivery: %s", e)
-            if self._unmask_server_error_with_nonstreaming(e):
+            from agent.chat_completion_helpers_nonstream_probe import retry_auth_error, unmask_server_error
+            if unmask_server_error(self, e) or retry_auth_error(self, e):
                 return False
         # Propagate to the main retry loop (credential rotation, fallback, backoff).
         self.result["error"] = e
         return False
-
-    def _unmask_server_error_with_nonstreaming(self, e: Exception) -> bool:
-        """One non-streaming re-issue when a 5xx killed the stream before any delta.
-
-        Some gateways validate the request only on their non-streaming path and crash
-        opaquely ("500 something went wrong") when streaming — the real 4xx, with its
-        actionable message, never reaches the user through stream retries. One
-        non-streaming probe per 60s window (timestamped on the agent: each outer retry
-        builds a fresh _StreamingCall, so an instance flag would re-probe every attempt)
-        surfaces it: on success the response is delivered for this turn WITHOUT latching
-        non-streaming (a transient gateway 500 must not permanently disable streaming);
-        on a probe 4xx that error REPLACES the opaque 5xx; any other probe failure keeps
-        the original error. The successful delivery is bracketed by its own stream
-        start/end pair (the failed attempt already emitted a terminal end), and a response
-        that cannot be replayed propagates ``e``. The probe runs on this worker thread while
-        the stream monitor still polls, so its stale check is suspended for the probe's
-        duration (the probe has its own non-streaming watchdog). Interrupts re-raise (the outer handler routes them), and a /stop that arrived before
-        this point suppresses the probe entirely — the loop's pre-retry interrupt check owns
-        that decision, so a pending stop must not buy one more request.
-        True = handled (caller must not overwrite result); False = propagate ``e``.
-        """
-        if getattr(self.agent, "_interrupt_requested", False):
-            return False
-        if _streams_llamacpp(self.agent):
-            # Same error either way, and the router can't cancel this probe once its watchdog gives up.
-            return False
-        status = _extract_status_code(e)
-        if status is None or status < 500 or self.deltas_were_sent["yes"]:
-            return False
-        if getattr(self.agent, "api_mode", "") not in ("", "chat_completions"):
-            return False  # replay handles chat-completions shapes only
-        now = time.monotonic()
-        last_probe = self.agent._stream_5xx_probe_ts
-        if last_probe is not None and now - last_probe < _STREAM_5XX_PROBE_WINDOW_S:
-            return False  # one probe per 60s window
-        self.agent._stream_5xx_probe_ts = now
-        probe_kwargs = {k: v for k, v in self.api_kwargs.items() if k not in ("stream", "stream_options")}
-        stale_timeout = self._stream_stale_timeout
-        self._stream_stale_timeout = float("inf")  # no chunks arrive during the probe
-        try:
-            probe = interruptible_api_call(self.agent, probe_kwargs)
-        except (KeyboardInterrupt, InterruptedError):
-            raise  # the outer handler routes user interrupts; never swallow them
-        except Exception as probe_err:
-            probe_status = _extract_status_code(probe_err)
-            if probe_status is not None and probe_status < 500:
-                # The provider's REAL validation error beats the opaque 5xx.
-                logger.info("Non-streaming unmask probe surfaced the underlying error: %s", probe_err)
-                self.result["error"] = probe_err
-                return True
-            logger.info("Non-streaming unmask probe failed: %s", probe_err)
-            return False
-        finally:
-            self._stream_stale_timeout = stale_timeout
-        logger.info("Streaming 5xx re-issued non-streaming successfully for %s/%s "
-                    "(not latched: the 5xx may be transient).",
-                    self.agent.provider or "unknown", self.agent.model or "unknown")
-        self._quiet(self.agent._buffer_status,
-                    "⚠  Streaming failed with a provider server error; the non-streaming retry succeeded.")
-        try:
-            # The failed attempt already emitted its terminal on_stream_end(finished=False),
-            # so the recovered delivery opens and closes its OWN stream pair — consumers must
-            # never see deltas after that error event.
-            replayed = _with_stream_emitters(self.agent, lambda: self._replay_final_response(probe))
-        except Exception as replay_err:
-            # A response we cannot replay must not escape into _call()'s except block.
-            logger.exception("Non-streaming unmask probe response could not be replayed: %s", replay_err)
-            return False
-        self.result["response"] = replayed
-        return True
 
     def _call_wire(self, stream_attempt_id: int):
         if self.agent.api_mode != "anthropic_messages":

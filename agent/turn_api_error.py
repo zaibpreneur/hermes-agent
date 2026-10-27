@@ -263,6 +263,42 @@ class UnrecoveredErrorVerdict:
     result: Optional[dict[str, Any]] = None
 
 
+_TRANSIENT_AUTH_RETRY_WAIT_S = 2.0
+
+
+def _retry_transient_auth_once(
+    agent: Any, classified: Any, _retry: Any, *, status_code: Any, messages: Any,
+    conversation_history: Any, api_call_count: Any,
+) -> Optional[tuple]:
+    """One more attempt before a transient 401 becomes terminal, so the turn — and any gateway
+    delivery riding on it — is retried instead of dropped.
+
+    Reached only after refresh, rotation and the fallback chain have all declined, i.e. the 401
+    came from the last provider standing. An OpenAI-compatible aggregator was observed rejecting a
+    valid key intermittently (same key 200 seconds later), so one short-delay retry recovers the
+    common case. ``auth_permanent`` (failed after refresh) is excluded, and the guard lives on the
+    per-call ``TurnRetryState``, so a genuinely dead key costs exactly one extra request.
+    Returns ``(action, result)`` for the caller's verdict, or ``None`` to fall to terminal."""
+    if classified.reason != FailoverReason.auth or status_code != 401:
+        return None
+    if _retry.transient_auth_retry_attempted:
+        return None
+    _retry.transient_auth_retry_attempted = True
+    agent._buffer_diagnostic_status("🔐 Authentication rejected by the last provider — retrying once...")
+    _interrupted = interruptible_backoff_sleep(
+        agent, _TRANSIENT_AUTH_RETRY_WAIT_S, _retry, messages=messages,
+        conversation_history=conversation_history, api_call_count=api_call_count,
+        abort_message="Interrupt detected during auth retry wait, aborting.",
+        interrupt_text="Operation interrupted: retrying API call after an authentication error.",
+        activity_label="transient auth retry",
+    )
+    if _interrupted is not None:
+        return ("return", _interrupted)
+    if _retry.restart_with_redirected_messages:
+        return ("break", None)
+    return ("fallthrough", None)
+
+
 def settle_unrecovered_error(
     agent: Any, *, api_error: Any, classified: Any, _retry: Any, status_code: Any, error_msg: Any,
     is_context_length_error: Any, is_rate_limited: Any, _is_zai_coding_overload: Any,
@@ -357,6 +393,12 @@ def settle_unrecovered_error(
                 active_system_prompt = _arm_fallback_restart(agent, api_messages, active_system_prompt, _retry)
                 retry_count = compression_attempts = 0
                 return _verdict("break")
+        _again = _retry_transient_auth_once(
+            agent, classified, _retry, status_code=status_code, messages=messages,
+            conversation_history=conversation_history, api_call_count=api_call_count,
+        )
+        if _again is not None:
+            return _verdict(*_again)
         # Terminal from here: collapse the continuation trail once, before the persist.
         _delivered = settle_delivered_partial(agent, messages, current_turn_user_idx)
         return _verdict("return", nonretryable_client_error_result(
